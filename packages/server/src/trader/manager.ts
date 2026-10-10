@@ -456,6 +456,14 @@ export class TraderManager {
     return typeof value === 'boolean' ? value : null;
   }
 
+  /**
+   * **启动代数**：每个机器人最近一次启动的序号。
+   *
+   * 用途只有一个：让"上一次启动的看门狗/回调"能判断自己是否已经过期，
+   * 从而不去覆盖后来者的状态（见 `startTraderAsync`）。
+   */
+  private readonly startGeneration = new Map<number, number>();
+
   runningIds(): number[] {
     return [...this.running.keys()];
   }
@@ -1311,6 +1319,13 @@ export class TraderManager {
      * 所以只写状态（界面立刻变），占位交给 `startTrader` 自己加：
      * 中间**没有 await**，两次调用在同一个同步块里，不存在并发窗口。
      */
+    /*
+     * **启动代数** —— 每次启动自增。看门狗与回调据此判断"我还是不是当前那一代"，
+     * 避免一次陈旧的启动（或它的看门狗）去覆盖后来者的状态（2026-10-11 审查发现）。
+     */
+    const generation = (this.startGeneration.get(traderId) ?? 0) + 1;
+    this.startGeneration.set(traderId, generation);
+
     traders.setStatus(traderId, 'starting', null);
 
     /*
@@ -1326,11 +1341,25 @@ export class TraderManager {
      * 操作员既看不到结论，也失去了重试的能力。
      */
     const startWatchdog = setTimeout(() => {
+      /* 已经有更新的一次启动接管了 → 这个陈旧看门狗什么都不做。 */
+      if (this.startGeneration.get(traderId) !== generation) return;
       if (this.running.has(traderId)) return;
-      /* 占位一定要释放：否则用户**再也点不动这个按钮**。 */
-      this.starting.delete(traderId);
+      /*
+       * ⚠️ **看门狗【不释放】 `starting` 占位（2026-10-11 审查发现）。**
+       *
+       * 上一版这里删了占位，理由是"否则用户再也点不动"。**那个理由换来了一个更糟的后果**：
+       * 慢启动（>90 秒）时占位被提前释放，用户再点一次就能并发出**第二个交易实例**，
+       * 而第一个还活着 —— 它既停不掉，也会和新的那个一起下单。
+       *
+       * 正确的分工：**占位由 `startTrader` 的 `finally` 释放**（谁持有谁释放），
+       * 看门狗只负责"把状态说清楚" —— 让操作员看到"启动还在进行中、已超过 N 秒"，
+       * 而不是让按钮变成一个可以踩出第二个实例的陷阱。
+       *
+       * 按钮在此期间点不动是**正确行为**：那一轮启动确实还在飞。
+       */
       const message =
-        '启动流程超时未完成（可能是 AI 模型不可用导致的长重试）。机器人未进入运行状态，可以重试或更换模型。';
+        `启动仍在进行中，已超过 ${Math.round(START_WATCHDOG_MS / 1000)} 秒未完成` +
+        '（可能是 AI 模型不可用导致的长重试）。请等待它结束；若持续不结束请看服务器日志。';
       log.error(`机器人 ${traderId} ${message}`);
       traders.setStatus(traderId, 'error', message);
     }, START_WATCHDOG_MS);
@@ -1340,6 +1369,7 @@ export class TraderManager {
     void this.startTrader(traderId, dryRun)
       .then((result) => {
         clearTimeout(startWatchdog);
+        if (this.startGeneration.get(traderId) !== generation) return;
         if (result.ok) return;
         log.warn(`机器人 ${traderId} 启动失败：${result.error ?? '未知错误'}`);
         /* 失败必须落到 `error` —— 否则状态会停在 `starting` 上（见看门狗）。 */
@@ -1347,6 +1377,7 @@ export class TraderManager {
       })
       .catch((error: unknown) => {
         clearTimeout(startWatchdog);
+        if (this.startGeneration.get(traderId) !== generation) return;
         const message = (error as Error).message;
         log.error(`机器人 ${traderId} 启动时抛错：${message}`);
         traders.setStatus(traderId, 'error', message);

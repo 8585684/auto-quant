@@ -144,10 +144,20 @@ export function backoffDelayMs(attempt: number, random: () => number = Math.rand
 export function usesAnthropicProtocol(provider: string, model: string): boolean {
   if (provider === 'anthropic') return true;
   /*
-   * 依据是**网关自己的模型 id**（文档逐条列了 id 与端点的对应），不是猜测。
-   * 用前缀匹配而不是穷举名单：网关新增同族模型时不必改代码，
-   * 而 `claude-` / `minimax-` / `qwen3.7-` / `qwen3.8-` 这几族在文档里**全部**属于 /messages。
+   * ⚠️ **这条"按模型名判协议"的规则只对 `opencode` 生效（2026-10-11 审查发现）。**
+   *
+   * 原来它对**任何** provider 都按模型名前缀判协议，于是：
+   *
+   *   · `commandcode`（OpenAI 兼容聚合网关）选 claude 系模型 → 被发到 `/messages`；
+   *   · 任何自有部署的 MiniMax / qwen3.7 / qwen3.8 → 同样被改道。
+   *
+   * 而那些网关**只有 OpenAI 兼容端点**，改道等于把请求发到一个不存在的路径上。
+   *
+   * 判据是"**这个网关会不会按模型换协议**"，而不是"模型叫什么名字" ——
+   * 只有 OpenCode Go 是后者（它的文档逐条列了模型与端点的对应）。
+   * 所以这里显式限定供应商；以后接同类网关时**显式加进来**，不要放宽成通配。
    */
+  if (provider !== 'opencode') return false;
   return /^(claude-|minimax-|qwen3\.7-|qwen3\.8-)/i.test(model);
 }
 export class LlmClient {
