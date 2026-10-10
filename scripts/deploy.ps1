@@ -200,11 +200,7 @@ Remove-Item $archive -Force
 
 $remote = @"
 set -e
-# ⚠️ **必须同时有 pipefail（2026-10-11 审查发现）。**
-# 下面 `npm ci … 2>&1 | tail -2` 放在 `if` 条件里：没有 pipefail 时整条管道的退出码
-# 是 `tail` 的 0，**安装失败也会走 then 分支**、写进 lock stamp，
-# 下次部署就"依赖未变化，跳过安装" —— 服务带着缺包重启，而本地照常打印「完成」。
-set -o pipefail
+
 export PATH=/usr/local/node22/bin:`$PATH
 cd $RemoteDir
 
@@ -257,11 +253,24 @@ if [ "`$(cat `$STAMP_FILE 2>/dev/null)" != "`$LOCK_HASH" ]; then
     echo "==> 依赖有变化，正在安装（npm ci --omit=dev）"
     mkdir -p /tmp/aqhome
     chown autoquant:autoquant /tmp/aqhome 2>/dev/null || true
-    if sudo -u autoquant env PATH=/usr/local/node22/bin:`$PATH HOME=/tmp/aqhome npm ci --omit=dev --no-audit --no-fund 2>&1 | tail -2; then
+    # ⚠️ **不能用 `npm ci … 2>&1 | tail -2` 放在 if 里（2026-10-11 审查发现）。**
+    #
+    # 管道的退出码是 `tail` 的 0，于是**安装失败也走 then 分支**、把 lock hash 写进 stamp，
+    # 下次部署直接"依赖未变化，跳过安装" —— 服务带着缺包重启，而本地照常打印「完成」。
+    #
+    # 修法是**先落到文件、再看退出码**，而不是给整个脚本加 `set -o pipefail`：
+    # 后者会改变脚本里**所有**管道的语义（实测直接把部署打断：`tail: option used in
+    # invalid context -- 2`，而本地不检查 ssh 退出码、照样打印「完成」）。
+    # **只改有问题的那一行，别动全局语义。**
+    if sudo -u autoquant env PATH=/usr/local/node22/bin:`$PATH HOME=/tmp/aqhome npm ci --omit=dev --no-audit --no-fund > /tmp/aq-npm.log 2>&1; then
+        tail -2 /tmp/aq-npm.log
         echo "`$LOCK_HASH" > `$STAMP_FILE
         chown autoquant:autoquant `$STAMP_FILE 2>/dev/null || true
     else
-        echo "    ✗ 依赖安装失败 —— 服务会起不来，请先看上面的 npm 输出"
+        echo "    ✗ 依赖安装失败 —— 服务会起不来。npm 输出："
+        tail -20 /tmp/aq-npm.log
+        # **必须让部署失败**，不能带着缺包重启：写 stamp 的下一次会跳过安装。
+        exit 1
     fi
 else
     echo "==> 依赖未变化，跳过安装"
