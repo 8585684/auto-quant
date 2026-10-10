@@ -1012,6 +1012,25 @@ export class AutoTrader {
     this.running = false;
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
+    /*
+     * ⚠️ **先把在途那一轮掐断，再去等它结束（2026-10-10，用户报的卡顿）。**
+     *
+     * 用户的原话：「机器人启动\停止，用户点击以后应该是瞬间完成……如果点了停止按钮，
+     * 如果此时有运行中的 AI 请求也应该是立即终止」。
+     *
+     * 原来这里直接 `await waitForIdle()` —— 而那一轮可能正卡在一次 LLM 调用上
+     * （实测单轮 1.8–9.9 分钟，硬超时更是 60 分钟），于是"点停止"要干等
+     * 最多 `waitForIdle` 的 60 秒。**操作员点的是"停"，得到的却是"再等等"。**
+     *
+     * `abortCurrentCycle` 本来就有 —— 硬超时那条路径一直在用它真的拆掉在途请求
+     *（见 `inCycle` 里那段注释：abort 会把 `work()` 掀掉）。所以这里只是
+     * **让操作员的意图走同一条路**，而不是新造一个取消机制。
+     *
+     * 为什么可以安全地掐：那一轮此刻要么还没下单（纯 LLM 等待），要么在等交易所回执。
+     * abort 影响的是 HTTP 等待，**不会撤销已经发出的下单请求** —— 已成交的仓位
+     * 仍由对账与保护单兜住（`waitForIdle` 之后仍然照常等它收尾）。
+     */
+    this.abortCurrentCycle?.abort();
     const drained = await this.waitForIdle();
     if (!drained) {
       /*
@@ -1037,6 +1056,16 @@ export class AutoTrader {
    * exchange call — but it returns `false` in that case rather than pretending
    * the cycle finished, so the caller can say so in the log.
    */
+  /**
+   * **立刻中止在途的那一轮决策**（拆掉正在等待的 LLM 请求）。
+   *
+   * 给操作员的"停止"用：那条路径不该干等一轮跑完（见 `stop()` 里的说明）。
+   * 幂等，没有在途轮次时是空操作。
+   */
+  abortInFlightCycle(): void {
+    this.abortCurrentCycle?.abort();
+  }
+
   async waitForIdle(timeoutMs = 60_000): Promise<boolean> {
     const pending = this.cyclePromise;
     if (!pending) return true;

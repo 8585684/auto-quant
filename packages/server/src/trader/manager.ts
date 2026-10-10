@@ -126,7 +126,7 @@ export function readLlmHealth(aiModelId: number): LlmHealth | null {
   }
 }
 
-function recordLlmHealth(aiModelId: number, health: LlmHealth): void {
+export function recordLlmHealth(aiModelId: number, health: LlmHealth): void {
   settings.set(`llm_health:${aiModelId}`, JSON.stringify(health));
 }
 
@@ -664,11 +664,34 @@ export class TraderManager {
 
     const probe = await client.testConnection();
     if (!probe.ok) {
-      throw new Error(`AI 模型「${row.label}」无法访问：${probe.message}`);
+      /*
+       * ⚠️ **模型不可达不再阻止启动（2026-10-10，用户定的原则）。**
+       *
+       * 用户的原话：「模型用尽也不应该让我卡在启动\停止页面上，**切换不切换是用户来决定**，
+       * 模型用尽那你**启动以后页面上提示就行**了」。
+       *
+       * 原来这里是 `throw` —— 于是一个额度用尽的模型会让「启动」直接失败：
+       * 操作员既起不来、又被卡在那一页上，还得自己琢磨为什么。
+       * 而**换不换模型是操作员的决定**，系统不该替他做，
+       * 更不该用"起不来"这种形式**逼**他做。
+       *
+       * 现在只记事实：`recordLlmHealth` 写进 `llm_health:<id>`，界面上的「最近错误」
+       * 读的就是它。启动照常继续 —— 模型不可用时那一轮决策会失败，
+       * 而**失败显示在页面上**，那才是操作员需要看到的形态。
+       * （之后每次模型调用的成败由下面 `tracked.chat` 持续记录。）
+       */
+      log.warn(`AI 模型「${row.label}」探测失败，但启动继续：${probe.message}`);
+      recordLlmHealth(aiModelId, {
+        ok: false,
+        at: new Date().toISOString(),
+        latencyMs: probe.latencyMs,
+        error: probe.message.slice(0, 300),
+      });
+    } else {
+      log.info(
+        `AI 模型「${row.label}」（${row.provider}/${row.model}）响应正常，耗时 ${probe.latencyMs}ms`,
+      );
     }
-    log.info(
-      `AI 模型「${row.label}」（${row.provider}/${row.model}）响应正常，耗时 ${probe.latencyMs}ms`,
-    );
 
     /*
      * ⚠️ **把每次调用的成败记下来 —— 否则它只活在日志里。**
@@ -1243,17 +1266,86 @@ export class TraderManager {
    * drain finishes, so a concurrent `startTrader` cannot slip a second instance
    * in behind this one while it is still writing.
    */
+  /**
+   * **启动机器人 —— 同步返回，真正的启动在后台继续。**
+   *
+   * ## 为什么需要它（2026-10-10，用户报的卡顿）
+   *
+   * 用户的原话：「机器人启动\停止，用户点击以后应该是瞬间完成（起码 UI 页面上
+   * 用户感觉是瞬间完成，现在运行中的机器人运行\停止会卡住很久）」。
+   *
+   * 原来的 `/start` 直接 `await startTrader(...)`：它要先建交易所连接、拉持仓、
+   * 对账、再 `this.running.set(...)` —— 这几步实测要几秒到几十秒，而期间
+   * `statusOf()` 仍是 `stopped`（那个 id 还没进 `running`）。于是界面表现成
+   * **点了启动、什么都没发生**，直到全部完成才跳一下。
+   *
+   * 现在：**守卫同步判完 → 状态立刻置为 `starting` 并返回**，真正的启动在后台跑；
+   * 失败时由启动路径自己写 `error` 状态（那条路径本来就有），界面靠推送看到结果。
+   *
+   * 守卫**不重复实现**：这里调的就是 `startGuard`，与 `startTrader` 同一个纯函数。
+   */
+  startTraderAsync(traderId: number, dryRun: boolean): StartResult {
+    const trader = traders.get(traderId);
+    const guard = startGuard({
+      traderId,
+      globalTradingDisabled: env.globalTradingDisabled,
+      traderExists: trader !== undefined,
+      running: this.running.has(traderId),
+      starting: this.starting.has(traderId),
+    });
+    if (!guard.ok) return { ok: false, error: guard.error, preflight: [] };
+    if (!trader) return { ok: false, error: `找不到机器人 ${traderId}`, preflight: [] };
+
+    /*
+     * ⚠️ **这里不能先 `starting.add` 再调 `startTrader`** —— `startTrader` 自己的
+     * 守卫会看到"已经在启动了"而拒绝，启动永远起不来。
+     * 所以只写状态（界面立刻变），占位交给 `startTrader` 自己加：
+     * 中间**没有 await**，两次调用在同一个同步块里，不存在并发窗口。
+     */
+    traders.setStatus(traderId, 'starting', null);
+    void this.startTrader(traderId, dryRun)
+      .then((result) => {
+        if (!result.ok) log.warn(`机器人 ${traderId} 启动失败：${result.error ?? '未知错误'}`);
+      })
+      .catch((error: unknown) => {
+        const message = (error as Error).message;
+        log.error(`机器人 ${traderId} 启动时抛错：${message}`);
+        traders.setStatus(traderId, 'error', message);
+      });
+    return { ok: true, preflight: [] };
+  }
+
   async stopTrader(traderId: number): Promise<void> {
     // Record the operator's intent before doing any async work, so a boot retry
     // parked in `waitForRetry()` aborts instead of starting the trader seconds
     // after it was told to stop.
     this.cancelledStarts.add(traderId);
     const autoTrader = this.running.get(traderId);
-    if (autoTrader) {
-      await autoTrader.stop();
-      this.running.delete(traderId);
-    }
+
+    /*
+     * ⚠️ **先把"它已停止"定下来，再去做清理（2026-10-10，用户报的卡顿）。**
+     *
+     * 用户的原话：「机器人启动\停止，用户点击以后应该是瞬间完成（起码 UI 页面上
+     * 用户感觉是瞬间完成，现在运行中的机器人运行\停止会卡住很久）」。
+     *
+     * 原来 `this.running.delete()` 在 `await autoTrader.stop()` **之后** ——
+     * 而 `stop()` 要等在途那一轮结束（最多 60 秒，那一轮可能正卡在一次 LLM 调用上）。
+     * 界面读的是 `statusOf()`（= `running.get(id)?.currentStatus ?? 'stopped'`），
+     * 于是**这 60 秒里页面上还写着"运行中"**，看起来就是"点了没反应"。
+     *
+     * 顺序反过来之后：状态立刻变 `stopped`，界面立刻翻；清理照常在后面做完。
+     * 清理期的机器人在 `running` 里已经不存在，所以并发 `start` 不会撞上半停的实例。
+     */
+    this.running.delete(traderId);
     this.startedAt.delete(traderId);
+    if (autoTrader) {
+      /* 掐断在途的 AI 请求 —— 这是"停止"要立即生效的那部分。 */
+      autoTrader.abortInFlightCycle();
+      traders.setStatus(traderId, 'stopped', null);
+      await autoTrader.stop();
+    } else {
+      traders.setStatus(traderId, 'stopped', null);
+    }
     this.cancelFillReconcile(traderId);
     const stream = this.userStreams.get(traderId);
     if (stream) {

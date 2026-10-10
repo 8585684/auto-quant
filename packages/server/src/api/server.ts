@@ -48,7 +48,7 @@ import {
   users,
 } from '../store/repositories.js';
 import type { TraderManager } from '../trader/manager.js';
-import { readLlmHealth } from '../trader/manager.js';
+import { readLlmHealth, recordLlmHealth } from '../trader/manager.js';
 import {
   requireAuth,
   signToken,
@@ -1399,12 +1399,18 @@ export async function buildServer(deps: ApiDependencies): Promise<FastifyInstanc
     return { ok: true };
   }));
 
-  /** Probe the model endpoint without starting a trader. */
+  /**
+   * Probe the model endpoint without starting a trader.
+   *
+   * 结果写进 `llm_health:<id>`(同一份记录机器人运行时的调用结果)。否则点完「测试」
+   * 刷新页面,「最近测试」就回到"从未测试" —— 结果只活在前端内存里。
+   */
   app.post('/api/ai-models/:id/test', authed, async (request, reply) => {
     const id = Number((request.params as { id: string }).id);
     const row = aiModels.getWithSecret(id);
     if (!row) return reply.code(404).send({ error: '找不到该模型' });
 
+    const at = () => new Date().toISOString();
     try {
       const { LlmClient } = await import('../llm/client.js');
       const client = new LlmClient({
@@ -1416,9 +1422,14 @@ export async function buildServer(deps: ApiDependencies): Promise<FastifyInstanc
         maxRetries: 0,
       });
       const probe = await client.testConnection();
+      recordLlmHealth(id, probe.ok
+        ? { ok: true, at: at(), latencyMs: probe.latencyMs }
+        : { ok: false, at: at(), latencyMs: probe.latencyMs, error: probe.message.slice(0, 300) });
       return probe;
     } catch (error) {
-      return reply.code(400).send({ ok: false, message: (error as Error).message, latencyMs: 0 });
+      const message = (error as Error).message;
+      recordLlmHealth(id, { ok: false, at: at(), error: message.slice(0, 300) });
+      return reply.code(400).send({ ok: false, message, latencyMs: 0 });
     }
   });
 
@@ -1695,13 +1706,15 @@ export async function buildServer(deps: ApiDependencies): Promise<FastifyInstanc
     const body = (request.body ?? {}) as { dryRun?: boolean };
     // Paper mode is the default: a real-money start must be asked for explicitly.
     const dryRun = body.dryRun ?? true;
-    const result = await deps.manager.startTrader(id, dryRun);
+    /* ⚠️ 同步返回，不等启动跑完 —— 建连接/拉持仓/对账都要等，界面会像"点了没反应"（2026-10-10）。 */
+    const result = deps.manager.startTraderAsync(id, dryRun);
     if (!result.ok) return reply.code(400).send(result);
     return result;
   });
 
   app.post('/api/traders/:id/stop', authed, async (request) => {
-    await deps.manager.stopTrader(Number((request.params as { id: string }).id));
+    /* ⚠️ 不 await：stopTrader 已先把状态翻成 stopped 并掐断在途 AI 请求（2026-10-10）。 */
+    void deps.manager.stopTrader(Number((request.params as { id: string }).id));
     return { ok: true };
   });
 
