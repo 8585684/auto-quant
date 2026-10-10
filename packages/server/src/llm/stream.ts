@@ -149,7 +149,16 @@ export function mergeOpenAiStreamChunks(lines: readonly string[]): unknown {
  * 所以网关的 100 秒超时不再作用于"生成耗时"。而本函数会一直读到流结束 ——
  * 对上层来说，返回时机与非流式一样，只是**期间连接是活的**。
  */
-export async function readOpenAiStreamLines(response: Response): Promise<string[]> {
+export async function readOpenAiStreamLines(
+  response: Response,
+  /**
+   * 每收到一块数据就调一次 —— 给调用方**重置"卡住"计时器**用。
+   *
+   * 见 `http.ts` 的 `executeStreamRequest`：慢模型一边正常吐字、一边撞总时长超时，
+   * 是 2026-10-10 用户实测到的问题。**判据该是"有没有在动"，不是"一共花了多久"。**
+   */
+  onActivity?: () => void,
+): Promise<string[]> {
   const body = response.body;
   if (body === null) return [];
   const reader = body.getReader();
@@ -160,6 +169,8 @@ export async function readOpenAiStreamLines(response: Response): Promise<string[
   for (;;) {
     const { done, value } = await reader.read();
     if (done) break;
+    /* 收到数据 = 上游还在动 —— 让调用方的"卡住"计时器重新开始。 */
+    onActivity?.();
     buffer += decoder.decode(value, { stream: true });
     /*
      * 按行切：SSE 用 `\n`，但网关偶尔发 `\r\n`。留最后一段（可能是半行）

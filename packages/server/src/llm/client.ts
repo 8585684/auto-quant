@@ -29,7 +29,20 @@ const log = createLogger('llm');
  * 但它**避免把"我们跑得慢"误报成"上游挂了"** —— 那是两条完全不同的诊断路径。
  */
 const DEFAULT_TIMEOUT_SECONDS = 300;
-const DEFAULT_MAX_RETRIES = 3;
+/*
+ * ⚠️ **默认重试从 3 提到 10（2026-10-10，用户实测）。**
+ *
+ * 用户的原话：「那些不稳定的提供商（偶发连接失败）……**只要重试\等待基本能正常使用**……
+ * 偶发失败（重连大概 20 次以内）都是正常情况，系统应当正常运行下去」。
+ *
+ * 原来的 3 只有 3 次尝试、退避合计约 1.5 秒 —— 对偶发断连的第三方几乎等于不重试，
+ * 于是"能靠重试救回来"的一轮被直接判成失败。退避是 `min(30s, 0.5s·2^n)`，
+ * 10 次的总等待仍然远小于一轮的硬超时（60 分钟）。
+ *
+ * **这不是"掩盖故障"**：真失败（401/402/模型不存在）仍然是不可重试的，
+ * 一次就结束；这里放宽的只有"网络抖动/限流/超时"那一类。
+ */
+const DEFAULT_MAX_RETRIES = 10;
 /** Full-jitter backoff bounds from B.14 (`base ≈ 500ms`, cap ≈ 30s). */
 const BACKOFF_BASE_MS = 500;
 const BACKOFF_CAP_MS = 30_000;
@@ -596,8 +609,18 @@ export class LlmClient {
      * 任一信号触发都会中止这一跳；重试循环会照常进入下一次尝试，
      * 而那时 `signal.aborted` 仍为真 —— 上层会看到这一轮被判定为失败。
      */
-    const signal =
-      options.signal === undefined
+    /*
+     * ⚠️ **流式路径不能套"总时长超时"（2026-10-10，用户实测）。**
+     *
+     * 那条判据会误杀慢模型：≈30 tok/s 的模型回答长问题时，总时长必然比
+     * 按 ≈300 tok/s 设计的阈值大得多 —— 于是它**一边正常吐字、一边被判失败**。
+     * 流式自己按"多久没有数据"判定卡住（见 `http.ts` 的 `STREAM_IDLE_TIMEOUT_MS`），
+     * 外层还有轮次硬超时兜底。
+     */
+    const signal = useStream
+      ? /* 流式：只把调用方的取消信号交出去，"卡住"由 http 层判。 */
+        (options.signal ?? new AbortController().signal)
+      : options.signal === undefined
         ? AbortSignal.timeout(this.timeoutMs)
         : AbortSignal.any([AbortSignal.timeout(this.timeoutMs), options.signal]);
     const response = useStream
