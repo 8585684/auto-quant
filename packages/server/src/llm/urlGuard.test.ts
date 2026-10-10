@@ -16,7 +16,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { checkOutboundUrl } from './urlGuard.js';
+import { checkOutboundUrl, parseHostAllowlist } from './urlGuard.js';
 
 /** 断言被拒，并返回原因，便于确认拒的是**正确的那一条规则**。 */
 function rejected(url: string): string {
@@ -111,4 +111,57 @@ test('正常的公网端点全部放行', () => {
   allowed('http://gateway.example.com:8080/v1');
   // 主机名里含数字 / 连字符不能误判成 IP
   allowed('https://llm-2.example.com/v1');
+});
+
+/* -------------------------------------------------------------------------- */
+/*  内网白名单（2026-10-11：用户要连自建的内网 LLM 服务）                        */
+/* -------------------------------------------------------------------------- */
+
+test('★ 默认仍然挡掉私网 —— 白名单不能改变默认行为', () => {
+  /*
+   * 用户要把 baseUrl 指向自己内网的 LLM 服务（`http://172.19.0.1:8317/v1`）。
+   * 放行必须**由操作员显式声明**：不传白名单时，行为与从前**完全一致**。
+   *
+   * 这一条是整套改动的地基 —— 如果哪天它红了，说明"默认安全"被悄悄改掉了。
+   */
+  for (const url of [
+    'http://172.19.0.1:8317/v1',
+    'http://10.0.0.5:8080/v1',
+    'http://192.168.1.10/v1',
+    'http://127.0.0.1:11434/v1',
+    'http://169.254.169.254/latest/meta-data/',
+  ]) {
+    assert.equal(checkOutboundUrl(url).allowed, false, `★ ${url} 默认必须被挡`);
+  }
+});
+
+test('★ 显式声明的内网目标才放行 —— 且只放行它', () => {
+  const list = parseHostAllowlist('172.19.0.1');
+  assert.equal(checkOutboundUrl('http://172.19.0.1:8317/v1', list).allowed, true, '声明过的主机应放行');
+
+  /*
+   * ⚠️ **关键：放行一个地址，不能顺带放行云元数据。**
+   * 这正是"不直接放开私网、而要做显式清单"的全部理由。
+   */
+  assert.equal(
+    checkOutboundUrl('http://169.254.169.254/latest/meta-data/', list).allowed,
+    false,
+    '★ 声明 172.19.0.1 不能顺带允许元数据地址',
+  );
+  assert.equal(checkOutboundUrl('http://172.19.0.2/v1', list).allowed, false, '同网段的其他主机也不该被放行');
+});
+
+test('CIDR / 域名后缀 / 主机名的写法都生效', () => {
+  assert.equal(checkOutboundUrl('http://172.19.5.9/v1', parseHostAllowlist('172.19.0.0/16')).allowed, true);
+  assert.equal(checkOutboundUrl('http://172.20.5.9/v1', parseHostAllowlist('172.19.0.0/16')).allowed, false);
+  assert.equal(checkOutboundUrl('http://gw.corp.lan/v1', parseHostAllowlist('.corp.lan')).allowed, true);
+  assert.equal(checkOutboundUrl('http://localhost:11434/v1', parseHostAllowlist('localhost')).allowed, true);
+  /* 空白/逗号分隔都要认 —— 手输的清单不该因为分隔符而静默失效。 */
+  assert.equal(parseHostAllowlist('172.19.0.1, 10.1.2.3').length, 2);
+  assert.equal(parseHostAllowlist('  172.19.0.1   10.1.2.3 ').length, 2);
+});
+
+test('白名单不能绕过协议校验', () => {
+  /* 协议校验在白名单之前 —— 声明了主机也不该让 file: 通过。 */
+  assert.equal(checkOutboundUrl('file:///etc/passwd', parseHostAllowlist('localhost')).allowed, false);
 });

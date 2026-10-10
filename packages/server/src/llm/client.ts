@@ -8,7 +8,8 @@ import * as openai from './openaiCompatible.js';
 import * as anthropic from './anthropic.js';
 import * as gemini from './gemini.js';
 import { EMPTY_USAGE, type ChatMessage, type ChatResult, type OutboundRequest } from './types.js';
-import { checkOutboundUrl } from './urlGuard.js';
+import { checkOutboundUrl, parseHostAllowlist } from './urlGuard.js';
+import { env } from '../env.js';
 
 const log = createLogger('llm');
 
@@ -233,7 +234,12 @@ export class LlmClient {
      *
      * 不重试、直接失败：这不是网络抖动，重试只会把同一个内网请求再发一遍。
      */
-    const verdict = checkOutboundUrl(this.baseUrl);
+    /*
+     * 操作员显式声明的内网目标（`ALLOW_PRIVATE_LLM_HOSTS`）——
+     * 自建网关/私有部署要连内网地址，而默认规则会挡掉它们。
+     * 每次读 env 而不是模块级常量：测试可以按用例改环境。
+     */
+    const verdict = checkOutboundUrl(this.baseUrl, parseHostAllowlist(env.allowPrivateLlmHosts));
     if (!verdict.allowed) {
       throw new LlmError(
         `baseUrl 不被允许：${verdict.reason}`,

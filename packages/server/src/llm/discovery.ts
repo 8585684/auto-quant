@@ -1,7 +1,8 @@
 import { getProvider, type DiscoveredModel, type LlmProviderId } from '@aq/shared';
 import { createLogger } from '../logger.js';
 import { classifyHttpError } from './errors.js';
-import { checkOutboundUrl } from './urlGuard.js';
+import { checkOutboundUrl, parseHostAllowlist } from './urlGuard.js';
+import { env } from '../env.js';
 
 const log = createLogger('llm:discovery');
 
@@ -87,7 +88,7 @@ export async function discoverModels(options: {
   // 模型列表发现是**服务端主动发出**的 GET 请求，和对话请求一样能被打成 SSRF 跳板，
   // 所以走同一套地址白名单。API 层已经拦过一次，这里是纵深防御：
   // 将来若有人从别处调用 discovery，也不会绕过。
-  const verdict = checkOutboundUrl(baseUrl);
+  const verdict = checkOutboundUrl(baseUrl, parseHostAllowlist(env.allowPrivateLlmHosts));
   if (!verdict.allowed) {
     return fallback(`baseUrl 不被允许：${verdict.reason}`);
   }

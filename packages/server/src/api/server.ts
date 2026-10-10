@@ -61,7 +61,7 @@ import {
   type TokenPayload,
 } from './auth.js';
 import { FailureThrottle, IP_THROTTLE_OPTIONS, USERNAME_THROTTLE_OPTIONS } from './loginThrottle.js';
-import { checkOutboundUrl } from '../llm/urlGuard.js';
+import { checkOutboundUrl, parseHostAllowlist } from '../llm/urlGuard.js';
 import type { BalanceService } from '../services/balance.js';
 
 const log = createLogger('api');
@@ -102,7 +102,16 @@ const BaseUrlSchema = z
   .default('')
   .superRefine((value, ctx) => {
     if (!value) return;
-    const verdict = checkOutboundUrl(value);
+    /*
+     * ⚠️ **这里必须也传操作员的内网白名单（2026-10-11）。**
+     *
+     * 这是**保存模型时的校验**，也就是用户看到「baseUrl 不被允许：私有地址 172.16.0.0/12」
+     * 的那一处。只改 `client.ts`/`discovery.ts` 的话，保存这一步照样拒绝 ——
+     * 于是"允许内网端点"这个开关**在用户真正会碰到的那道门上不起作用**。
+     *
+     * 教训：一个开关接了几处、漏了一处，等于没接 —— 因为用户只会撞上漏的那一处。
+     */
+    const verdict = checkOutboundUrl(value, parseHostAllowlist(env.allowPrivateLlmHosts));
     if (!verdict.allowed) {
       ctx.addIssue({ code: z.ZodIssueCode.custom, message: `baseUrl 不被允许：${verdict.reason}` });
     }
