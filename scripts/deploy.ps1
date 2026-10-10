@@ -200,6 +200,11 @@ Remove-Item $archive -Force
 
 $remote = @"
 set -e
+# ⚠️ **必须同时有 pipefail（2026-10-11 审查发现）。**
+# 下面 `npm ci … 2>&1 | tail -2` 放在 `if` 条件里：没有 pipefail 时整条管道的退出码
+# 是 `tail` 的 0，**安装失败也会走 then 分支**、写进 lock stamp，
+# 下次部署就"依赖未变化，跳过安装" —— 服务带着缺包重启，而本地照常打印「完成」。
+set -o pipefail
 export PATH=/usr/local/node22/bin:`$PATH
 cd $RemoteDir
 

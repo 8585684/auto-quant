@@ -164,6 +164,22 @@ export function recordLlmHealth(aiModelId: number, health: LlmHealth): void {
  */
 const START_WATCHDOG_MS = 90_000;
 
+/**
+ * 连接缓存的键：**同一台机器人的"模拟盘"与"实盘"是两条不同的连接。**
+ *
+ * 见 `connectionFor` 里那段说明 —— 键里少了 `dryRun` 会让模拟盘启动复用到实盘连接，
+ * 日志写模拟、订单真实成交（2026-10-11 审查发现的 P0）。
+ */
+function connectionCacheKey(traderId: number, dryRun: boolean): string {
+  return `${traderId}:${dryRun ? 'paper' : 'live'}`;
+}
+
+/** 把某台机器人**两种模式**的连接都从缓存里去掉（停止 / 失败 / 清理时用）。 */
+function dropConnections(store: Map<string, ExchangeConnection>, traderId: number): void {
+  store.delete(connectionCacheKey(traderId, true));
+  store.delete(connectionCacheKey(traderId, false));
+}
+
 export function startGuard(input: {
   traderId: number;
   globalTradingDisabled: boolean;
@@ -266,7 +282,7 @@ export class TraderManager {
    * 都能凑成这个组合。所以启动必须**先占位、再干活**。
    */
   private readonly starting = new Set<number>();
-  private readonly connections = new Map<number, ExchangeConnection>();
+  private readonly connections = new Map<string, ExchangeConnection>();
   private readonly userStreams = new Map<number, BinanceUserDataStream>();
   /**
    * 成交触发的即时对账，按机器人去抖 —— 见 `scheduleFillReconcile()`。
@@ -494,7 +510,24 @@ export class TraderManager {
     exchangeAccountId: number,
     dryRun: boolean,
   ): Promise<ExchangeConnection> {
-    const existing = this.connections.get(traderId);
+    /*
+     * ⚠️ **缓存键必须带上 `dryRun`（2026-10-11 审查发现的 P0）。**
+     *
+     * 原来键只有 `traderId`，命中就直接返回 —— **完全不比对 `dryRun`**。后果：
+     *
+     *   1. 开机数秒后对全部机器人做对账，那是按**实盘**建的连接；
+     *   2. 之后操作员按默认的「模拟盘」启动同一台机器人；
+     *   3. 它拿到的是第 1 步那条**实盘**连接 —— 日志写"模拟盘"，**订单真实成交**。
+     *
+     * 这是"一个字段说模拟、另一个字段在下真单"，比任何账目偏差都严重：
+     * 操作员以为在纸面上试，钱已经动了。
+     *
+     * 键改成 `traderId:paper|live`：两种模式各持一条连接，互不冒充。
+     * 同一台机器人的两种模式**本来就不该共享**连接对象 ——
+     * 它的 `dryRun` 是构造时定死的，不是可切换的开关。
+     */
+    const cacheKey = connectionCacheKey(traderId, dryRun);
+    const existing = this.connections.get(cacheKey);
     if (existing) return existing;
 
     const account = exchanges.getWithSecret(exchangeAccountId);
@@ -531,7 +564,7 @@ export class TraderManager {
       ...(process.env.BINANCE_WS_HOST ? { wsHostOverride: process.env.BINANCE_WS_HOST } : {}),
     });
 
-    this.connections.set(traderId, connection);
+    this.connections.set(cacheKey, connection);
     return connection;
   }
 
@@ -873,7 +906,7 @@ export class TraderManager {
 
       const blocking = connectivity.filter((c) => !c.ok && c.blocking);
       if (blocking.length > 0) {
-        this.connections.delete(traderId);
+        dropConnections(this.connections, traderId);
         const message = blocking.map((c) => `${c.name}: ${c.detail}`).join(' ');
         traders.setStatus(traderId, 'error', message);
         return {
@@ -1265,7 +1298,7 @@ export class TraderManager {
       const message = (error as Error).message;
       log.error(`启动机器人 ${traderId} 失败：${message}`);
       this.running.delete(traderId);
-      this.connections.delete(traderId);
+      dropConnections(this.connections, traderId);
       traders.setStatus(traderId, 'error', message);
       return {
         result: { ok: false, error: message, preflight: checks },
@@ -1422,7 +1455,7 @@ export class TraderManager {
       await stream.stop().catch(() => undefined);
       this.userStreams.delete(traderId);
     }
-    this.connections.delete(traderId);
+    dropConnections(this.connections, traderId);
     runtimeLogs.write(traderId, 'info', 'manager', '机器人已停止');
   }
 

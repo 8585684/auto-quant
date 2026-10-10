@@ -1684,6 +1684,28 @@ export async function buildServer(deps: ApiDependencies): Promise<FastifyInstanc
     }
     const parsed = TraderInputSchema.partial().safeParse(body);
     if (!parsed.success) throw new Error(parsed.error.issues[0]?.message ?? 'Invalid trader');
+    /*
+     * ⚠️ **带了仓储不支持的字段时必须明说，不能静默成功（2026-10-11 审查发现）。**
+     *
+     * `TraderInputSchema` 含 `exchangeAccountId`（创建时必需），而 `traders.update()`
+     * 的入参里**没有这个字段** —— 于是编辑弹窗改了交易所账户、接口回 200、
+     * `return traders.get(id)` 看起来一切正常，**而账户根本没变**。
+     *
+     * 这是最坏的一类失败：**它告诉你成功了。** 与本项目反复在消灭的
+     * "一个字段说做成了、另一个字段说什么都没有"是同一个病。
+     *
+     * 现在显式拒绝。**不支持就说"不支持"，不要假装成功。**
+     * （真正支持"改交易所账户"是独立改动：要清连接缓存、要对账按新账户重来 ——
+     *  那值得单独做，但不该以"静默丢弃"的形式存在。）
+     */
+    const unsupported = (['exchangeAccountId', 'mode'] as const).filter((key) => key in parsed.data);
+    if (unsupported.length > 0) {
+      return reply.code(400).send({
+        error:
+          `暂不支持通过编辑修改：${unsupported.join('、')}。` +
+          '要换交易所账户，请新建一个机器人（当前这个可以停掉保留历史）。',
+      });
+    }
     traders.update(id, parsed.data);
     return traders.get(id);
   }));
