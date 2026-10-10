@@ -303,14 +303,14 @@ function CycleSteps({
   const currentSec = Number.isFinite(lastAt) ? Math.max(0, Math.round((nowMs - lastAt) / 1000)) : 0;
   const mmss = (s: number): string => `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
   return (
-    <div className="mb-1.5 min-w-0 rounded-md border border-base-800 bg-base-900/40 px-2 py-1.5 text-xs">
+    <div className="mb-1.5 min-w-0 rounded-md border border-base-700 bg-base-850/60 px-2.5 py-2 text-xs">
       <button
         type="button"
         onClick={() => setOpen((v) => !v)}
         title={open ? '收起这一轮的步骤' : '展开这一轮在做的每一步'}
-        className="flex w-full min-w-0 items-center gap-1.5 text-left text-ink-lo transition hover:text-ink-hi"
+        className="group flex w-full min-w-0 items-center gap-2 text-left"
       >
-        <span aria-hidden className="shrink-0 text-ink-faint">
+        <span aria-hidden className="shrink-0 text-ink-lo transition group-hover:text-ink-hi">
           {open ? '▾' : '▸'}
         </span>
         {/*
@@ -319,20 +319,32 @@ function CycleSteps({
           （`animate-pulse-soft` 是 `tailwind.config.js` 里注册的名字）。
         */}
         <span aria-hidden className="h-1.5 w-1.5 shrink-0 animate-pulse-soft rounded-full bg-accent" />
-        <span className="shrink-0 text-ink-faint">当前</span>
-        {/* 最新一步 —— 折叠时这一格就是"它现在在做什么"。 */}
-        <span className="min-w-0 truncate">{last.message}</span>
+        <span className="shrink-0 text-ink-lo">当前</span>
+        {/* 最新一步 —— 折叠时这一格就是"它现在在做什么"。**最亮的一档**：它是本体。 */}
+        <span className="min-w-0 truncate text-ink-hi">{last.message}</span>
         {/*
           两个数回答两个问题，**同一口径**（见上面 `elapsedSec` 的说明）：
           · `mmss(elapsedSec)`   —— 这一轮一共跑了多久
           · `currentSec`         —— **当前这一步**已经卡了多久（它才是"是不是卡住"的答案）
         */}
-        <span className="num ml-auto shrink-0 text-ink-faint">
-          已 {mmss(elapsedSec)} · 这一步 {currentSec}s
+        <span className="num ml-auto flex shrink-0 items-center gap-2 rounded border border-base-700 bg-base-900 px-2 py-0.5">
+          <span className="text-ink-lo">
+            已 <span className="text-ink-hi">{mmss(elapsedSec)}</span>
+          </span>
+          <span aria-hidden className="text-ink-faint">
+            ·
+          </span>
+          {/*
+            当前这一步的用时 —— "它是不是卡住了"的唯一答案，所以单独一档：
+            超过 60 秒转琥珀色，扫一眼就知道该不该担心。
+          */}
+          <span className="text-ink-lo">
+            这一步 <span className={currentSec >= 60 ? 'text-accent' : 'text-ink-hi'}>{currentSec}s</span>
+          </span>
         </span>
       </button>
       {open && (
-        <ol className="mt-1.5 space-y-0.5 border-t border-base-800 pt-1.5">
+        <ol className="mt-2 space-y-1 border-t border-base-700 pt-2">
           {steps.map((s, i) => {
             const at = Date.parse(s.at);
             const prevAt = i > 0 ? Date.parse(steps[i - 1]!.at) : at;
@@ -348,7 +360,8 @@ function CycleSteps({
             const isCurrent = i === steps.length - 1;
             return (
               <li key={`${s.at}-${i}`} className="flex min-w-0 items-start gap-2">
-                <span className="num shrink-0 text-ink-faint">
+                {/* 时刻与耗时都是**读数**，用能看清的一档。 */}
+                <span className="num shrink-0 text-ink-lo">
                   {new Date(s.at).toLocaleTimeString('en-GB', { hour12: false })}
                 </span>
                 {/*
@@ -368,13 +381,14 @@ function CycleSteps({
                 >
                   {isCurrent ? '⟳' : '✓'}
                 </span>
-                <span className="num w-11 shrink-0 text-right text-ink-faint">
+                <span className="num w-11 shrink-0 text-right text-ink-lo">
                   {deltaSec === 0 ? '—' : `${deltaSec}s`}
                 </span>
                 <span
                   className={
                     'min-w-0 break-words ' +
-                    (s.level === 'error' ? 'text-down' : s.level === 'warn' ? 'text-accent' : 'text-ink-lo')
+                    /* 正文比读数更亮一档：它是主角，时刻与耗时是配角。 */
+                    (s.level === 'error' ? 'text-down' : s.level === 'warn' ? 'text-accent' : 'text-ink-hi')
                   }
                 >
                   {s.message}
