@@ -275,17 +275,7 @@ function elapsedLabel(seconds: number): string {
  * 用 `<button>` + 条件渲染而不是 `<details>`：`<details>` 的展开态不进 React 状态，
  * 而这里要跟着 `steps` 增长自动滚到最新（列表本身在增长，不能用一次性快照）。
  */
-function CycleSteps({
-  steps,
-  elapsedSec,
-  nowMs,
-}: {
-  steps: LiveCycle['steps'];
-  /** 这一轮**从开始到现在**已用时（秒）—— 与在途盒子里的读数是同一个口径。 */
-  elapsedSec: number;
-  /** 当前时刻（epoch ms）。**当前这一步走了多久**要跟着秒表动，不能只看到最后一次活动。 */
-  nowMs: number;
-}) {
+function CycleSteps({ steps, elapsedSec }: { steps: LiveCycle['steps']; elapsedSec: number }) {
   const [open, setOpen] = useState(false);
   if (steps.length === 0) return null;
   const last = steps[steps.length - 1]!;
@@ -300,7 +290,6 @@ function CycleSteps({
    * 现在：`elapsedSec` 由父组件给（与盒子同一个来源），
    * `currentSec` 是**当前这一步**已经走了多久 —— 它们相减没有意义，因为回答的是两个问题。
    */
-  const currentSec = Number.isFinite(lastAt) ? Math.max(0, Math.round((nowMs - lastAt) / 1000)) : 0;
   const mmss = (s: number): string => `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
   return (
     <div className="mb-1.5 min-w-0 rounded-md border border-base-700 bg-base-850/60 px-2.5 py-2 text-xs">
@@ -319,7 +308,7 @@ function CycleSteps({
           （`animate-pulse-soft` 是 `tailwind.config.js` 里注册的名字）。
         */}
         <span aria-hidden className="h-1.5 w-1.5 shrink-0 animate-pulse-soft rounded-full bg-accent" />
-        <span className="shrink-0 text-ink-lo">当前</span>
+
         {/* 最新一步 —— 折叠时这一格就是"它现在在做什么"。**最亮的一档**：它是本体。 */}
         <span className="min-w-0 truncate text-ink-hi">{last.message}</span>
         {/*
@@ -327,20 +316,27 @@ function CycleSteps({
           · `mmss(elapsedSec)`   —— 这一轮一共跑了多久
           · `currentSec`         —— **当前这一步**已经卡了多久（它才是"是不是卡住"的答案）
         */}
-        <span className="num ml-auto flex shrink-0 items-center gap-2 rounded border border-base-700 bg-base-900 px-2 py-0.5">
-          <span className="text-ink-lo">
-            已 <span className="text-ink-hi">{mmss(elapsedSec)}</span>
-          </span>
-          <span aria-hidden className="text-ink-faint">
-            ·
-          </span>
-          {/*
-            当前这一步的用时 —— "它是不是卡住了"的唯一答案，所以单独一档：
-            超过 60 秒转琥珀色，扫一眼就知道该不该担心。
-          */}
-          <span className="text-ink-lo">
-            这一步 <span className={currentSec >= 60 ? 'text-accent' : 'text-ink-hi'}>{currentSec}s</span>
-          </span>
+        {/*
+          ⚠️ **就一个计时器，别的都不写（2026-10-10）。**
+          
+          上一版这里是「已 1:53 · 这一步 1s」。用户的原话是
+          「这表述我他妈看得一头雾水，你就直接显示计时不就好了吗？
+            搞些什么奇奇怪怪得非主流语言在上面」。
+          
+          **他说得对**：`已` / `这一步` 是我自己发明的说法，一个读数不需要前缀；
+          计时器本身就是"从开始到现在"，跳动的秒数已经回答了"它还在动吗"。
+          每一步各花了多久，去展开视图里看（那里是表格，列本身有含义）。
+          
+          唯一保留的判断是**颜色**：超过 2 分钟转琥珀色 —— 那是"比平常久"的
+          无声提示，不占字。
+        */}
+        <span
+          className={
+            'num ml-auto shrink-0 tabular-nums ' +
+            (elapsedSec >= 120 ? 'text-accent' : 'text-ink-hi')
+          }
+        >
+          {mmss(elapsedSec)}
         </span>
       </button>
       {open && (
@@ -454,7 +450,7 @@ function LiveCycleBlock({ live }: { live: LiveCycle }) {
         实线 + 抬升底色是"这一轮已经出结果"的语言，用在这里会被读成成品（§1）。
       */}
       {/* 步骤流水：默认折叠成一行摘要，点开看这一轮在做的每一步。 */}
-      <CycleSteps steps={live.steps} elapsedSec={seconds} nowMs={startedAt + seconds * 1000} />
+      <CycleSteps steps={live.steps} elapsedSec={seconds} />
 
       <div className="min-w-0 rounded-lg border border-dashed border-base-600 bg-base-900/40 px-3 py-3">
         <div className="flex min-w-0 items-start gap-2">
