@@ -1110,6 +1110,33 @@ export class AutoTrader {
       traderId: this.deps.trader.id,
       raw: message,
     });
+    /*
+     * ⚠️ **一轮里发生的每一件事，顺带作为"当前步骤"推给界面（2026-10-10）。**
+     *
+     * ## 为什么挂在 `emit` 上，而不是在一轮的六个节点各写一次
+     *
+     * `emit` 本来就是"这一轮发生了什么"的唯一出口 —— 取数、模型调用与重试、
+     * 执行、挂保护单、对账**全都走它**。挂在六个节点上意味着六处各自漂移；
+     * 挂在这里则**自动覆盖未来新增的每一个步骤**，一行都不用改。
+     *
+     * ## 归属哪一轮：用 `cyclePromise` 判断，不加任何状态位
+     *
+     * `cyclePromise` 非空**恰好等价于**"有一轮在跑"（`inCycle` 里赋值、`finally` 清）。
+     * 所以不需要额外的 set/clear，也就没有"异常路径忘了清"的那种 bug ——
+     * 轮次外的日志（启动、对账、错误）不会被误当成某轮的步骤。
+     *
+     * **不落库**：它只活到这一轮结束（结论由 `decision` 事件带 `executionLog` 落库）。
+     */
+    if (this.cyclePromise !== null) {
+      eventBus.publish({
+        type: 'cycle_step',
+        traderId: this.deps.trader.id,
+        cycleNumber: this.cycleNumber,
+        level,
+        message,
+        at: new Date().toISOString(),
+      });
+    }
   }
 
   /**

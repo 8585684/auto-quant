@@ -1224,6 +1224,24 @@ export type ServerEvent = Replayable<
   | { type: 'trader_status'; traderId: number; status: TraderStatus; detail?: string }
   | { type: 'cycle_start'; traderId: number; cycleNumber: number; timestamp: string }
   | { type: 'cycle_end'; traderId: number; cycleNumber: number; summary: string; success: boolean }
+  /*
+   * **一轮**内部**的实时步骤**（2026-10-10，用户提的观测需求）。
+   *
+   * 用户的原话：「智能模式下，每一期最近决策里面能展开（就像你 DSH 一样），
+   * 能折叠实时显示当前步骤（默认是缩起来的，用户可以手动展开），
+   * 这样用户可以手动展开看系统到底在做什么，也可以判断系统到底是否正常工作」。
+   *
+   * 它**不落库**：这是"现在在做什么"，只需要活到这一轮结束。
+   * 落库的结论由 `decision` 那条事件给（它带 `executionLog`）。
+   */
+  | {
+      type: 'cycle_step';
+      traderId: number;
+      cycleNumber: number;
+      level: 'info' | 'warn' | 'error';
+      message: string;
+      at: string;
+    }
   | { type: 'decision'; traderId: number; record: DecisionRecord }
   | { type: 'positions'; traderId: number; positions: PositionView[] }
   | { type: 'order'; traderId: number; order: OrderRecord }

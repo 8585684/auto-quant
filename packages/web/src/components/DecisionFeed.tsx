@@ -255,6 +255,78 @@ function elapsedLabel(seconds: number): string {
  * 它回答的是"卡住了还是只是慢"这个问题，只有在这个条目内部才读得通
  * （`LAYOUT.md` §5 禁止把诊断值放进状态区）。
  */
+/**
+ * 这一轮的**步骤流水** —— 默认折叠，点开看每一步。
+ *
+ * ## 用户的原话（2026-10-10）
+ *
+ * > 「智能模式下，每一期最近决策里面能展开（就像你 DSH 一样），能折叠实时显示当前步骤
+ * >  （默认是缩起来的，用户可以手动展开），这样用户可以手动展开看系统到底在做什么，
+ * >  也可以判断系统到底是否正常工作」
+ * > 「如果不展开，就默认显示一条:关键的摘要，能大概看到在做什么，是否在做事，
+ * >  如果想看详情，再手动展开查看，里面就完全展示这一轮具体再做什么」
+ *
+ * ## 两条形态约束
+ *
+ * · **折叠态只有一行**：`步数 │ 最新那一步 │ 已用时`。它要回答的就是
+ *   "在做事吗、卡在哪一步"，所以取的必须是**最新一条**，不是第一条。
+ * · **展开态是完整流水**（带每步的时刻），后端只给最近 60 条。
+ *
+ * 用 `<button>` + 条件渲染而不是 `<details>`：`<details>` 的展开态不进 React 状态，
+ * 而这里要跟着 `steps` 增长自动滚到最新（列表本身在增长，不能用一次性快照）。
+ */
+function CycleSteps({ steps }: { steps: LiveCycle['steps'] }) {
+  const [open, setOpen] = useState(false);
+  if (steps.length === 0) return null;
+  const first = steps[0];
+  const last = steps[steps.length - 1]!;
+  /*
+   * 用**事件自带的时间戳**算跨度，不用本地收到的时刻 ——
+   * 同一来源的两个读数相减才有意义（`LiveCycle.startedAt` 的注释是同一个理由）。
+   */
+  const spanSec =
+    first === undefined ? 0 : Math.max(0, Math.round((Date.parse(last.at) - Date.parse(first.at)) / 1000));
+  return (
+    <div className="mb-1.5 min-w-0 rounded-md border border-base-800 bg-base-900/40 px-2 py-1.5 text-xs">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        title={open ? '收起这一轮的步骤' : '展开这一轮在做的每一步'}
+        className="flex w-full min-w-0 items-center gap-1.5 text-left text-ink-lo transition hover:text-ink-hi"
+      >
+        <span aria-hidden className="shrink-0 text-ink-faint">
+          {open ? '▾' : '▸'}
+        </span>
+        <span className="num shrink-0 text-ink-faint">{steps.length} 步</span>
+        <span aria-hidden className="shrink-0 text-ink-faint">
+          │
+        </span>
+        {/* 最新一步 —— 折叠时这一格就是"它现在在做什么"。 */}
+        <span className="min-w-0 truncate">{last.message}</span>
+        <span className="num ml-auto shrink-0 text-ink-faint">{spanSec}s</span>
+      </button>
+      {open && (
+        <ol className="mt-1.5 space-y-0.5 border-t border-base-800 pt-1.5">
+          {steps.map((s, i) => (
+            <li key={`${s.at}-${i}`} className="flex min-w-0 items-start gap-2">
+              <span className="num shrink-0 text-ink-faint">
+                {new Date(s.at).toLocaleTimeString('en-GB', { hour12: false })}
+              </span>
+              <span
+                className={
+                  'min-w-0 break-words ' +
+                  (s.level === 'error' ? 'text-down' : s.level === 'warn' ? 'text-accent' : 'text-ink-lo')
+                }
+              >
+                {s.message}
+              </span>
+            </li>
+          ))}
+        </ol>
+      )}
+    </div>
+  );
+}
 function LiveCycleBlock({ live }: { live: LiveCycle }) {
   const startedAt = live.startedAt;
   const [seconds, setSeconds] = useState(() => Math.max(0, Math.floor((Date.now() - startedAt) / 1000)));
@@ -295,13 +367,22 @@ function LiveCycleBlock({ live }: { live: LiveCycle }) {
         <span aria-hidden className="text-ink-faint">
           │
         </span>
-        <span className="animate-pulse-soft">正在请求模型…</span>
+        {/*
+          ⚠️ **这一格跟着 `cycle_step` 走，而不是固定写"正在请求模型…"（2026-10-10）。**
+          它要回答的是"它现在在做什么" —— 固定的句子在一轮跑了几十秒之后就不带信息了。
+        */}
+        <span className="min-w-0 truncate">
+          {live.steps.length > 0 ? live.steps[live.steps.length - 1]!.message : '正在请求模型…'}
+        </span>
       </div>
 
       {/*
         盒子：虚线边框 + 更弱的底色，**不是**成品的 `bg-base-850`。
         实线 + 抬升底色是"这一轮已经出结果"的语言，用在这里会被读成成品（§1）。
       */}
+      {/* 步骤流水：默认折叠成一行摘要，点开看这一轮在做的每一步。 */}
+      <CycleSteps steps={live.steps} />
+
       <div className="min-w-0 rounded-lg border border-dashed border-base-600 bg-base-900/40 px-3 py-3">
         <div className="flex min-w-0 items-start gap-2">
           <LoaderCircle aria-hidden className="mt-0.5 h-4 w-4 shrink-0 animate-spin text-accent" />
