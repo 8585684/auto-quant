@@ -155,6 +155,15 @@ export function recordLlmHealth(aiModelId: number, health: LlmHealth): void {
  * 项目自己的风格要求就是"导出的纯函数优先于需要打桩的对象"（§5.4）—— 这里照它办。
  * **判定顺序与错误文案都与原来一字不差**：这只是提取，不是改行为。
  */
+/**
+ * 启动流程的看门狗（毫秒）。
+ *
+ * 超过这个时间还没进入 `running`，就把状态落到 `error` 并释放 `starting` 占位 ——
+ * 见 `startTraderAsync` 里的说明。**"永远停在启动中"会让操作员既看不到结论、
+ * 又点不动按钮**，比一个明确的失败更糟。
+ */
+const START_WATCHDOG_MS = 90_000;
+
 export function startGuard(input: {
   traderId: number;
   globalTradingDisabled: boolean;
@@ -1303,11 +1312,41 @@ export class TraderManager {
      * 中间**没有 await**，两次调用在同一个同步块里，不存在并发窗口。
      */
     traders.setStatus(traderId, 'starting', null);
+
+    /*
+     * ⚠️ **"卡在启动中"本身是个 bug，必须有兜底（2026-10-10 实测）。**
+     *
+     * 用户点启动后界面停在「正在启动中」，而且**再点也点不动** —— 因为
+     * `startTrader` 的 `starting` 占位一直没释放，守卫就一直回
+     * 「该机器人正在启动中」。根因是启动流程里某一步没有返回
+     *（模型不可用那条路上有长重试），而**状态与占位都跟着它一起悬住**。
+     *
+     * 所以加一道看门狗：无论如何，启动要么进 `running`，要么落到 `error`
+     * 并释放占位。**"永远停在启动中"不是一种可接受的状态** ——
+     * 操作员既看不到结论，也失去了重试的能力。
+     */
+    const startWatchdog = setTimeout(() => {
+      if (this.running.has(traderId)) return;
+      /* 占位一定要释放：否则用户**再也点不动这个按钮**。 */
+      this.starting.delete(traderId);
+      const message =
+        '启动流程超时未完成（可能是 AI 模型不可用导致的长重试）。机器人未进入运行状态，可以重试或更换模型。';
+      log.error(`机器人 ${traderId} ${message}`);
+      traders.setStatus(traderId, 'error', message);
+    }, START_WATCHDOG_MS);
+    /* 别让这个定时器拖住进程退出。 */
+    startWatchdog.unref?.();
+
     void this.startTrader(traderId, dryRun)
       .then((result) => {
-        if (!result.ok) log.warn(`机器人 ${traderId} 启动失败：${result.error ?? '未知错误'}`);
+        clearTimeout(startWatchdog);
+        if (result.ok) return;
+        log.warn(`机器人 ${traderId} 启动失败：${result.error ?? '未知错误'}`);
+        /* 失败必须落到 `error` —— 否则状态会停在 `starting` 上（见看门狗）。 */
+        traders.setStatus(traderId, 'error', result.error ?? '启动失败');
       })
       .catch((error: unknown) => {
+        clearTimeout(startWatchdog);
         const message = (error as Error).message;
         log.error(`机器人 ${traderId} 启动时抛错：${message}`);
         traders.setStatus(traderId, 'error', message);

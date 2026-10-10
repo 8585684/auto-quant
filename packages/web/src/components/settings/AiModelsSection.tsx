@@ -126,6 +126,31 @@ function SecretChip({ hasKey, masked }: { hasKey: boolean; masked: string }) {
  * `title` 提示对"为什么连不上"没有帮助）。测试进行中也要有独立状态，
  * 否则用户会以为按钮没反应。
  */
+/**
+ * 把接口带回来的 `health` 快照转成 `TestOutcome` 认识的结果。
+ *
+ * ## 为什么必须有这一步（2026-10-10，用户第三次报同一个问题）
+ *
+ * 用户的原话：「这个页面点了测试刷新又没了记录问题还是没修复啊」。
+ *
+ * 根因是**后端存了、前端没读**：`testResult` 是组件内存里的一个 map，
+ * 刷新就空 —— 于是永远显示「从未测试」。而 `/api/ai-models` 早就把每次测试
+ * 与每次模型调用的成败写进 `llm_health:<id>` 并随行返回（`row.health`）。
+ *
+ * **一个字段只要没人读，它就不算存在。** 这次是第三次因为"只做了一半"而返工。
+ */
+function healthToResult(
+  health: AiModelRow['health'],
+): (ModelTestResult & { at: number }) | undefined {
+  if (!health) return undefined;
+  const at = Date.parse(String(health.at));
+  return {
+    ok: health.ok,
+    message: health.error ?? '',
+    latencyMs: health.latencyMs ?? 0,
+    at: Number.isFinite(at) ? at : Date.now(),
+  };
+}
 const TestOutcome = memo(function TestOutcome({
   testing,
   result,
@@ -698,7 +723,7 @@ export function AiModelsSection() {
                           row={row}
                           providerLabel={providerById.get(row.provider)?.label ?? row.provider}
                           defaults={providerById.get(row.provider)?.defaults}
-                          result={testResult[row.id]}
+                          result={testResult[row.id] ?? healthToResult(row.health)}
                           testing={testingId === row.id}
                           removing={removingId === row.id}
                           isDefault={row.id === (defaultIdOverride ?? catalog?.defaultAiModelId ?? null)}
