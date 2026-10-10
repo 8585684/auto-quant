@@ -275,17 +275,33 @@ function elapsedLabel(seconds: number): string {
  * 用 `<button>` + 条件渲染而不是 `<details>`：`<details>` 的展开态不进 React 状态，
  * 而这里要跟着 `steps` 增长自动滚到最新（列表本身在增长，不能用一次性快照）。
  */
-function CycleSteps({ steps }: { steps: LiveCycle['steps'] }) {
+function CycleSteps({
+  steps,
+  elapsedSec,
+  nowMs,
+}: {
+  steps: LiveCycle['steps'];
+  /** 这一轮**从开始到现在**已用时（秒）—— 与在途盒子里的读数是同一个口径。 */
+  elapsedSec: number;
+  /** 当前时刻（epoch ms）。**当前这一步走了多久**要跟着秒表动，不能只看到最后一次活动。 */
+  nowMs: number;
+}) {
   const [open, setOpen] = useState(false);
   if (steps.length === 0) return null;
-  const first = steps[0];
   const last = steps[steps.length - 1]!;
+  const lastAt = Date.parse(last.at);
   /*
-   * 用**事件自带的时间戳**算跨度，不用本地收到的时刻 ——
-   * 同一来源的两个读数相减才有意义（`LiveCycle.startedAt` 的注释是同一个理由）。
+   * ⚠️ **两个数必须是同一口径，否则屏幕上会出现两个对不上的时间（用户 2026-10-10 实测）。**
+   *
+   * 上一版这里算的是"首步→末步的跨度"，而下面那个盒子写的是"从开始等到现在" ——
+   * 于是同一屏出现 `93s` 与 `已等待 2 分 39 秒`。用户的原话是「你自己看看你做的这个
+   * 合理吗？……用了多少时间？」。
+   *
+   * 现在：`elapsedSec` 由父组件给（与盒子同一个来源），
+   * `currentSec` 是**当前这一步**已经走了多久 —— 它们相减没有意义，因为回答的是两个问题。
    */
-  const spanSec =
-    first === undefined ? 0 : Math.max(0, Math.round((Date.parse(last.at) - Date.parse(first.at)) / 1000));
+  const currentSec = Number.isFinite(lastAt) ? Math.max(0, Math.round((nowMs - lastAt) / 1000)) : 0;
+  const mmss = (s: number): string => `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
   return (
     <div className="mb-1.5 min-w-0 rounded-md border border-base-800 bg-base-900/40 px-2 py-1.5 text-xs">
       <button
@@ -307,31 +323,65 @@ function CycleSteps({ steps }: { steps: LiveCycle['steps'] }) {
         {/* 最新一步 —— 折叠时这一格就是"它现在在做什么"。 */}
         <span className="min-w-0 truncate">{last.message}</span>
         {/*
-          两个时间都给：`spanSec` 是这一轮**已经跑了多久**，
-          `at` 是**最新一步发生的那一刻** —— 只有前者回答不了"它是不是卡住了"
-          （跑了 60 秒但最新一步是 0.2 秒前，与最新一步是 60 秒前，含义完全相反）。
+          两个数回答两个问题，**同一口径**（见上面 `elapsedSec` 的说明）：
+          · `mmss(elapsedSec)`   —— 这一轮一共跑了多久
+          · `currentSec`         —— **当前这一步**已经卡了多久（它才是"是不是卡住"的答案）
         */}
         <span className="num ml-auto shrink-0 text-ink-faint">
-          {new Date(last.at).toLocaleTimeString('en-GB', { hour12: false })} · {spanSec}s
+          已 {mmss(elapsedSec)} · 这一步 {currentSec}s
         </span>
       </button>
       {open && (
         <ol className="mt-1.5 space-y-0.5 border-t border-base-800 pt-1.5">
-          {steps.map((s, i) => (
-            <li key={`${s.at}-${i}`} className="flex min-w-0 items-start gap-2">
-              <span className="num shrink-0 text-ink-faint">
-                {new Date(s.at).toLocaleTimeString('en-GB', { hour12: false })}
-              </span>
-              <span
-                className={
-                  'min-w-0 break-words ' +
-                  (s.level === 'error' ? 'text-down' : s.level === 'warn' ? 'text-accent' : 'text-ink-lo')
-                }
-              >
-                {s.message}
-              </span>
-            </li>
-          ))}
+          {steps.map((s, i) => {
+            const at = Date.parse(s.at);
+            const prevAt = i > 0 ? Date.parse(steps[i - 1]!.at) : at;
+            /*
+             * **这一步花了多久** = 它自己的时刻 − 上一步的时刻。
+             * 这是"慢在哪一步"唯一的答案 —— 只给绝对时刻的话，
+             * 人还得自己心算相邻两行的差。
+             */
+            const deltaSec =
+              Number.isFinite(at) && Number.isFinite(prevAt)
+                ? Math.max(0, Math.round((at - prevAt) / 1000))
+                : 0;
+            const isCurrent = i === steps.length - 1;
+            return (
+              <li key={`${s.at}-${i}`} className="flex min-w-0 items-start gap-2">
+                <span className="num shrink-0 text-ink-faint">
+                  {new Date(s.at).toLocaleTimeString('en-GB', { hour12: false })}
+                </span>
+                {/*
+                  ⚠️ **状态标记说的是实话，不编造成功/失败。**
+                  服务端只给了"发生过"与日志级别，没给"这一步成没成" ——
+                  所以：最后一条 = **正在这一步**（转圈），其余 = **已发生**（对勾）；
+                  级别是 error/warn 时用红/黄把**那一条日志本身**的严重性标出来。
+                  **不要**把"日志级别"伪装成"步骤成败"：那正是本项目反复在消灭的
+                  "一个字段说做成了、另一个字段说什么都没有"。
+                */}
+                <span
+                  aria-hidden
+                  className={
+                    'w-3 shrink-0 text-center ' +
+                    (isCurrent ? 'animate-pulse-soft text-accent' : 'text-ink-faint')
+                  }
+                >
+                  {isCurrent ? '⟳' : '✓'}
+                </span>
+                <span className="num w-11 shrink-0 text-right text-ink-faint">
+                  {deltaSec === 0 ? '—' : `${deltaSec}s`}
+                </span>
+                <span
+                  className={
+                    'min-w-0 break-words ' +
+                    (s.level === 'error' ? 'text-down' : s.level === 'warn' ? 'text-accent' : 'text-ink-lo')
+                  }
+                >
+                  {s.message}
+                </span>
+              </li>
+            );
+          })}
         </ol>
       )}
     </div>
@@ -390,7 +440,7 @@ function LiveCycleBlock({ live }: { live: LiveCycle }) {
         实线 + 抬升底色是"这一轮已经出结果"的语言，用在这里会被读成成品（§1）。
       */}
       {/* 步骤流水：默认折叠成一行摘要，点开看这一轮在做的每一步。 */}
-      <CycleSteps steps={live.steps} />
+      <CycleSteps steps={live.steps} elapsedSec={seconds} nowMs={startedAt + seconds * 1000} />
 
       <div className="min-w-0 rounded-lg border border-dashed border-base-600 bg-base-900/40 px-3 py-3">
         <div className="flex min-w-0 items-start gap-2">
