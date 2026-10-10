@@ -297,13 +297,23 @@ function CycleSteps({ steps }: { steps: LiveCycle['steps'] }) {
         <span aria-hidden className="shrink-0 text-ink-faint">
           {open ? '▾' : '▸'}
         </span>
-        <span className="num shrink-0 text-ink-faint">{steps.length} 步</span>
-        <span aria-hidden className="shrink-0 text-ink-faint">
-          │
-        </span>
+        {/*
+          运行指示点：折叠时也要一眼看出"它还在动"。
+          与元数据行那个点是同一个类名 —— 同一个含义用同一个标记
+          （`animate-pulse-soft` 是 `tailwind.config.js` 里注册的名字）。
+        */}
+        <span aria-hidden className="h-1.5 w-1.5 shrink-0 animate-pulse-soft rounded-full bg-accent" />
+        <span className="shrink-0 text-ink-faint">当前</span>
         {/* 最新一步 —— 折叠时这一格就是"它现在在做什么"。 */}
         <span className="min-w-0 truncate">{last.message}</span>
-        <span className="num ml-auto shrink-0 text-ink-faint">{spanSec}s</span>
+        {/*
+          两个时间都给：`spanSec` 是这一轮**已经跑了多久**，
+          `at` 是**最新一步发生的那一刻** —— 只有前者回答不了"它是不是卡住了"
+          （跑了 60 秒但最新一步是 0.2 秒前，与最新一步是 60 秒前，含义完全相反）。
+        */}
+        <span className="num ml-auto shrink-0 text-ink-faint">
+          {new Date(last.at).toLocaleTimeString('en-GB', { hour12: false })} · {spanSec}s
+        </span>
       </button>
       {open && (
         <ol className="mt-1.5 space-y-0.5 border-t border-base-800 pt-1.5">
@@ -364,16 +374,15 @@ function LiveCycleBlock({ live }: { live: LiveCycle }) {
           │
         </span>
         <span className="num">周期 #{live.cycleNumber}</span>
-        <span aria-hidden className="text-ink-faint">
-          │
-        </span>
         {/*
-          ⚠️ **这一格跟着 `cycle_step` 走，而不是固定写"正在请求模型…"（2026-10-10）。**
-          它要回答的是"它现在在做什么" —— 固定的句子在一轮跑了几十秒之后就不带信息了。
+          ⚠️ **这一格不再重复"当前步骤"（2026-10-10，用户实测）。**
+          
+          加了步骤流水之后，这里和下面折叠行的摘要显示的是**同一句话**，
+          屏幕上连着两行一模一样的字 —— 用户的原话是「这 2 行重复了」。
+          
+          "现在在做什么"只该有一个出处：下面那一行（它同时还带步数与用时，
+          并且是**可点的展开入口**）。这里保留状态与周期号即可。
         */}
-        <span className="min-w-0 truncate">
-          {live.steps.length > 0 ? live.steps[live.steps.length - 1]!.message : '正在请求模型…'}
-        </span>
       </div>
 
       {/*
