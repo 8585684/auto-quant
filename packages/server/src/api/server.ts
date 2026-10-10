@@ -1694,25 +1694,44 @@ export async function buildServer(deps: ApiDependencies): Promise<FastifyInstanc
     const parsed = TraderInputSchema.partial().safeParse(body);
     if (!parsed.success) throw new Error(parsed.error.issues[0]?.message ?? 'Invalid trader');
     /*
-     * ⚠️ **带了仓储不支持的字段时必须明说，不能静默成功（2026-10-11 审查发现）。**
+     * ⚠️ **改了仓储不支持的字段时必须明说，不能静默成功（2026-10-11 审查发现）。**
      *
      * `TraderInputSchema` 含 `exchangeAccountId`（创建时必需），而 `traders.update()`
      * 的入参里**没有这个字段** —— 于是编辑弹窗改了交易所账户、接口回 200、
      * `return traders.get(id)` 看起来一切正常，**而账户根本没变**。
      *
-     * 这是最坏的一类失败：**它告诉你成功了。** 与本项目反复在消灭的
-     * "一个字段说做成了、另一个字段说什么都没有"是同一个病。
+     * 这是最坏的一类失败：**它告诉你成功了。**
      *
-     * 现在显式拒绝。**不支持就说"不支持"，不要假装成功。**
-     * （真正支持"改交易所账户"是独立改动：要清连接缓存、要对账按新账户重来 ——
-     *  那值得单独做，但不该以"静默丢弃"的形式存在。）
+     * ## ⚠️ 判据必须是"值变了没有"，不是"键在不在"（2026-10-11 当天返工）
+     *
+     * 第一版写的是 `key in parsed.data` —— **它把用户改任何东西都挡住了**，
+     * 用户报的原话是「我修改机器人模型报错了」。我为了防"静默失败"，
+     * 造出了一个"什么都改不了"。
+     *
+     * ### 真正的原因（已实测证实，不是推测）
+     *
+     * 我起初以为是 zod 的 `.partial()` 会保留声明过的键 —— **实测否定了它**：
+     *
+     *     z.object({ a: z.number().optional(), b: z.string() }).partial()
+     *       .safeParse({ b: 'x' }).data   →  { b: 'x' }
+     *       'a' in data                   →  false
+     *
+     * 所以 `key in parsed.data` 对**未传**的键本来就是 false。
+     * 真正的原因是**前端把 `exchangeAccountId` 一起提交了** ——
+     * 配置弹窗会带上当前选中的交易所账户，哪怕用户改的是别的东西。
+     *
+     * 结论不变、但理由不同：**要判断的是"这一次有没有改它"，只能拿值和库里的比。**
+     * 一个请求体里出现某个字段，既不代表用户改了它、也不代表没改 ——
+     * **只有和当前值比较才能回答那个问题。**
      */
-    const unsupported = (['exchangeAccountId', 'mode'] as const).filter((key) => key in parsed.data);
-    if (unsupported.length > 0) {
+    const current = traders.get(id);
+    if (!current) return reply.code(404).send({ error: `找不到机器人 ${id}` });
+    const requestedAccountId = (parsed.data as { exchangeAccountId?: number }).exchangeAccountId;
+    if (requestedAccountId !== undefined && requestedAccountId !== current.exchangeAccountId) {
       return reply.code(400).send({
         error:
-          `暂不支持通过编辑修改：${unsupported.join('、')}。` +
-          '要换交易所账户，请新建一个机器人（当前这个可以停掉保留历史）。',
+          '暂不支持通过编辑修改交易所账户。要换账户，请新建一个机器人' +
+          '（当前这个可以停掉保留历史）。',
       });
     }
     traders.update(id, parsed.data);
