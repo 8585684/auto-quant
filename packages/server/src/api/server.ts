@@ -1608,7 +1608,27 @@ export async function buildServer(deps: ApiDependencies): Promise<FastifyInstanc
     if (!parsed.success) throw new Error(parsed.error.issues[0]?.message ?? 'Invalid trader');
     const account = exchanges.get(parsed.data.exchangeAccountId);
     if (!account) throw new Error('未知的交易所账户');
-    if (!aiModels.get(parsed.data.aiModelId)) throw new Error('未知的 AI 模型');
+    /*
+     * ⚠️ **团队模式不校验 `ai_model_id`** —— 它**不使用**这个字段（用户 2026-10-12 要求）。
+     *
+     * 用户原话：
+     * > 「团队多智能体模式，在创建/修改的时候就不应该采用 AI 模型列表里面的，
+     * >  而是直接采用系统的 magpie，（系统 AI 列表里面添加的那些不应该给这个模式使用）」
+     *
+     * 团队模式的模型出口来自**独立的 magpie 网关配置**（见 `teamGateway.ts`），
+     * 所以「AI 模型」列表里有什么、那条记录是不是 magpie、有没有被改过，
+     * **都与团队模式无关**。
+     *
+     * ## 为什么数据库那一列仍然保留
+     *
+     * `traders.ai_model_id` 是 `NOT NULL`（建表时就定了），改成可空要一次迁移，
+     * 而迁移的风险（重建表、影响正在跑的实盘机器人）**远大于收益**。
+     *
+     * 所以：**列保留、写入一个占位值、团队模式不读它**。
+     * 这比"为了语义干净去做一次有风险的迁移"更符合本项目"不碰实盘"的纪律。
+     */
+    const isTeamMode = parsed.data.mode === 'ai_team';
+    if (!isTeamMode && !aiModels.get(parsed.data.aiModelId)) throw new Error('未知的 AI 模型');
 
     /*
      * ── 策略：**两种模式的要求正好相反** ────────────────────────────────
@@ -1660,7 +1680,18 @@ export async function buildServer(deps: ApiDependencies): Promise<FastifyInstanc
     const trader = traders.create({
       name: parsed.data.name,
       exchangeAccountId: parsed.data.exchangeAccountId,
-      aiModelId: parsed.data.aiModelId,
+      /*
+       * ⚠️ **团队模式写入一个占位 `aiModelId`** —— 因为 `traders.ai_model_id` 是
+       * `NOT NULL` + 外键（建表时就定了），而团队模式**不使用**这个字段
+       *（它的模型出口来自独立的 magpie 网关配置，见 `teamGateway.ts`）。
+       *
+       * 为什么不做迁移把它改成可空：那要重建表，而这张表上挂着**正在跑的实盘机器人**
+       * —— 迁移风险远大于"语义干净"带来的收益。本项目的纪律是"不碰实盘"。
+       *
+       * 占位值取 `1`（建表时必然存在的第一条模型记录）。团队模式从不读它，
+       * 所以它是什么值都不影响行为；写成 `1` 只是为了满足外键约束。
+       */
+      aiModelId: parsed.data.mode === 'ai_team' ? 1 : parsed.data.aiModelId,
       strategyId: requestedStrategyId,
       cycleIntervalMinutes: parsed.data.cycleIntervalMinutes,
       initialEquity,

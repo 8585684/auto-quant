@@ -874,9 +874,76 @@ export class AutoTrader {
     this.setStatus('running', null);
     this.emit('info', `机器人「${this.deps.trader.name}」已启动`);
 
-    // Run the first cycle immediately so the operator is not left waiting.
-    void this.tick();
-    this.scheduleNextCycle();
+    /*
+     * ── 首次决策：**看上次决策过了多久**，而不是无条件立刻跑 ──────────────
+     *
+     * ## 用户报的问题（2026-10-12）
+     *
+     * > 「你改代码的时候（提交更新部署代码到服务器后，服务器会重启对吧，
+     * >  这时候运行中的机器人会被停止-启动，导致**决策周期刷新**……
+     * >  就例如我运行中的赚大钱，**这一分钟才运行了 AI 分析，你下一分钟更新了程序，
+     * >  机器人会被重新启动又马上进行分析**，你自己看着修，
+     * >  不要为了机器人正常而影响你更新，**应该是两全其美**」
+     *
+     * ## 原来的写法为什么错
+     *
+     * 原来这里是无条件的：
+     *
+     *     void this.tick();            // ← 每次启动都立刻跑一轮
+     *     this.scheduleNextCycle();
+     *
+     * 那句注释写的是「Run the first cycle immediately so the operator is not left waiting」
+     * —— 对**操作员手动点启动**是对的（他想马上看到结果），
+     * 但对**部署重启**是错的：机器人一分钟前刚跑完，重启后又跑一轮。
+     *
+     * 后果不只是"多花一次 AI 调用"：**决策周期被打乱**（AI 可能说"5 分钟后再看"，
+     * 却被重启打断），而且每次部署都这样，累积起来就是"一直在重复分析同一段行情"。
+     *
+     * ## 修法：按 `lastCycleAt` 算剩余时间
+     *
+     * · **从没跑过**（`lastCycleAt` 为空）→ 立刻跑（首次启动，操作员在等）；
+     * · **距上次不足一个周期** → 只排定时器等**剩余**时间（不重复分析）；
+     * · **已超过一个周期**（停机很久）→ 立刻跑（行情已经变了，该看新的）。
+     *
+     * ⚠️ 这才叫"两全其美"：**操作员手动启动仍立刻看到结果**（新机器人或停机已久），
+     * 而**部署重启不会打断正在跑的节奏**。
+     *
+     * ## 为什么用 `lastCycleAt` 而不是"进程内是否跑过"
+     *
+     * `lastCycleAt` 是**落库的**（`traders.last_cycle_at`），所以它跨重启有效 ——
+     * 而"进程内标记"在重启后就丢了，等于没修。
+     */
+    const lastCycleAtMs = this.deps.trader.lastCycleAt
+      ? new Date(this.deps.trader.lastCycleAt).getTime()
+      : null;
+    const cycleMs = Math.max(1, this.deps.trader.cycleIntervalMinutes) * 60_000;
+    const elapsedMs = lastCycleAtMs === null ? Number.POSITIVE_INFINITY : Date.now() - lastCycleAtMs;
+
+    if (elapsedMs >= cycleMs) {
+      /* 从没跑过，或者停机超过一个周期 —— 立刻跑（操作员在等 / 行情已变）。 */
+      void this.tick();
+      this.scheduleNextCycle();
+    } else {
+      /*
+       * 距上次不足一个周期 —— **只等剩余时间**，不重复分析。
+       *
+       * 日志要说清"为什么没有立刻跑"，否则操作员会以为启动卡住了
+       *（这正是原来那句注释想避免的体验问题）。
+       */
+      const waitMs = cycleMs - elapsedMs;
+      this.emit(
+        'info',
+        `距上次决策仅 ${Math.max(0, Math.floor(elapsedMs / 60_000))} 分钟（周期 ${this.deps.trader.cycleIntervalMinutes} 分钟）` +
+          ` —— 不重复分析，约 ${Math.ceil(waitMs / 60_000)} 分钟后进行下一轮。`,
+      );
+      this.nextCycleAt = Date.now() + waitMs;
+      this.timer = setTimeout(() => {
+        this.timer = null;
+        this.nextCycleAt = null;
+        void this.tick();
+        this.scheduleNextCycle();
+      }, waitMs);
+    }
   }
 
   /**

@@ -20,7 +20,8 @@ import { checkConfigReachability } from '../risk/reachability.js';
 import { AgentRuntime } from './agent/runtime.js';
 import { AutoTrader, type DecisionModel } from './autoTrader.js';
 import { ModelRouter } from '../llm/modelRouter.js';
-import { createMagpieCallFactory, discoverFromGateway, looksLikeMagpieGateway } from './magpieGateway.js';
+import { createMagpieCallFactory, discoverFromGateway } from './magpieGateway.js';
+import { resolveTeamGateway } from './teamGateway.js';
 import { createRoutedDecisionModel, createTeamDecisionModel, tierForRole } from './routedModel.js';
 
 const log = createLogger('manager');
@@ -274,6 +275,25 @@ export interface StartResult {
  * `reason` 让调用点能把失败**说清楚**（页面上的 preflight check + 日志），
  * 同时仍然不阻断启动（与「模型不可达不阻止启动」的既有原则一致）。
  */
+/**
+ * 团队模式网关的固定参数。
+ *
+ * **不取自 `ai_models`** —— 团队模式与「AI 模型」列表完全解耦（用户 2026-10-12 要求）。
+ * 这些值是"跑一个 7 人团队会议"的合理默认：单次 300 秒（团队一轮要跑 7 次调用）、
+ * 单模型内重试 2 次（跨模型的降级由 `ModelRouter` 负责，不重复做）。
+ */
+const TEAM_GATEWAY_TIMEOUT_SECONDS = 300;
+const TEAM_GATEWAY_MAX_RETRIES = 2;
+const TEAM_GATEWAY_TEMPERATURE = 0.2;
+
+/**
+ * 团队模式的单次输出预算基准。
+ *
+ * 8192 起步：够一个角色写完整的论证，而 `ModelRouter.budgetFor` 会对
+ * 思维链模型再放大（但**不会小于**这个值 —— 见那里的说明）。
+ */
+const TEAM_BASE_MAX_TOKENS = 8192;
+
 interface TeamModelBuild {
   model: DecisionModel | null;
   /** `null` = 成功。有值 = 失败原因（给人看的中文）。 */
@@ -666,31 +686,38 @@ export class TraderManager {
    * 「模型用尽那你启动以后页面上提示就行了」）：
    * 出口不通用 `error` 状态说清，而不是让机器人起不来。
    */
-  private async buildTeamModel(aiModelId: number, traderId: number): Promise<TeamModelBuild> {
-    const row = aiModels.getWithSecret(aiModelId);
-    if (!row) {
-      return { model: null, reason: `找不到 AI 模型 #${aiModelId}（记录可能已被删除）。` };
-    }
-    const baseUrl = row.base_url ?? '';
-    if (!looksLikeMagpieGateway(baseUrl)) {
-      /*
-       * 不是 magpie 网关 → **不启用团队路由**，并说明原因。
-       *
-       * 为什么不是"照样用"：团队路由要按模型名在**同一个网关**里切换，
-       * 而一个普通供应商的 baseUrl 只有一个模型。硬用会让每一轮都失败，
-       * 且错误信息（404 模型不存在）指向不了真正的问题（配置错了）。
-       */
+  private async buildTeamModel(traderId: number): Promise<TeamModelBuild> {
+    /*
+     * ⚠️ **团队模式【不】使用「AI 模型」列表里的任何记录**（用户 2026-10-12 明确要求）。
+     *
+     * 用户原话：
+     * > 「团队多智能体模式，在创建/修改的时候就不应该采用 AI 模型列表里面的，
+     * >  而是直接采用系统的 magpie，（系统 AI 列表里面添加的那些不应该给这个模式使用），
+     * >  因为这个模式很多东西会和其他的冲突，例如我刚才修改列表里面 magpie 的模型，
+     * >  目的是为了更改赚大钱机器人的模型，但是**我猜测实际影响到了你那个团队模式的测试机器人**」
+     *
+     * **他猜对了**，实测确认：`#10 赚大钱` 与 `#11 团队测试` 当时都指向 `ai_models #13`。
+     * 改那条记录去调一台机器人，会连带改掉所有团队机器人。
+     *
+     * 根因是我原来的设计：让团队模式**复用 `ai_models` 里那条 magpie 记录当网关出口**，
+     * 理由是"用户不用学新配置概念"。那个理由站不住 ——
+     * `ai_models` 的语义是"**一个模型**"，而团队模式要的是"**一个网关**"，
+     * 两者生命周期与用途都不同，共用一条记录必然互相干扰。
+     *
+     * 现在改成读**独立配置**（`.env` 显式配置优先，否则从 magpie 自己的配置自动发现），
+     * 与 `ai_models` 完全解耦：改任何一边都不影响另一边。
+     */
+    const gateway = resolveTeamGateway(process.env);
+    if (gateway === null) {
       return {
         model: null,
         reason:
-          `所选模型的基址不是 magpie 网关（${baseUrl}）。` +
-          '团队模式需要一个能按模型名路由的网关 —— 请在「AI 模型」里配置指向 http://127.0.0.1:3425/v1 的记录。',
+          '找不到 magpie 网关配置。请在服务器 `.env` 里设置 `MAGPIE_GATEWAY_URL` 与 `MAGPIE_GATEWAY_KEY`' +
+          '（或确保 magpie 的 caller-keys.json 可被本服务读取）。',
       };
     }
-    const apiKey = this.vault.decryptOptional(row.api_key_enc);
-    if (!apiKey) {
-      return { model: null, reason: '这条网关记录没有 API Key。' };
-    }
+    const baseUrl = gateway.baseUrl;
+    const apiKey = gateway.apiKey;
 
     /*
      * ── **自动发现：让系统跟上模型的变化**（用户 2026-10-12 的明确要求）──
@@ -719,9 +746,9 @@ export class TraderManager {
     const catalog = await discoverFromGateway({
       baseUrl,
       apiKey,
-      timeoutSeconds: row.timeout_seconds,
-      maxRetries: row.max_retries,
-      temperature: row.temperature,
+      timeoutSeconds: TEAM_GATEWAY_TIMEOUT_SECONDS,
+      maxRetries: TEAM_GATEWAY_MAX_RETRIES,
+      temperature: TEAM_GATEWAY_TEMPERATURE,
       /*
        * ⚠️ `plugin-providers.json` 是 **Docker 卷里的文件**，
        * 只在同机部署时读得到。读不到就退化为"不知道免费与否"（`free: 'unknown'`），
@@ -762,9 +789,9 @@ export class TraderManager {
       call: createMagpieCallFactory({
         baseUrl,
         apiKey,
-        timeoutSeconds: row.timeout_seconds,
-        maxRetries: row.max_retries,
-        temperature: row.temperature,
+        timeoutSeconds: TEAM_GATEWAY_TIMEOUT_SECONDS,
+        maxRetries: TEAM_GATEWAY_MAX_RETRIES,
+        temperature: TEAM_GATEWAY_TEMPERATURE,
         pluginProvidersPath: process.env.MAGPIE_PLUGIN_PROVIDERS_PATH ?? null,
       }),
       /*
@@ -800,7 +827,7 @@ export class TraderManager {
      */
     const model = createTeamDecisionModel({
       router,
-      baseMaxTokens: Math.max(row.max_tokens, MIN_MAX_TOKENS_FOR_REASONING),
+      baseMaxTokens: TEAM_BASE_MAX_TOKENS,
       /*
        * 每一步都写进本机器人的日志 —— 用户反复要求"看得见系统在做什么"。
        * 多智能体模式下这一步尤其关键：否则界面上只是一轮很慢的决策，
@@ -1186,7 +1213,7 @@ export class TraderManager {
        */
       const teamBuild =
         trader.mode === 'ai_team'
-          ? await this.buildTeamModel(trader.aiModelId, trader.id)
+          ? await this.buildTeamModel(trader.id)
           : { model: null, reason: null };
       const routedTeamModel = teamBuild.model;
 

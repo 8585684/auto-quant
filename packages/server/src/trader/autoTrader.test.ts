@@ -6339,3 +6339,112 @@ test('★ 未平仓仓位的持有成本符号不能混 —— 手续费【减�
       `符号写反时它会是 2 × 未平仓手续费（这里应为 1.0）`,
   );
 });
+/* -------------------------------------------------------------------------- */
+/*  部署重启不该打断决策周期（用户 2026-10-12 反复诟病的问题）                    */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * 造一个"上一次决策发生在 X 毫秒之前"的 AutoTrader。
+ *
+ * ## 为什么不改数据库
+ *
+ * `traders.update()` **不支持写 `lastCycleAt`** —— 那一列只有 `recordCycle()` 会写，
+ * 而它写的是 `now()`（当前时刻）。所以"把上次决策设成 10 秒前"这件事
+ * **在数据库层面做不到**（除非真的等 10 秒）。
+ *
+ * 而 `start()` 读的是 `this.deps.trader.lastCycleAt` —— 那是**构造时的对象**。
+ * 所以直接构造一个带目标时刻的 trader 对象即可：**精确、无等待**。
+ */
+function buildTraderWithLastCycle(
+  broker: FakeBroker,
+  model: DecisionModel,
+  lastCycleAt: string | null,
+  cycleMinutes: number,
+): AutoTrader {
+  const trader = traders.get(traderId)!;
+  const strategy = strategyStore.get(trader.strategyId!)!;
+  return new AutoTrader({
+    trader: { ...trader, lastCycleAt, cycleIntervalMinutes: cycleMinutes },
+    config: strategy.config,
+    registry: fakeRegistry,
+    market: {} as never,
+    marketData: fakeMarketData,
+    broker: broker as unknown as BinanceBroker,
+    model,
+  });
+}
+
+test('★★ 刚跑过一轮的机器人被重启时【不重复分析】，只等剩余时间', async () => {
+  /*
+   * 用户原话：
+   * > 「你改代码的时候（提交更新部署代码到服务器后，服务器会重启对吧，
+   * >  这时候运行中的机器人会被停止-启动，导致**决策周期刷新**……
+   * >  就例如我运行中的赚大钱，**这一分钟才运行了 AI 分析，你下一分钟更新了程序，
+   * >  机器人会被重新启动又马上进行分析**，你自己看着修，
+   * >  不要为了机器人正常而影响你更新，**应该是两全其美**」
+   *
+   * 根因：`start()` 里无条件 `void this.tick()` —— 每次启动都立刻跑一轮。
+   * 那句注释（"so the operator is not left waiting"）对**手动启动**是对的，
+   * 但对**部署重启**是错的。
+   *
+   * 这条测试钉住修好的行为：**距上次决策不足一个周期时，不得立刻再跑一轮**。
+   */
+  const broker = new FakeBroker();
+  let calls = 0;
+  const model: DecisionModel = {
+    async complete() {
+      calls += 1;
+      return { text: OPEN_LONG_RESPONSE, latencyMs: 1, usage: { promptTokens: 1, completionTokens: 1 } };
+    },
+  };
+
+  /* 上次决策在 10 秒前；周期 15 分钟 → 远未到点。 */
+  const trader = buildTraderWithLastCycle(broker, model, new Date(Date.now() - 10_000).toISOString(), 15);
+  await trader.start();
+  await new Promise((r) => setTimeout(r, 80));
+
+  assert.equal(calls, 0, '★ 距上次决策仅 10 秒，不该重复分析');
+  assert.ok(trader.nextCycleAt !== null, '★ 应当已排好下一轮时刻（界面倒计时要用）');
+  await trader.stop();
+});
+
+test('★★ 停机很久（超过一个周期）重启时【立刻跑】—— 行情已经变了', async () => {
+  /*
+   * 另一半：不能因为"怕重复"就把该跑的也推迟。
+   * 停机 40 分钟（周期 15 分钟）之后重启，应当立刻分析。
+   */
+  const broker = new FakeBroker();
+  let calls = 0;
+  const model: DecisionModel = {
+    async complete() {
+      calls += 1;
+      return { text: OPEN_LONG_RESPONSE, latencyMs: 1, usage: { promptTokens: 1, completionTokens: 1 } };
+    },
+  };
+
+  const trader = buildTraderWithLastCycle(broker, model, new Date(Date.now() - 40 * 60_000).toISOString(), 15);
+  await trader.start();
+  await new Promise((r) => setTimeout(r, 150));
+
+  assert.ok(calls > 0, '★ 停机超过一个周期后重启，应当立刻分析');
+  await trader.stop();
+});
+
+test('★ 从没跑过的机器人（lastCycleAt 为空）重启时【立刻跑】', async () => {
+  /* 新建的机器人没有 lastCycleAt —— 操作员在等结果，不能让它干等一个周期。 */
+  const broker = new FakeBroker();
+  let calls = 0;
+  const model: DecisionModel = {
+    async complete() {
+      calls += 1;
+      return { text: OPEN_LONG_RESPONSE, latencyMs: 1, usage: { promptTokens: 1, completionTokens: 1 } };
+    },
+  };
+
+  const trader = buildTraderWithLastCycle(broker, model, null, 15);
+  await trader.start();
+  await new Promise((r) => setTimeout(r, 150));
+
+  assert.ok(calls > 0, '★ 首次启动应当立刻分析');
+  await trader.stop();
+});
