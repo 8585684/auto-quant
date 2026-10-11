@@ -1,0 +1,165 @@
+/**
+ * 角色路由器与网关工厂的测试。
+ *
+ * 重点钉住用户的两条要求：
+ *   ① 「万一 claude 额度不足了，系统能智能把主管模型换成向下平替，保证系统不中断」
+ *   ② 「各个 AI 要有一定容错、纠正机制……这个模式里面的一切都可以让 AI 来自我迭代升级」
+ */
+
+import assert from 'node:assert/strict';
+import test from 'node:test';
+
+import { ModelRouter, type CallModel } from '../llm/modelRouter.js';
+import { ROLE_TIERS, createRoutedDecisionModel, tierForRole } from './routedModel.js';
+import { looksLikeMagpieGateway } from './magpieGateway.js';
+
+/* -------------------------------------------------------------------------- */
+/*  角色 → 档位映射（"每个智能体用什么模型"的机器表达）                          */
+/* -------------------------------------------------------------------------- */
+
+test('★ 体力活角色用便宜档、判断类角色用强档（成本与能力匹配）', () => {
+  /*
+   * 用户原话：「高智能的模型做什么，低智能的做哪些体力活（例如查资料，整理、重复性工作）」。
+   * 分档错了的后果很实际：用 T3 跑打标 = 花 15 倍 token 做不需要智商的事。
+   */
+  assert.equal(tierForRole('supervisor'), 'T3_deep', '调度官要统筹，必须最强');
+  assert.equal(tierForRole('judge'), 'T3_deep', '裁决要强');
+  assert.equal(tierForRole('newscaster'), 'T1_fast', '★ 查新闻/打标是体力活，不该用旗舰');
+  assert.equal(tierForRole('sentiment'), 'T1_fast');
+  assert.equal(tierForRole('execution'), 'T0_code', '★ 执行绝不用 LLM');
+  assert.equal(tierForRole('data_sentinel'), 'T0_code', '数据哨兵是纯代码');
+});
+
+test('未知角色保守给 T2（宁可稍贵，也不要让新角色没模型可用）', () => {
+  assert.equal(tierForRole('some-brand-new-role'), 'T2_mid');
+});
+
+test('★ 每个角色都登记了档位（加角色时不能忘）', () => {
+  /*
+   * 这条防的是"加了角色但忘了登记" —— 那种角色会静默走 T2 默认值，
+   * 而它可能本该是 T3（裁决）或 T0（不该用 LLM）。
+   */
+  const expected = [
+    'supervisor', 'judge', 'bull', 'bear', 'portfolio_manager', 'red_team',
+    'market_analyst', 'onchain_analyst', 'memory_curator', 'risk_officer',
+    'newscaster', 'sentiment', 'technical', 'reporter', 'clerk',
+    'data_sentinel', 'execution', 'ops_watchdog',
+  ];
+  for (const role of expected) {
+    assert.ok(ROLE_TIERS[role], `角色 ${role} 没有登记档位`);
+  }
+});
+
+/* -------------------------------------------------------------------------- */
+/*  路由 DecisionModel：降级 + 可观测                                          */
+/* -------------------------------------------------------------------------- */
+
+/** 造一个按"模型名前缀"决定行为的桩。 */
+function stubFactory(behavior: (modelId: string) => 'ok' | 'quota' | 'empty'): CallModel {
+  return async (modelId) => {
+    const kind = behavior(modelId);
+    if (kind === 'quota') {
+      const err = new Error('You have insufficient credits to make this request.') as Error & { status?: number };
+      err.status = 429;
+      throw err;
+    }
+    if (kind === 'empty') return { text: '', latencyMs: 5, usage: { promptTokens: 1, completionTokens: 0 } };
+    return { text: `来自 ${modelId}`, latencyMs: 10, usage: { promptTokens: 1, completionTokens: 1 } };
+  };
+}
+
+test('★★ 核心：首选额度尽 → 自动降级，且【每一次尝试都被报告】', async () => {
+  /*
+   * 用户要求两件事同时成立：
+   *   ① 系统不中断（降级成功）
+   *   ② 看得见发生了什么（"降级了几次、为什么"必须能观测）
+   */
+  const seen: Array<{ role: string; modelId: string; ok: boolean; note: string }> = [];
+  let call = 0;
+  const router = new ModelRouter({
+    call: async (modelId, messages, options) => {
+      call += 1;
+      /* 第一次失败（额度尽），之后成功 */
+      if (call === 1) {
+        const err = new Error('endpoint is unavailable') as Error & { status?: number };
+        err.status = 429;
+        throw err;
+      }
+      return { text: '平替成功', latencyMs: 10, usage: { promptTokens: 1, completionTokens: 1 } };
+    },
+  });
+
+  const model = createRoutedDecisionModel({
+    router,
+    request: { role: 'judge', tier: 'T3_deep' },
+    baseMaxTokens: 4096,
+    onAttempt: (info) => seen.push(info),
+  });
+
+  const result = await model.complete('系统提示', '用户提示', {});
+  assert.equal(result.text, '平替成功', '★ 系统不能因为首选额度尽就停摆');
+  assert.equal(seen.length, 2, '★ 两次尝试都要被报告（失败的 + 成功的）');
+  assert.equal(seen[0]!.ok, false, '★ 第一次失败必须可见');
+  assert.equal(seen[0]!.role, 'judge', '报告里要带角色 —— 多智能体下"谁失败了"是关键信息');
+  assert.equal(seen[1]!.ok, true);
+  assert.ok(seen[0]!.note.length > 0, '★ 失败原因要能读（不能只是一个 ok:false）');
+});
+
+test('★ 空内容会重试（不是立刻判失败）', async () => {
+  let call = 0;
+  const router = new ModelRouter({
+    call: async () => {
+      call += 1;
+      return call === 1
+        ? { text: '  ', latencyMs: 5, usage: { promptTokens: 1, completionTokens: 0 } }
+        : { text: '第二次有内容', latencyMs: 5, usage: { promptTokens: 1, completionTokens: 1 } };
+    },
+  });
+  const model = createRoutedDecisionModel({ router, request: { role: 'clerk', tier: 'T1_fast' }, baseMaxTokens: 512 });
+  const r = await model.complete('s', 'u', {});
+  assert.equal(r.text, '第二次有内容');
+});
+
+test('usage 三个字段一路带到适配层（缓存/思考 token 不能在最后一跳丢）', async () => {
+  /*
+   * 项目里踩过这个坑：适配层漏掉 cachedTokens，前面所有工作白做，
+   * 界面上"缓存命中率"永远显示不出来。
+   */
+  const router = new ModelRouter({
+    call: async () => ({
+      text: 'ok', latencyMs: 7,
+      usage: { promptTokens: 100, completionTokens: 20, cachedTokens: 86, reasoningTokens: 12 },
+    }),
+  });
+  const model = createRoutedDecisionModel({ router, request: { role: 'bull', tier: 'T3_deep' }, baseMaxTokens: 1024 });
+  const r = await model.complete('s', 'u', {});
+  assert.equal(r.usage.cachedTokens, 86, '★ 缓存 token 必须带出来');
+  assert.equal(r.usage.reasoningTokens, 12, '★ 思考 token 必须带出来');
+  assert.equal(r.usage.promptTokens, 100);
+});
+
+test('中止信号一路透传到路由器', async () => {
+  let gotSignal: AbortSignal | undefined;
+  const router = new ModelRouter({
+    call: async (_m, _msg, options) => {
+      gotSignal = options.signal;
+      return { text: 'ok', latencyMs: 1, usage: { promptTokens: 0, completionTokens: 0 } };
+    },
+  });
+  const model = createRoutedDecisionModel({ router, request: { role: 'bear', tier: 'T3_deep' }, baseMaxTokens: 512 });
+  const ac = new AbortController();
+  await model.complete('s', 'u', { signal: ac.signal });
+  assert.equal(gotSignal, ac.signal, '★ 停止时必须能掐断在途请求');
+});
+
+/* -------------------------------------------------------------------------- */
+/*  magpie 网关识别                                                            */
+/* -------------------------------------------------------------------------- */
+
+test('★ 能识别 magpie 网关（判据是 baseUrl，不需要用户多勾一个开关）', () => {
+  assert.equal(looksLikeMagpieGateway('http://127.0.0.1:3425/v1'), true);
+  assert.equal(looksLikeMagpieGateway('http://172.19.0.1:3425/v1'), true);
+  assert.equal(looksLikeMagpieGateway('http://127.0.0.1:3425/mcp/magpie/web-search'), true);
+  assert.equal(looksLikeMagpieGateway('https://api.deepseek.com'), false);
+  assert.equal(looksLikeMagpieGateway(''), false);
+});

@@ -18,6 +18,9 @@ import { eventBus } from '../events.js';
 import { checkConfigReachability } from '../risk/reachability.js';
 import { AgentRuntime } from './agent/runtime.js';
 import { AutoTrader, type DecisionModel } from './autoTrader.js';
+import { ModelRouter } from '../llm/modelRouter.js';
+import { createMagpieCallFactory, looksLikeMagpieGateway } from './magpieGateway.js';
+import { createRoutedDecisionModel, tierForRole } from './routedModel.js';
 
 const log = createLogger('manager');
 
@@ -620,6 +623,97 @@ export class TraderManager {
     );
   }
 
+  /**
+   * **构造 AI 团队模式的模型出口**（2026-10-12 新增）。
+   *
+   * ## 与 `buildModel` 的关系：并存，不替换
+   *
+   * `buildModel` 是"一条记录 = 一个模型"（`ai_managed` 用）；
+   * 本方法是"一条记录 = 一个网关 + 动态模型名"（`ai_team` 用）。
+   * **两者互不调用、互不影响** —— 用户硬约束要求团队模式不能碰到实盘那条路。
+   *
+   * ## 为什么复用 `ai_models` 那条记录当网关出口
+   *
+   * magpie 是 **705 个模型共用一套 baseUrl/key**，靠请求体里的模型名切换。
+   * 而 `ai_models` 是"一条记录一个模型"—— 一对多表达不了。
+   *
+   * 与其新增一套"网关配置"概念（用户得再学一遍、再配一遍），不如
+   * **把已有那条 magpie 记录当出口**：它的 baseUrl/key 就是网关的。
+   * 判据用 `looksLikeMagpieGateway(baseUrl)` —— 从配置**推断**，不需要用户勾开关。
+   *
+   * ## 失败时不阻断启动
+   *
+   * 与 `buildModel` 的探测失败同一个原则（用户 2026-10-10 定的：
+   * 「模型用尽那你启动以后页面上提示就行了」）：
+   * 出口不通用 `error` 状态说清，而不是让机器人起不来。
+   */
+  private buildTeamModel(aiModelId: number, traderId: number): DecisionModel | null {
+    const row = aiModels.getWithSecret(aiModelId);
+    if (!row) {
+      log.warn(`机器人 #${traderId} 的团队模式找不到 AI 模型 ${aiModelId} —— 团队路由不可用。`);
+      return null;
+    }
+    const baseUrl = row.base_url ?? '';
+    if (!looksLikeMagpieGateway(baseUrl)) {
+      /*
+       * 不是 magpie 网关 → **不启用团队路由**，并说明原因。
+       *
+       * 为什么不是"照样用"：团队路由要按模型名在**同一个网关**里切换，
+       * 而一个普通供应商的 baseUrl 只有一个模型。硬用会让每一轮都失败，
+       * 且错误信息（404 模型不存在）指向不了真正的问题（配置错了）。
+       */
+      log.warn(
+        `机器人 #${traderId} 是 AI 团队模式，但所选模型的基址不是 magpie 网关（${baseUrl}）。` +
+          '团队模式需要一个能按模型名路由的网关 —— 请在「AI 模型」里配置指向 http://127.0.0.1:3425/v1 的记录。',
+      );
+      return null;
+    }
+    const apiKey = this.vault.decryptOptional(row.api_key_enc);
+    if (!apiKey) {
+      log.warn(`机器人 #${traderId} 的团队模式网关记录没有 API Key。`);
+      return null;
+    }
+
+    const router = new ModelRouter({
+      call: createMagpieCallFactory({
+        baseUrl,
+        apiKey,
+        timeoutSeconds: row.timeout_seconds,
+        maxRetries: row.max_retries,
+        temperature: row.temperature,
+      }),
+      /*
+       * 观测：每一次降级都写进本机器人的日志。
+       * 用户反复要求"看得见系统在做什么"，而降级正是最该被看见的事
+       *（"为什么这轮慢"的答案通常就是"首选额度尽了、换了两次"）。
+       */
+      onFallback: (info: { from: string | null; to: string; verdict: { reason: string } }) => {
+        runtimeLogs.write(
+          traderId,
+          'warn',
+          'team',
+          `模型降级：${info.from ?? '首选'} → ${info.to}（${info.verdict.reason}）`,
+        );
+      },
+    });
+
+    /*
+     * 用哪个角色/档位调用，由 `autoTrader` 在**每一轮**告诉模型（它会传不同的
+     * system prompt）。第一版先固定为"调度官"档 —— 也就是团队模式的默认档，
+     * 真正的按角色分派留给 S3（`agent/team.ts`）接入。
+     *
+     * ⚠️ 这不是"忘了做"，而是**先把出口打通、再按角色细分**：
+     * 一次只改一层，出问题时能立刻定位是哪一层。
+     */
+    return createRoutedDecisionModel({
+      router,
+      request: { role: 'supervisor', tier: tierForRole('supervisor') },
+      baseMaxTokens: Math.max(row.max_tokens, MIN_MAX_TOKENS_FOR_REASONING),
+    });
+  }
+
+  /** 记日志用的机器人 id（`buildTeamModel` 在装配期被调用，那时还没有实例字段可用）。 */
+  private traderIdForLog = 0;
   private async buildModel(aiModelId: number): Promise<{ client: LlmClient; config: ReturnType<typeof aiModels.get> }> {
     const row = aiModels.getWithSecret(aiModelId);
     if (!row) throw new Error(`找不到 AI 模型 ${aiModelId}`);
@@ -954,6 +1048,31 @@ export class TraderManager {
         blocking: false,
       });
 
+      /*
+       * ── AI 团队模式的**模型出口**（2026-10-12 新增，与智能托管完全隔离）──
+       *
+       * ## 为什么在这里分叉，而不是改动那个已有的 `model`
+       *
+       * 用户硬约束：「这次更新是一个全新的项目，和现在智能托管是 2 个东西……
+       * **不要影响我现在实盘跑的机器人**」。
+       *
+       * 所以 `ai_team` 走**另一条构造路径**，而 `strategy` / `ai_managed`
+       * 用的那个 `model` 对象**一个字节都不变** —— 后者上面挂着用户的真金白银。
+       *
+       * ## 出口怎么来的
+       *
+       * 团队模式需要"一个网关 + 动态模型名"（magpie 是 705 个模型共用一套
+       * baseUrl/key）。而 `ai_models` 表是"一条记录 = 一个供应商 + 一个模型"。
+       *
+       * 所以复用那条记录当**网关出口**：它的 baseUrl/key 就是网关的，
+       * 模型名由角色路由在运行时决定（见 `magpieGateway.ts` 的文件头说明）。
+       * **这样用户不用学新配置概念** —— 他已经在「AI 模型」里配过 magpie 了。
+       */
+      const routedTeamModel =
+        trader.mode === 'ai_team'
+          ? this.buildTeamModel(trader.aiModelId, trader.id)
+          : null;
+
       /* --- Assemble ----------------------------------------------------- */
       const marketData = new MarketDataService(connection.market, connection.registry);
 
@@ -1180,6 +1299,16 @@ export class TraderManager {
 
       const model: DecisionModel = {
         complete: async (systemPrompt, userPrompt, options) => {
+          /*
+           * ⚠️ **团队模式走路由模型；其余模式走原来那一条路（一字未改）。**
+           *
+           * 判据放在 `complete` 里而不是替换整个 `model` 对象，是为了让
+           * **两者的 usage 适配逻辑共用一份** —— 那个"缓存/思考 token 不能在
+           * 最后一跳丢掉"的坑（见下面那段注释）只该有一个修复点。
+           */
+          if (routedTeamModel) {
+            return routedTeamModel.complete(systemPrompt, userPrompt, options);
+          }
           const result = await client.complete(systemPrompt, userPrompt, options);
           return {
             text: result.text,

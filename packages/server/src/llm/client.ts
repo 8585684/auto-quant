@@ -304,7 +304,30 @@ export class LlmClient {
 
   async chat(
     messages: ChatMessage[],
-    options: { probe?: boolean; signal?: AbortSignal } = {},
+    options: {
+      probe?: boolean;
+      signal?: AbortSignal;
+      /**
+       * **本次调用**的输出预算覆盖（不传则用构造时的 `maxTokens`）。
+       *
+       * ## 为什么需要它（2026-10-12，多智能体路由的必需能力）
+       *
+       * 实测：思维链模型（如 `gpt-6-astra`）的 `reasoning_content` 与正文**共享**
+       * `max_tokens`，预算太小会返回 `content: null` + `finish_reason: length`：
+       *
+       *     mt=16  → content=null · reasoning=435
+       *     mt=128 → content=null · reasoning=475
+       *     mt=512 → content="…"            ← 够用了
+       *
+       * 而 `maxTokens` 原来是**构造时定死的实例字段**，于是"这一轮预算不够、
+       * 加大重试"在结构上做不到 —— 只能整轮失败或换模型，而**换模型会白白丢掉
+       * 最强的那一个**（它只是这次说得多了一点）。
+       *
+       * 所以加这个可选的 per-call 覆盖：**默认行为完全不变**（不传就用实例值），
+       * 只有需要它的调用方（模型路由器的"空内容重试"）才传。
+       */
+      maxTokens?: number;
+    } = {},
   ): Promise<ChatResult> {
     const startedAt = Date.now();
     const startedAtIso = new Date(startedAt).toISOString();
@@ -324,6 +347,7 @@ export class LlmClient {
       });
 
       try {
+        /* options 原样透传 —— 含 per-call maxTokens 覆盖（见 chat() 的说明）。 */
         const result = await this.attempt(messages, startedAt, startedAtIso, options);
         log.info(`模型调用成功：${this.provider} / ${result.model}`, {
           provider: this.provider,
@@ -494,7 +518,12 @@ export class LlmClient {
     return usesAnthropicProtocol(this.provider, this.model);
   }
 
-  private buildRequest(messages: ChatMessage[], probe: boolean): OutboundRequest {
+  private buildRequest(messages: ChatMessage[], probe: boolean, maxTokensOverride?: number): OutboundRequest {
+    /*
+     * **本次调用的输出预算**：per-call 覆盖优先，否则用实例值。
+     * 见 `chat()` 的 `maxTokens` 参数说明（思维链吃光预算时要能加大重试）。
+     */
+    const effectiveMaxTokens = maxTokensOverride ?? this.maxTokens;
     // A probe must be as cheap as possible and must not request a schema. It
     // keeps the sampling temperature so it exercises the real request path.
     const bodyOptions: openai.OpenAiBodyOptions = probe
@@ -504,7 +533,7 @@ export class LlmClient {
         }
       : {
           ...(this.temperature !== undefined ? { temperature: this.temperature } : {}),
-          ...(this.maxTokens !== undefined ? { maxTokens: this.maxTokens } : {}),
+          ...(effectiveMaxTokens !== undefined ? { maxTokens: effectiveMaxTokens } : {}),
           jsonMode: this.jsonMode,
           ...(this.jsonSchema !== undefined ? { jsonSchema: this.jsonSchema } : {}),
           /*
@@ -581,10 +610,10 @@ export class LlmClient {
     messages: ChatMessage[],
     startedAt: number,
     startedAtIso: string,
-    options: { probe?: boolean; signal?: AbortSignal } = {},
+    options: { probe?: boolean; signal?: AbortSignal; maxTokens?: number } = {},
   ): Promise<ChatResult> {
     const probe = options.probe === true;
-    const request = this.buildRequest(messages, probe);
+    const request = this.buildRequest(messages, probe, options.maxTokens);
     /*
      * ⚠️ **OpenAI 兼容的 provider 默认走流式**（探测请求除外）。
      *
