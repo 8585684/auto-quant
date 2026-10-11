@@ -455,6 +455,36 @@ export function evaluateTraderHealth(
   return { ok: stale.length === 0, stale, traders };
 }
 
+/**
+ * 给团队模式取一个**真实存在**的 `aiModelId` 当占位。
+ *
+ * ## 为什么需要它（本地实测踩到的坑）
+ *
+ * `traders.ai_model_id` 是 `NOT NULL` + 外键，而团队模式**不使用**这个字段
+ *（它的模型出口是独立的 magpie 网关配置，见 `teamGateway.ts`）。
+ * 所以需要写一个"满足外键、但没人读"的值。
+ *
+ * 第一版硬编码成 `1`，假设"建表时必然有 id=1 的模型"。**那个假设不成立**：
+ * 本地库里模型 id 是 `4/5/8/9`（没有 1），于是建团队机器人直接
+ * `FOREIGN KEY constraint failed` —— 而那个错误完全指不到真正的原因
+ *（看起来像"外键配置错了"，实际是"占位值选错了"）。
+ *
+ * ## 行为
+ *
+ * · 有模型 → 返回**第一条的 id**（团队模式不读它，取哪条都一样）；
+ * · 一条都没有 → 抛**说人话**的错误，而不是让外键去报。
+ */
+function requireAnyModelIdForTeam(): number {
+  const first = aiModels.list()[0];
+  if (!first) {
+    throw new Error(
+      'AI 团队模式需要数据库里至少存在一条「AI 模型」记录（团队模式本身不使用它，' +
+        '但机器人表的这一列是必填的）。请先到「AI 模型」页添加任意一条。',
+    );
+  }
+  return first.id;
+}
+
 export async function buildServer(deps: ApiDependencies): Promise<FastifyInstance> {
   const app = Fastify({
     logger: false,
@@ -1688,10 +1718,19 @@ export async function buildServer(deps: ApiDependencies): Promise<FastifyInstanc
        * 为什么不做迁移把它改成可空：那要重建表，而这张表上挂着**正在跑的实盘机器人**
        * —— 迁移风险远大于"语义干净"带来的收益。本项目的纪律是"不碰实盘"。
        *
-       * 占位值取 `1`（建表时必然存在的第一条模型记录）。团队模式从不读它，
-       * 所以它是什么值都不影响行为；写成 `1` 只是为了满足外键约束。
+       * ## ⚠️ 占位值**不能硬编码成 `1`**（本地实测踩到）
+       *
+       * 第一版写的是 `? 1 : ...`，理由是"建表时必然有 id=1 的模型"。
+       * **那个假设不成立**：本地实测库里模型 id 是 `4/5/8/9`（没有 1），
+       * 于是建团队机器人直接 `FOREIGN KEY constraint failed` ——
+       * 而错误信息完全指不到"占位值选错了"这个原因。
+       *
+       * 正确做法：**取一个真实存在的模型 id**。团队模式从不读它，
+       * 所以取哪一条都行，只要满足外键。
+       *
+       * 一条模型都没有时（全新库）→ 抛一个说人话的错误，而不是外键报错。
        */
-      aiModelId: parsed.data.mode === 'ai_team' ? 1 : parsed.data.aiModelId,
+      aiModelId: parsed.data.mode === 'ai_team' ? requireAnyModelIdForTeam() : parsed.data.aiModelId,
       strategyId: requestedStrategyId,
       cycleIntervalMinutes: parsed.data.cycleIntervalMinutes,
       initialEquity,

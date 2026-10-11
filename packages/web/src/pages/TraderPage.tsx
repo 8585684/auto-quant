@@ -1180,11 +1180,33 @@ export function TraderPage() {
   const secondaryFacts = (
     <div className="flex flex-wrap items-baseline gap-x-4 gap-y-1 px-1 text-xs text-ink-lo">
       <span>
-        AI 模型{' '}
-        <Link to="/models" className="text-accent hover:underline" title="决定它看什么、怎么下单的模型。">
-          {model ? model.label : `#${trader.aiModelId}`}
-        </Link>
-        {model?.model && <span className="ml-1 text-ink-faint">{model.model}</span>}
+        {/*
+          ⚠️ **团队模式不显示「AI 模型」**（用户 2026-10-12 明确要求）。
+
+          原话：
+          > 「团队多智能体模式，在创建/修改的时候就**不应该采用 AI 模型列表里面的**，
+          >  而是**直接采用系统的 magpie**，（系统 AI 列表里面添加的那些
+          >  **不应该给这个模式使用**）」
+
+          团队模式的模型出口来自**独立的 magpie 网关配置**，所以这里显示
+          "AI 模型 #4" 是**误导** —— 那个值是数据库外键要求的占位，
+          团队模式从不读它。浏览器实测确实看到了「AI 模型 [DEMO] 脚本化模型」，
+          而那不是它在用的东西。
+        */}
+        {trader.mode === 'ai_team' ? (
+          <span title="团队模式的模型由独立的 magpie 网关调度，与「AI 模型」列表无关。">
+            模型调度{' '}
+            <span className="text-ink-faint">系统 magpie 网关（按角色分档）</span>
+          </span>
+        ) : (
+          <>
+            AI 模型{' '}
+            <Link to="/models" className="text-accent hover:underline" title="决定它看什么、怎么下单的模型。">
+              {model ? model.label : `#${trader.aiModelId}`}
+            </Link>
+            {model?.model && <span className="ml-1 text-ink-faint">{model.model}</span>}
+          </>
+        )}
       </span>
       <span>
         {/*
@@ -1202,6 +1224,16 @@ export function TraderPage() {
           <span title="参数与交易提示词由 AI 自主设定并持续调整；生效的配置不在策略里。">
             智能托管
           </span>
+        ) : trader.mode === 'ai_team' ? (
+          /*
+           * ⚠️ **团队模式也不显示策略** —— 而且原来的代码会渲染成「策略 #null」。
+           *
+           * 因为 `ai_team` 与 `ai_managed` 一样**不引用策略**（`strategyId` 是 `null`），
+           * 而这里的分支只判了 `ai_managed`，于是团队模式落进 `else` 分支，
+           * 把 `null` 渲染成「策略 #null」并链到 `/strategy/null` ——
+           * 一个**指向不存在页面的链接**，浏览器实测确实看到了「策略 #null」。
+           */
+          <span title="AI 团队模式不引用策略；参数由团队按角色自行管理。">AI 团队（多智能体）</span>
         ) : (
           <>
             策略{' '}
