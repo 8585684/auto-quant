@@ -1,5 +1,6 @@
 import {
   StrategyConfigSchema,
+  isAiDriven,
   type CircuitBreakerReading,
   type StrategyConfig,
   type TraderStatus,
@@ -1036,9 +1037,25 @@ export class TraderManager {
        */
       const strategyRecord =
         trader.strategyId === null ? undefined : strategies.get(trader.strategyId);
-      if (trader.mode !== 'ai_managed' && !strategyRecord) {
+      /*
+       * ⚠️ **判据必须是"这个模式是不是 AI 驱动"，不能写死 `'ai_managed'`**
+       *（2026-10-12 实测踩到）。
+       *
+       * 原来的写法是 `trader.mode !== 'ai_managed'`。加了 `ai_team` 之后，
+       * 一个新模式的机器人**会被当成"按固定策略运行"**，于是启动时抛
+       * 「它引用的策略已不存在」—— 而 AI 团队模式的参数整份由团队自己管，
+       * **本来就不该有策略**。实测症状（#11 启动即 error）：
+       *
+       *     #11 [团队测试] ai_team status=error
+       *     last_error=这个机器人按固定策略运行，但它引用的策略已不存在…
+       *
+       * 而共享包里**早就导出了 `AI_DRIVEN_MODES`** 就是为了这个 ——
+       * 让"哪些模式由 AI 驱动"只有一个定义处，而不是散在各层的字符串比较里。
+       * 我上一轮在 API 层用了它，却**漏了这里** —— 于是同一个 bug 换个地方又出现。
+       */
+      if (!isAiDriven(trader.mode) && !strategyRecord) {
         throw new Error(
-          '这个机器人按固定策略运行，但它引用的策略已不存在 —— 请为它重新选择一个策略，或改成智能托管。',
+          '这个机器人按固定策略运行，但它引用的策略已不存在 —— 请为它重新选择一个策略，或改成 AI 托管模式。',
         );
       }
       const parsed = strategyRecord ? StrategyConfigSchema.safeParse(strategyRecord.config) : null;
@@ -1144,7 +1161,15 @@ export class TraderManager {
        */
       const effectiveConfig = (() => {
         const raw = traders.get(traderId)?.agentConfigJson;
-        if (trader.mode === 'ai_managed' && typeof raw === 'string' && raw.length > 0) {
+        /*
+         * ⚠️ **用 `isAiDriven` 而不是写死 `'ai_managed'`。**
+         *
+         * 这里是"AI 模式下用 `agent_config_json` 当生效配置"的读取点。
+         * 写死单模式名的话，`ai_team` 会读不到自己的配置 —— 而它的参数同样
+         * 存在那一列（AI 自己管）。**症状是"AI 配的参数没生效"，
+         * 而界面上看不出任何异常。**
+         */
+        if (isAiDriven(trader.mode) && typeof raw === 'string' && raw.length > 0) {
           try {
             const parsedAi = StrategyConfigSchema.safeParse(JSON.parse(raw));
             if (parsedAi.success) return parsedAi.data;
@@ -1367,7 +1392,15 @@ export class TraderManager {
          * 意思是"没有固定参数" —— 后者不能是前者的一种。挂在策略上还会让它
          * 出现在策略列表里，任何既有机器人都能选中它。
          */
-        isAiStrategy: () => traders.get(traderId)?.mode === 'ai_managed',
+        /*
+         * `isAiStrategy` 的语义是"**这个机器人是不是 AI 自己管参数**"
+         *（所以它不该被当成一个可选策略）。`ai_team` 同样是 AI 管参数 →
+         * 用 `isAiDriven` 而不是写死单模式名。
+         */
+        isAiStrategy: () => {
+          const mode = traders.get(traderId)?.mode;
+          return mode !== undefined && isAiDriven(mode);
+        },
         model,
         equityNow: () => equity.latest(traderId)?.equity ?? null,
         /*
@@ -1678,10 +1711,10 @@ export class TraderManager {
      * 覆盖）；固定策略模式仍然返回 `null`（那种情况下确实读不到）。
      */
     const record = trader.strategyId === null ? undefined : strategies.get(trader.strategyId);
-    if (!record && trader.mode !== 'ai_managed') return null;
+    if (!record && !isAiDriven(trader.mode)) return null;
     let config: StrategyConfig = record?.config ?? StrategyConfigSchema.parse({});
     const raw = trader.agentConfigJson;
-    if (trader.mode === 'ai_managed' && typeof raw === 'string' && raw.length > 0) {
+    if (isAiDriven(trader.mode) && typeof raw === 'string' && raw.length > 0) {
       try {
         const parsed = StrategyConfigSchema.safeParse(JSON.parse(raw));
         if (parsed.success) config = parsed.data;
