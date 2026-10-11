@@ -130,16 +130,26 @@ export function createRoutedDecisionModel(options: {
        * 而看不到"首选模型额度尽了"这个真事实。
        */
       if (onAttempt) {
-        const failures = result.attempts.filter((a) => !a.ok).length;
-        for (const [index, a] of result.attempts.entries()) {
+        /*
+         * ⚠️ **`fallbackCount` 是"到这一步为止已经降级了几次"**（复核发现 P2-I）。
+         *
+         * 第一版写的是 `index + failures`（两点：这是两个无关量的和），
+         * 实测 `[失败,失败,成功]` 会输出 `2,3,4` —— 而正确的语义是 `0,1,2`
+         *（第 1 次尝试还没降级、第 2 次降了 1 级、第 3 次降了 2 级）。
+         *
+         * 这个字段是**给操作员看的**（"为什么这轮慢"），语义错了就会误导。
+         */
+        let fallbacks = 0;
+        for (const a of result.attempts) {
           onAttempt({
             role: request.role,
             modelId: a.modelId,
             ok: a.ok,
             ms: a.ms,
             note: a.note,
-            fallbackCount: index + failures,
+            fallbackCount: fallbacks,
           });
+          if (!a.ok) fallbacks += 1;
         }
       }
 

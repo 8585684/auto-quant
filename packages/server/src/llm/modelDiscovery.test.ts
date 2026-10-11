@@ -321,3 +321,43 @@ test('读不到 plugin-providers 时降级为"只有基础信息"，不抛错', 
   assert.equal(cat.models.length, 1);
   assert.equal(cat.models[0]!.free, 'unknown', '读不到配置就是"不知道"');
 });
+
+/* -------------------------------------------------------------------------- */
+/*  分档正则的边界（复核发现 P2-G，已实测）                                     */
+/* -------------------------------------------------------------------------- */
+
+test('★ 名称正则不能误伤 `minimax` / `mini-max` 之外的短词', () => {
+  /*
+   * 复核实测结果：
+   *   误判为 T1：`mini-max`、`mini_pilot`、`b_mini_c`、`nano-1`
+   *   正确放过：`minimax`、`minimax-m2`、`nanotron-x`、`flashlight`、`fastest-llm`
+   *
+   * `mini` 后面若是 `max`，那不是"迷你模型"的意思 → 用 `(?!max)` 排除。
+   */
+  const mk = (id: string): DiscoveredModel => ({
+    id, displayName: id, provider: 'p', contextTokens: 200_000, maxOutputTokens: 32_000,
+    reasoning: true, reasoningLevels: ['low', 'high'], image: false, free: 'unknown',
+    rate: null, released: '', fast: false,
+  });
+
+  /* 必须【不】被判成 T1（它们是正常/旗舰模型名） */
+  assert.equal(inferTier(mk('provider/minimax')), 'T2_mid', '★ minimax 不是 mini');
+  assert.equal(inferTier(mk('provider/minimax-m2')), 'T2_mid');
+  assert.equal(inferTier(mk('provider/nanotron-x')), 'T2_mid', '★ nanotron 不是 nano');
+  assert.equal(inferTier(mk('provider/flashlight')), 'T2_mid', '★ flashlight 不是 flash');
+  assert.equal(inferTier(mk('provider/fastest-llm')), 'T2_mid');
+
+  /* 真的快档命名仍要被认出来 */
+  assert.equal(inferTier(mk('workbuddy-ai/deepseek-v4.1-flash')), 'T1_fast');
+  assert.equal(inferTier(mk('provider/some-mini-model')), 'T1_fast');
+  assert.equal(inferTier(mk('provider/nano-1')), 'T1_fast');
+});
+
+test('★ `mini-max` 不再被误判（这是复核点名的实例）', () => {
+  const m: DiscoveredModel = {
+    id: 'provider/mini-max', displayName: 'x', provider: 'provider', contextTokens: 200_000,
+    maxOutputTokens: 32_000, reasoning: true, reasoningLevels: ['low', 'high'], image: false,
+    free: 'unknown', rate: null, released: '', fast: false,
+  };
+  assert.notEqual(inferTier(m), 'T1_fast', '★ mini-max 不是"迷你模型"，不该进快档');
+});

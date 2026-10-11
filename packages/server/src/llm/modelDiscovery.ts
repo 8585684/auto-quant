@@ -337,9 +337,19 @@ export function mergeDiscovered(
  * | 条件 | 档位 | 理由 |
  * |---|---|---|
  * | `fast === true` | **T1** | 供应商自己标了"快"，不跟它争 |
+ * | 名字里有 `flash`/`mini`/… | **T1** | 供应商的命名就是定位声明（实测：`deepseek-v4.1-flash` 输出 128k 但实测 1.5s）|
  * | `reasoning === false` | **T1** | 不会思考 = 体力活（打标、摘要、字段映射）|
- * | `reasoning` 且（输出 ≥128k **或** 思考等级 ≥4 档）| **T3** | 能写长报告 / 提供了丰富的思考级别 = 旗舰 |
+ * | `reasoning` 且**思考等级 ≥4 档** | **T3** | 提供了丰富的思考级别 = 旗舰 |
  * | 其余 `reasoning` | **T2** | 会思考但输出能力一般 = 主力分析 |
+ *
+ * ## ⚠️ 为什么【不用】输出上限判旗舰（这条注释曾经与代码不符）
+ *
+ * 第一版用「输出 ≥128k」判 T3，后来**去掉了**，但注释没同步删 —— 于是
+ * 文档承诺了一条代码不执行的条件（复核发现）。
+ *
+ * 去掉它的实测理由：现代模型的输出上限普遍很大（`group/*` 动辄 128k+），
+ * 用它判 T3 会让 **72 个模型里 59 个进 T3**，档位失去区分度。
+ * **"能写长文"与"很聪明"是两件事。**
  *
  * ⚠️ **这仍然只是"初判"**：真正的档位由运行期的**实测延迟与成功率**修正
  *（见 `ModelHealthRegistry`）。启发式只负责"新模型上线时先给它一个合理位置"，
@@ -358,8 +368,21 @@ export function inferTier(m: DiscoveredModel): 'T1_fast' | 'T2_mid' | 'T3_deep' 
    *
    * **只看输出上限会把"能写长文"误当成"很聪明"**，这两件事无关。
    */
-  const name = m.id.toLowerCase();
-  if (/(^|[/\-_])(flash|mini|lite|lightning|turbo|fast|small|nano)([/\-_]|$)/.test(name.replace(/\./g, '-'))) {
+  const name = m.id.toLowerCase().replace(/\./g, '-');
+  /*
+   * ⚠️ **短词要收窄，否则会误伤**（复核发现 P2-G，已实测）：
+   *
+   *   误判为 T1：`provider/mini-max`、`provider/mini_pilot`、`a/b_mini_c`、`provider/nano-1`
+   *   正确放过：`minimax`、`minimax-m2`、`nanotron-x`、`flashlight`、`fastest-llm`
+   *
+   * `mini` 后面若接 `max`（无论中间有没有分隔符），那都不是"迷你模型"的意思 ——
+   * 所以用 `(?![\-_]?max)` 把 `minimax` 与 `mini-max` **两种写法都排除**。
+   *
+   * （第一版只写了 `(?!max)`，实测漏掉了 `mini-max` —— 因为它的 `mini` 后面
+   *  是 `-` 而不是 `m`。**两种写法都得挡**，否则这种命名一上线就会被塞进快档
+   *  去干需要智商的活。）
+   */
+  if (/(^|[/\-_])(flash|mini(?![\-_]?max)|lite|lightning|turbo|fast|small|nano)([/\-_]|$)/.test(name)) {
     return 'T1_fast';
   }
 
