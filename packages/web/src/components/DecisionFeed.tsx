@@ -142,6 +142,7 @@ import { exchangeErrorLabel, type DecisionRecord, type Decision, type ExecutionL
 import { api, type MarketSymbol } from '../lib/api';
 import { useLiveCycle, useEvents, type LiveCycle } from '../lib/store';
 import { TeamRoster } from './TeamRoster';
+import { FeedErrorBoundary } from './FeedErrorBoundary';
 import { parseTeamTrace } from '../lib/teamTrace';
 import { usePolled } from '../lib/hooks';
 import { Badge, Empty, Panel, Spinner3, cn } from './ui';
@@ -933,8 +934,21 @@ export function DecisionFeed({
 
           {runs.map((run) => (
             <div key={run.record.id}>
-              <CycleBlock record={run.record} symbols={symbolsQuery.data ?? []} />
-              {run.repeats.length > 0 && <RepeatedCycles repeats={run.repeats} />}
+              {/*
+                ⚠️ **每一轮单独包错误边界**（本轮实测踩到）。
+
+                一条字段不全的记录会让**整个页面白屏**（浏览器实测：
+                `Cannot read properties of undefined (reading 'length')` → BODY 为空）。
+                而决策记录是从模型输出解析来的，字段缺失/类型不对是**常态** ——
+                模型不总是听话。
+
+                包在"每一轮"而不是"整页"：这样一条坏记录只影响它自己那一块，
+                其余决策与页面照常可用。
+              */}
+              <FeedErrorBoundary>
+                <CycleBlock record={run.record} symbols={symbolsQuery.data ?? []} />
+                {run.repeats.length > 0 && <RepeatedCycles repeats={run.repeats} />}
+              </FeedErrorBoundary>
             </div>
           ))}
 
