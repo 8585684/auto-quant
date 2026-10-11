@@ -1,4 +1,5 @@
 import { useEffect, useState, type ReactNode } from 'react';
+import { ModeBadge } from '../components/TeamRoster';
 import { Link, useNavigate } from 'react-router-dom';
 import * as PopoverPrimitive from '@radix-ui/react-popover';
 import { ArrowUpRight, MoreHorizontal, Pencil, Play, RotateCw, Square, Trash2 } from 'lucide-react';
@@ -296,8 +297,25 @@ export function TradersPage() {
                           {/* 整格可点：这一行的职责就是打开这个机器人。名字列有宽度上限，
                               否则一个长名字会把整张表撑到横向滚动。 */}
                           <Link to={`/traders/${trader.id}`} className="group block max-w-[18rem]">
-                            <div className="truncate text-base font-semibold text-ink-hi group-hover:text-accent" title={trader.name}>
-                              {trader.name}
+                            <div className="flex items-center gap-1.5">
+                              <span
+                                className="truncate text-base font-semibold text-ink-hi group-hover:text-accent"
+                                title={trader.name}
+                              >
+                                {trader.name}
+                              </span>
+                              {/*
+                                ⚠️ **模式徽章**（用户 2026-10-12 要求）。
+
+                                原话：「既然现在有 3 种模式了（普通、智能、团队），
+                                那么 **UI 上面也要加上相应的显示**」。
+
+                                在此之前列表里**看不出模式区别** —— 用户截图里三台机器人
+                                只有名字和数字不同，看不出哪台是团队模式。
+                                而三种模式的**行为差别极大**（团队模式背后是一支分工的智能体队伍），
+                                列表作为第一落点必须能一眼分辨。
+                              */}
+                              <ModeBadge mode={trader.mode} />
                             </div>
                             <div className="num truncate text-xs text-ink-faint">
                               #{trader.id} · 周期 {fmtInt(trader.lastCycleNumber)} · 每 {trader.cycleIntervalMinutes}m

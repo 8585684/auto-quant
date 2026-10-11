@@ -142,6 +142,7 @@ import { exchangeErrorLabel, type DecisionRecord, type Decision, type ExecutionL
 import { api, type MarketSymbol } from '../lib/api';
 import { useLiveCycle, useEvents, type LiveCycle } from '../lib/store';
 import { TeamRoster } from './TeamRoster';
+import { parseTeamTrace } from '../lib/teamTrace';
 import { usePolled } from '../lib/hooks';
 import { Badge, Empty, Panel, Spinner3, cn } from './ui';
 import { ActionBadge, STATUS_LABELS, actionLabel, isOpenAction } from './DecisionAudit';
@@ -1092,6 +1093,56 @@ function priceOf(symbols: MarketSymbol[], symbol: string): number | null {
  * `export` 只是为了 SSR 验证脚本能够直接渲染它（`scripts/ssr-decision-feed.tsx`）。
  * 它在页面里的唯一调用点是下面的 `DecisionFeed`。
  */
+/**
+ * **一轮团队决策的审计块** —— 谁参与了、各自说了什么、用的什么模型。
+ *
+ * ## 为什么折叠
+ *
+ * 一轮团队有 7 个角色，每段产出几百字。默认展开会把决策流刷满 ——
+ * 而决策流的第一落点是"这一轮做了什么决定"，不是"每个角色的论证全文"。
+ *
+ * 所以默认只显示**摘要 + 角色名列表**（一行能看完），点开才看全文。
+ * 这与项目里 `skip` 折叠、`CycleSteps` 折叠是同一个原则：
+ * **信息一条不丢，但首屏只留需要看的。**
+ */
+function TeamTraceBlock({ rawResponse }: { rawResponse: string }): React.ReactElement | null {
+  const [open, setOpen] = useState(false);
+  const trace = parseTeamTrace(rawResponse);
+  if (trace === null) return null;
+
+  return (
+    <div className="mb-1.5 rounded-md border border-accent/25 bg-accent/5 px-2.5 py-1.5 text-xs">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        className="flex w-full items-center gap-2 text-left"
+      >
+        <span className="shrink-0 font-medium text-accent">智能体团队</span>
+        {trace.summary !== null && <span className="min-w-0 flex-1 truncate text-ink-soft">{trace.summary}</span>}
+        <span className="shrink-0 text-ink-faint">{open ? '收起' : `${trace.members.length} 个角色`}</span>
+      </button>
+      {open && (
+        <ul className="mt-1.5 space-y-1.5 border-t border-accent/15 pt-1.5">
+          {trace.members.map((m) => (
+            <li key={m.role} className="flex gap-2">
+              <span className="w-32 shrink-0 truncate font-medium text-ink-soft" title={m.role}>
+                {m.role}
+              </span>
+              <span className="min-w-0 flex-1">
+                {m.modelId !== null && (
+                  <span className="mr-1.5 text-ink-faint" title="这个角色用的模型">
+                    {m.modelId}
+                  </span>
+                )}
+                <span className="text-ink-lo">{m.text}</span>
+              </span>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
 export function CycleBlock({ record, symbols }: { record: DecisionRecord; symbols: MarketSymbol[] }) {
   /*
    * 把执行日志按 `action` + `symbol` 配到各自的决策上。
@@ -1169,6 +1220,17 @@ export function CycleBlock({ record, symbols }: { record: DecisionRecord; symbol
      */
     <article className="min-w-0" data-record-id={record.id}>
       <CycleMeta record={record} />
+
+      {/*
+        **团队审计**（只有团队模式才有）—— 用户 2026-10-12 要求
+        「看板应该直观显示**有哪些智能体，都是什么分工，都在做什么**」。
+
+        数据来源是 `rawResponse` 里本来就有的 `<team>` 块（见 `deskOutput.ts`），
+        所以**不需要给数据库加列**（迁移要动挂着实盘的 `traders` 表，风险不值得）。
+        普通/智能托管模式没有这个块 → `parseTeamTrace` 返回 `null` → 这里不渲染，
+        **另两种模式的界面逐字节不变**。
+      */}
+      <TeamTraceBlock rawResponse={record.rawResponse} />
 
       {/*
         决策盒子：**一轮只有这一个**边框。每条决策只是里面的一段，没有自己的边框。
