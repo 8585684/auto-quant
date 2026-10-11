@@ -22,6 +22,7 @@ import { AutoTrader, type DecisionModel } from './autoTrader.js';
 import { ModelRouter } from '../llm/modelRouter.js';
 import { createMagpieCallFactory, discoverFromGateway } from './magpieGateway.js';
 import { resolveTeamGateway } from './teamGateway.js';
+import { collectMarketResearch, DEFAULT_SEARCH_ENDPOINT } from './agent/webSearch.js';
 import { createRoutedDecisionModel, createTeamDecisionModel, tierForRole } from './routedModel.js';
 
 const log = createLogger('manager');
@@ -866,6 +867,49 @@ export class TraderManager {
           role,
           phase,
         });
+      },
+      /*
+       * ── **市场调研（联网搜索）**（用户需求 #2 / #4）──────────────────────
+       *
+       * 用户原话：
+       * > 「总管**委派子代理去做市场调研**（查新闻、各大交易所社区、社交媒体、
+       * >  新闻源等等。。）根据资料反馈给相应的智能体做处理」
+       * > 「以后系统自身需要用到网络搜索，**可以直接用 magpie 内置的搜索 MCP**
+       * >  `http://127.0.0.1:3425/mcp/magpie/web-search`（我已经配置好了密钥）」
+       *
+       * ## 为什么直接用 magpie 的搜索 MCP（不重复造轮子）
+       *
+       * magpie 已经把"搜索 API（tavily/brave/exa/…）或会搜索的模型"统一成一个
+       * `web_search` 工具，而用户**已经配好了密钥**。自己再接一套搜索 API 是重复劳动，
+       * 而且会多一个要维护的密钥与限流面。
+       *
+       * ## 端点与 key 从哪来
+       *
+       * **复用团队网关的 key**（同一个 magpie 实例）—— 不再新增一套配置。
+       * 端点可用 `MAGPIE_SEARCH_URL` 覆盖（默认 magpie 的标准位置）。
+       */
+      research: async (symbols) => {
+        const result = await collectMarketResearch(
+          {
+            endpoint: process.env.MAGPIE_SEARCH_URL ?? DEFAULT_SEARCH_ENDPOINT,
+            apiKey,
+          },
+          symbols,
+        );
+        /*
+         * 把"搜到了几条 / 为什么没搜到"写进日志 —— 用户要求看得见，
+         * 而"新闻数据没拿到"正是最该被看见的一件事
+         *（否则团队会一直基于行情做决策，而操作员以为它在查新闻）。
+         */
+        runtimeLogs.write(
+          traderId,
+          result.ok ? 'info' : 'warn',
+          'team',
+          result.ok
+            ? `市场调研完成：${symbols.length > 0 ? `针对 ${symbols.join('/')}` : '整体市场'}`
+            : `市场调研失败：${result.errors.join('；')}`,
+        );
+        return result.text;
       },
     });
 

@@ -205,6 +205,29 @@ export type ModelCallFactory = (modelId: string) => CallModel;
  *   写进 `<team>` 块了 —— **返回"不行动 + 说清原因"比抛错更有用**：
  *   前者操作员看得懂，后者只会在日志里留一条栈。
  */
+/**
+ * 从交易循环给的提示词里**尽力**找出候选标的。
+ *
+ * ## 为什么要找，而不是让调用方传
+ *
+ * `DecisionModel.complete(system, user)` 是交易循环与模型之间的**唯一契约**
+ *（见 `autoTrader.ts:381-434`），它只给两段文本。要拿标的就得从文本里找 ——
+ * 改那个契约会牵连整个交易循环，而那是本项目最安全攸关的文件。
+ *
+ * ## 找不到就不搜
+ *
+ * 匹配不到标的时返回空数组 → `collectMarketResearch` 只查整体市场情绪
+ *（那一条不需要标的）。**不猜标的** —— 猜错会让新闻分析师去查一个
+ * 跟本轮无关的币。
+ *
+ * 判据是 `XXXUSDT` 形式的交易对（这是本项目标的的命名约定）。
+ */
+function symbolsFromPrompt(prompt: string): string[] {
+  const matches = prompt.match(/\b[A-Z0-9]{2,15}USDT\b/g);
+  if (matches === null) return [];
+  /* 去重并限制数量 —— 搜索结果要进提示词，太多会把上下文吃满。 */
+  return [...new Set(matches)].slice(0, 3);
+}
 export function createTeamDecisionModel(options: {
   router: ModelRouter;
   /** 交易循环给的系统提示词（含输出格式要求）。团队角色提示词会叠加在它之上。 */
@@ -214,8 +237,22 @@ export function createTeamDecisionModel(options: {
   baseMaxTokens: number;
   /** 覆盖默认上限（测试用）。 */
   limits?: { maxCalls: number; maxDebateRounds: number };
+  /**
+   * **市场调研的取数函数**（联网搜索）。
+   *
+   * ## 为什么是注入的函数，而不是在里面直接调搜索
+   *
+   * 这样：① 这一层仍可被单元测试（注入桩即可，不碰网络）；
+   * ② 搜索的配置（端点/key）留在 `manager`，与网关配置同一处来源；
+   * ③ **不传就退化成原来的行为**（新闻材料为空）——
+   * 既有测试与"没配搜索"的部署都不受影响。
+   *
+   * 用户 2026-10-12 的要求：「总管委派子代理去做市场调研（查新闻、各大交易所社区、
+   * 社交媒体、新闻源等等）根据资料反馈给相应的智能体做处理」。
+   */
+  research?: (symbols: readonly string[]) => Promise<string>;
 }): DecisionModel {
-  const { router, onStep, baseMaxTokens, limits } = options;
+  const { router, onStep, baseMaxTokens, limits, research } = options;
 
   /** 把一个角色的问题交给路由器。 */
   const ask: AskRole = async ({ role, tier, context, task }): Promise<DeskRoleOutput> => {
@@ -257,10 +294,41 @@ export function createTeamDecisionModel(options: {
        * 交易循环给的 `systemPrompt`（规则与输出格式）**并入市场材料** ——
        * 见上面第二段边界说明：不能丢掉它，否则团队不知道要输出什么格式。
        */
+      /*
+       * ── **市场调研（联网搜索）** ─────────────────────────────────────────
+       *
+       * 用户 2026-10-12 的要求：
+       * 「总管委派子代理去做市场调研（查新闻、各大交易所社区、社交媒体、新闻源等等）
+       *  根据资料反馈给相应的智能体做处理」。
+       *
+       * ## 为什么在开会【之前】做
+       *
+       * 因为它是**所有分析师共用的素材** —— 新闻分析师与情绪分析师都要看它。
+       * 放在编排里做会让每个角色各搜一次（浪费时间与额度），
+       * 而且两个角色可能拿到**不一致**的搜索结果（同一轮里自相矛盾）。
+       *
+       * ## 搜索失败不阻断
+       *
+       * `research` 内部已经把失败转成"搜索不可用，请如实说明"的材料
+       *（见 `collectMarketResearch`）—— 那一句是给**模型**看的，
+       * 让它别对着空白编造消息面。
+       */
+      let newsContext = userPrompt;
+      if (research !== undefined) {
+        try {
+          onStep?.({ role: 'supervisor', phase: 'dispatch', note: '派出调研员联网搜索新闻与情绪' });
+          const researchText = await research(symbolsFromPrompt(userPrompt));
+          newsContext = `${userPrompt}\n\n${researchText}`;
+        } catch (error) {
+          /* 调研这一层失败不该让整轮失败 —— 行情数据仍是好的。 */
+          onStep?.({ role: 'supervisor', phase: 'dispatch', note: `调研失败：${(error as Error).message}` });
+        }
+      }
+
       const outcome = await runTradingDesk({
         ask,
         marketContext: systemPrompt,
-        newsContext: userPrompt,
+        newsContext,
         positionContext: '',
         ...(onStep ? { onStep } : {}),
         ...(limits ? { limits } : {}),

@@ -165,3 +165,70 @@ test('onStep 把团队的每一步报出来（可观测性）', async () => {
   assert.ok(steps.some((s) => s.startsWith('analysis')), '要有分析阶段');
   assert.ok(steps.some((s) => s.startsWith('verdict')), '要有裁决阶段');
 });
+
+/* -------------------------------------------------------------------------- */
+/*  市场调研（联网搜索）接入（用户需求 #2 / #4）                                 */
+/* -------------------------------------------------------------------------- */
+
+test('★★ 调研结果真的进入了团队材料（新闻分析师能看到它）', async () => {
+  /*
+   * 用户原话：
+   * > 「总管**委派子代理去做市场调研**（查新闻、各大交易所社区、社交媒体、新闻源等等）
+   * >  根据资料反馈给相应的智能体做处理」
+   *
+   * 这条钉住"调研确实被喂给了角色"，而不是走个形式。
+   */
+  const seenContexts: string[] = [];
+  const { call } = roleAwareCall();
+  const wrapped: CallModel = async (m, messages, o) => {
+    seenContexts.push(messages.find((x) => x.role === 'user')?.content ?? '');
+    return call(m, messages, o);
+  };
+
+  const model = createTeamDecisionModel({
+    router: new ModelRouter({ call: wrapped }),
+    baseMaxTokens: 4096,
+    research: async (symbols) => {
+      /* 桩：返回一段可辨识的调研文本。 */
+      return `## 联网搜索结果\n独家线索：${symbols.join(',')} 有重大消息 https://example.com/news`;
+    },
+  });
+  await model.complete(SYS, '当前候选 BTCUSDT、ETHUSDT', {});
+
+  assert.ok(
+    seenContexts.some((c) => c.includes('独家线索')),
+    '★ 调研结果必须出现在角色的材料里',
+  );
+  assert.ok(
+    seenContexts.some((c) => c.includes('BTCUSDT')),
+    '★ 调研应当带上从提示词里识别出的标的',
+  );
+});
+
+test('★ 调研失败【不阻断】整轮决策（行情数据是好的）', async () => {
+  /*
+   * 搜索是外部依赖。抛错会让"新闻拿不到"升级成"整轮失败" ——
+   * 而团队完全可以基于行情决策。
+   */
+  const { call } = roleAwareCall();
+  const model = createTeamDecisionModel({
+    router: new ModelRouter({ call }),
+    baseMaxTokens: 4096,
+    research: async () => {
+      throw new Error('搜索端点不可达');
+    },
+  });
+
+  const result = await model.complete(SYS, USER, {});
+  assert.ok(result.text.includes('<decision>'), '★ 调研失败仍要产出决策块');
+  const extracted = extractFirstJsonArray(result.text.slice(result.text.indexOf('<decision>')));
+  assert.equal(extracted.status, 'ok', '★ 仍要是合法 JSON');
+});
+
+test('★ 不传 research 时行为与之前一致（既有部署不受影响）', async () => {
+  const { call, seen } = roleAwareCall();
+  const model = createTeamDecisionModel({ router: new ModelRouter({ call }), baseMaxTokens: 4096 });
+  const result = await model.complete(SYS, USER, {});
+  assert.ok(result.text.includes('<decision>'));
+  assert.equal(seen.length, 8, '角色数不变（8 = 7 角色 + 风控官）');
+});
