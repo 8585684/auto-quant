@@ -228,6 +228,39 @@ fi
 
 chown -R autoquant:autoquant $RemoteDir 2>/dev/null || true
 chmod 600 .env 2>/dev/null || true
+
+# ---------------------------------------------------------------------------
+# magpie 模型档案副本（供"自动发现"读免费/付费标注）
+# ---------------------------------------------------------------------------
+# ## 为什么要复制一份，而不是直接读原文件
+#
+# magpie 的 `plugin-providers.json` 权限是 `-rw-------`（属主 UID 65532，
+# 那是容器内的用户）。服务以 `autoquant` 身份运行，**读不到它**（实测确认）。
+#
+# 而这份文件是"哪些模型免费不限量、哪些要消耗积分"的**唯一来源** ——
+# `/v1/models` 只给 context/reasoning，**没有 `free` 也没有 `cost`**（实测）。
+#
+# 拿不到它的后果很具体：自动发现会把所有模型标成"未知免费状态"，
+# 于是"体力活优先用免费模型"的策略**静默失效**（实测日志：
+# 「模型目录已刷新：共 105 个（免费 0 个）」—— 而实际有 14+ 个免费模型）。
+#
+# ## 为什么用复制而不是改权限
+#
+# 改 magpie 的文件权限会影响容器内的 magpie 自身，且 magpie 每次写配置都可能重置它。
+# **复制一份只读副本**对 magpie 零影响，且部署脚本每次都刷新它。
+#
+# ⚠️ 复制失败**不阻断部署** —— 那只是让免费标注退化（`free: 'unknown'`），
+# 团队模式仍能用静态档案跑，只是少了"优先用免费模型"这一层优化。
+MAGPIE_SRC=/var/lib/docker/volumes/magpie-config/_data/magpie/plugin-providers.json
+MAGPIE_DST=$RemoteDir/data/magpie-plugin-providers.json
+if [ -r "`$MAGPIE_SRC" ]; then
+  mkdir -p $RemoteDir/data
+  cp "`$MAGPIE_SRC" "`$MAGPIE_DST" 2>/dev/null && chown autoquant:autoquant "`$MAGPIE_DST" 2>/dev/null || true
+  chmod 640 "`$MAGPIE_DST" 2>/dev/null || true
+  echo "  magpie 模型档案已同步：`$(wc -c < "`$MAGPIE_DST" 2>/dev/null || echo 0) 字节"
+else
+  echo "  ⚠️  读不到 magpie 档案（`$MAGPIE_SRC）—— 免费/付费标注将退化为"未知""
+fi
 "@
 
 $remote += @"
