@@ -34,6 +34,64 @@ import type {
 /*  Session                                                                    */
 /* -------------------------------------------------------------------------- */
 
+/**
+ * 智能体审计的响应（三张表合成一次返回）。
+ *
+ * ## 为什么一次返回三张表
+ *
+ * 界面上那一块面板要**同时**显示"这一轮做了什么 + 学到了什么 + 之前试过什么" ——
+ * 分三个请求会让面板出现三次加载闪烁，而且它们天然属于同一件事（这个智能体在干什么）。
+ *
+ * ⚠️ 字段用**可选**（`?`）而不是必填：这三张表是后来才加进前端的，
+ * 老服务端（或某张表为空）不该让整个面板崩掉 —— 与决策看板那个
+ * "一条坏数据白屏"的教训一致。
+ */
+export interface AgentAudit {
+  /** 每次角色运行（字段与 `AgentRunRow` 一一对应）。 */
+  runs?: Array<{
+    id: number;
+    kind: string;
+    trigger: string;
+    intensity: string;
+    steps: number;
+    /** 这一步的结果分类（如 `ok` / `failed`）。 */
+    outcome: string;
+    /** 给人看的说明。 */
+    detail: string;
+    tokensIn: number;
+    tokensOut: number;
+    latencyMs: number;
+    createdAt: string;
+  }>;
+  /** 参数实验：改了什么 + 真实结果。**这是"自我迭代"的审计线索。** */
+  experiments?: Array<{
+    id: number;
+    trigger: string;
+    /** AI 给出的改参理由。 */
+    reason: string;
+    /** 改了什么（JSON 字符串）。 */
+    patchJson: string;
+    /** 实际生效的（可能被结构不变量夹过）。 */
+    appliedJson: string;
+    /** 回填前是 `null`。 */
+    outcomeTrades: number | null;
+    outcomeNetPnl: number | null;
+    outcomeEvaluatedAt: string | null;
+    createdAt: string;
+  }>;
+  /** 教训记忆（一笔平仓一条）。 */
+  memory?: Array<{
+    id: number;
+    symbol: string;
+    closeReason: string;
+    netPnl: number;
+    /** 复盘出的教训。 */
+    lesson: string;
+    createdAt: string;
+  }>;
+  pendingExperiments?: number;
+  runCount?: number;
+}
 const TOKEN_KEY = 'aq.token';
 const USER_KEY = 'aq.user';
 
@@ -747,6 +805,15 @@ export const api = {
     }),
   traderPositions: (id: number, signal?: AbortSignal) =>
     request<PositionView[]>(`/traders/${id}/positions`, { signal }),
+
+  /**
+   * **智能体审计**（运行轨迹 / 参数实验 / 教训记忆）。
+   *
+   * 用户 2026-10-12 要求团队看板显示「有哪些智能体、都是什么分工、都在做什么」，
+   * 而这三张表此前**前端完全不可见**（仓储层有、API 没有）。
+   */
+  traderAgentAudit: (id: number, limit = 20, signal?: AbortSignal) =>
+    request<AgentAudit>(`/traders/${id}/agent-audit?limit=${limit}`, { signal }),
   traderAccount: (id: number, signal?: AbortSignal) =>
     request<{
       live: boolean;

@@ -23,6 +23,7 @@ import { Badge, Button, Empty, ErrorNote, Panel, Spinner3, cn } from '../compone
 import { TraderStatusBadge } from '../components/Badges';
 import { PageShell, Metric } from '../components/shell';
 import { DecisionFeed } from '../components/DecisionFeed';
+import { AgentAuditPanel } from '../components/AgentAuditPanel';
 import { isOpenOrder, TraderTables, type TraderTabId } from '../components/TraderTables';
 import { NET_PNL_FORMULA, PnlBreakdown, pnlFormulaText, statsCosts } from '../components/PnlBreakdown';
 import { DashboardEquityChart, WinLossBar } from '../components/DashboardCharts';
@@ -1635,6 +1636,19 @@ export function TraderPage() {
             <CandlesPanel symbol={chartSymbol} />
           )}
         </Panel>
+
+        {/*
+          **智能体审计**（用户 2026-10-12 要求的「汇报工作的」那一环）。
+
+          它把三张此前**前端完全不可见**的表呈现出来
+          （`agent_runs` / `agent_experiments` / `agent_memory`）——
+          仓储层一直有，API 一直没有，于是界面上"它在跑"却看不到"它在学"。
+
+          ⚠️ **不按模式隐藏**：这三张表是 `ai_managed` 就有的（AI 自己调参 + 复盘），
+          团队模式会往里面写更多（每个角色一条）。所以"有没有数据"决定显示什么，
+          而不是模式决定显不显示。
+        */}
+        <AgentAuditPanel traderId={traderId} />
 
       </PageShell>
       </div>

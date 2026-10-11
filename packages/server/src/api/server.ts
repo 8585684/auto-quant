@@ -47,6 +47,11 @@ import {
   trades as tradeStore,
   users,
 } from '../store/repositories.js';
+/*
+ * 智能体审计三张表（运行轨迹 / 参数实验 / 教训记忆）。
+ * 它们此前**没有任何 API 暴露** —— 见 `/api/traders/:id/agent-audit` 的说明。
+ */
+import { agentExperiments as agentStoreExperiments, agentMemory as agentStoreMemory, agentRuns as agentStoreRuns } from '../store/agentStore.js';
 import type { TraderManager } from '../trader/manager.js';
 import { readLlmHealth, recordLlmHealth } from '../trader/manager.js';
 import {
@@ -2307,6 +2312,48 @@ export async function buildServer(deps: ApiDependencies): Promise<FastifyInstanc
    * `before` 时退回按 id 分页 —— 老调用方（以及任何只发一个游标的脚本）
    * 行为与以前完全一致。
    */
+  /**
+   * ── **智能体审计**（`agent_runs` / `agent_experiments` / `agent_memory`）──
+   *
+   * ## 为什么要有这个端点（用户 2026-10-12 的要求）
+   *
+   * 用户理想中的团队要有「**汇报工作的**」角色，而团队模式的看板要能显示
+   * 「有哪些智能体、都是什么分工、都在做什么」。
+   *
+   * 但这三张表**此前在前端完全不可见** —— 仓储层写得很完整
+   *（`agentStore.recent()` 三个方法都有），**却没有任何 API 暴露它们**，
+   * 于是 `web/src` 里对这三张表的引用是 **0 处**（考古报告 §5.2 记的就是这件事）。
+   *
+   * 结果是：AI 改了什么参数、反思出了什么教训、每个角色跑得怎么样 ——
+   * **全都在库里，但操作员一条都看不到**。那等于没有审计。
+   *
+   * ## 一次返回三张表
+   *
+   * 合成一个响应而不是三个端点：界面上一块面板就要同时显示它们
+   *（"这一轮做了什么 + 学到了什么 + 之前试过什么"），
+   * 分三个请求会让面板出现三次加载闪烁。
+   */
+  app.get('/api/traders/:id/agent-audit', authed, (request) => {
+    const traderId = traderIdOf(request);
+    const query = request.query as { limit?: string };
+    const parsed = Number(query.limit ?? 20);
+    /* 钳制而不报错 —— 与 `clampDecisionLimit` 同一个原则（界面传错不该 500）。 */
+    const limit = Number.isFinite(parsed) ? Math.min(Math.max(1, Math.trunc(parsed)), 100) : 20;
+
+    return {
+      /** 每次角色运行（谁跑了、用了多少 token、多久）。 */
+      runs: agentStoreRuns.recent(traderId, limit),
+      /** 参数实验（改了什么 + 真实结果）。**这是"自我迭代"的审计线索。** */
+      experiments: agentStoreExperiments.recent(traderId, limit),
+      /** 教训记忆（按标的）。 */
+      memory: agentStoreMemory.recent(traderId, limit),
+      /** 待结算的实验数 —— 界面可以据此说"还有 N 个在等结果"。 */
+      pendingExperiments: agentStoreExperiments.pending(traderId).length,
+      /** 累计运行次数 —— 判断"这个机器人到底跑过多少次"。 */
+      runCount: agentStoreRuns.countSince(traderId, '1970-01-01T00:00:00Z'),
+    };
+  });
+
   app.get('/api/traders/:id/trades', authed, async (request) => {
     const query = request.query as { limit?: string; before?: string; beforeClosedAt?: string };
     const limit = Number(query.limit ?? TRADE_PAGE_DEFAULT);
