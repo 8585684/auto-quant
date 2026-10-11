@@ -34,6 +34,7 @@
 
 import { LlmClient } from '../llm/client.js';
 import type { CallModel } from '../llm/modelRouter.js';
+import { buildCatalog, type DiscoveredCatalog } from '../llm/modelDiscovery.js';
 
 /** magpie 网关的连接参数（来自一条 `ai_models` 记录）。 */
 export interface MagpieGatewayConfig {
@@ -47,7 +48,58 @@ export interface MagpieGatewayConfig {
   maxRetries: number;
   /** 温度。 */
   temperature: number;
+  /**
+   * `plugin-providers.json` 的路径 —— **限量/不限量的标注只在那里**。
+   *
+   * `/v1/models` 只给 context / reasoning / 思考等级，**没有 `free` 也没有 `cost`**
+   *（2026-10-12 实测确认）。所以自动发现必须两处数据合并，否则分不出
+   * "免费不限量"与"消耗积分"—— 而那正是"合理安排使用"的依据。
+   *
+   * `null` = 读不到（降级为"不知道"，`free` 为 `unknown`，不猜）。
+   */
+  pluginProvidersPath?: string | null;
 }
+
+/**
+ * 从网关拉一次模型目录 —— **自动发现的入口**。
+ *
+ * ## 它解决的是用户提的哪个问题
+ *
+ * 用户 2026-10-12 的原话：
+ *
+ * > 「万一今天能用，明天不能用、改了名字或者限量了，又或者**突然上线了什么模型**
+ * >  （假如系统运行中这个提供商增加了一个模型，很好用智商高，**系统是否会自动发现，
+ * >  自动调研判断模型档次，然后应用到相应的智能体中**）」
+ *
+ * 这个函数负责前两步（发现 + 分档）。第三步"应用到智能体"由调用方
+ * （`manager.buildTeamModel`）把结果喂给 `ModelRouter` 完成。
+ *
+ * ## 为什么失败不抛错
+ *
+ * 拉目录是一次网络请求，失败原因（网关重启、key 失效）都不该让机器人起不来 ——
+ * 与 `buildModel` 探测失败同一个原则（用户 2026-10-10：「模型用尽那你启动以后
+ * 页面上提示就行了」）。**返回 `null` = 用静态档案兜底。**
+ */
+export async function discoverFromGateway(
+  gateway: MagpieGatewayConfig,
+  options: { signal?: AbortSignal } = {},
+): Promise<DiscoveredCatalog | null> {
+  try {
+    /* `/v1/models` 的路径：baseUrl 可能带 `/v1` 也可能不带。 */
+    const base = gateway.baseUrl.replace(/\/+$/, '');
+    const url = base.endsWith('/v1') ? `${base}/models` : `${base}/v1/models`;
+    const res = await fetch(url, {
+      headers: { authorization: `Bearer ${gateway.apiKey}` },
+      signal: options.signal ?? AbortSignal.timeout(15_000),
+    });
+    if (!res.ok) return null;
+    const payload: unknown = await res.json();
+    return buildCatalog(payload, gateway.pluginProvidersPath ?? null, null);
+  } catch {
+    return null;
+  }
+}
+
 
 /**
  * 输出预算的**下限**。

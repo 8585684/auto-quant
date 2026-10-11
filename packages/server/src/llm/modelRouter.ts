@@ -104,6 +104,23 @@ export interface ModelRouterOptions {
   maxFallbacks?: number;
   /** 观测钩子：每次降级都回调一次（给日志/事件流用）。 */
   onFallback?: (info: { from: string | null; to: string; verdict: FailureVerdict }) => void;
+  /**
+   * **自动发现到的候选链**（`ModelDiscovery.byTier`）—— 有它就用它，没有就用静态档案。
+   *
+   * ## 这是"自动发现"真正生效的那一步
+   *
+   * 用户 2026-10-12 要求「系统是否会自动发现，自动调研判断模型档次，
+   * **然后应用到相应的智能体中**」。前两步由 `modelDiscovery` 做，
+   * **第三步就是这里** —— 把发现到的档位清单当成候选链。
+   *
+   * ## 为什么是"覆盖"而不是"合并"
+   *
+   * 发现到的清单来自**网关此刻的真实状态**（哪些模型现在真的存在、
+   * 哪些是免费的）。而静态档案是**人写的、会过期**的。
+   * 合并会让已下线的模型继续留在链上（每次都要失败一次才发现），
+   * 所以以**发现结果为准**、档案只作兜底。
+   */
+  discoveredLadders?: Partial<Record<ModelTier, readonly string[]>>;
 }
 
 /**
@@ -152,7 +169,17 @@ export class ModelRouter {
       throw new Error('T0_code 档不需要模型 —— 这类工作应当由代码完成（这是设计约束，不是错误）。');
     }
 
-    const ladder = ladderForTier(tier).map((p) => p.id);
+    /*
+     * **候选链来源**：优先用"网关此刻真实存在"的发现结果；
+     * 没有（发现失败/未启用）就回退到静态档案。
+     *
+     * 这样"新上线的模型"下一次装配就会自动进入候选链，
+     * 而"已下线的模型"不会继续被尝试。
+     */
+    const discovered = this.options.discoveredLadders?.[tier];
+    const ladder = discovered !== undefined && discovered.length > 0
+      ? [...discovered]
+      : ladderForTier(tier).map((p) => p.id);
     if (ladder.length === 0) {
       throw new Error(`档位 ${tier} 没有任何候选模型 —— 模型档案（modelCatalog）需要补充。`);
     }

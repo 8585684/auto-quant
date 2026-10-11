@@ -402,3 +402,51 @@ test('★ 连续被截断时【只放大一次】，不无限重试（防死循�
   /* 4 个候选（maxFallbacks=2 → 至多 3 个）+ 至多 1 次放大重试 */
   assert.ok(callCount <= 5, `★ 调用次数必须有界，实际 ${callCount}`);
 });
+/* -------------------------------------------------------------------------- */
+/*  自动发现真的驱动模型选择（复核发现 P2-L：发现曾是"孤岛"）                     */
+/* -------------------------------------------------------------------------- */
+
+test('★★ 发现到的候选链【真的】被用于选择模型（"应用到智能体"那一步）', async () => {
+  /*
+   * 复核发现：`modelDiscovery` 曾经只在测试里被引用 —— **它是座孤岛**。
+   * 用户 2026-10-12 要求的「自动发现 → 判断档次 → **应用到相应的智能体中**」，
+   * 第三步当时没有实现。
+   *
+   * 这条测试就是那一步的执行者：给路由器一份"发现结果"，
+   * 它必须**优先用发现到的模型**，而不是静态档案。
+   */
+  const called: string[] = [];
+  const router = new ModelRouter({
+    call: async (modelId) => {
+      called.push(modelId);
+      return { text: 'ok', latencyMs: 1, usage: { promptTokens: 0, completionTokens: 0 } };
+    },
+    /* 一个档案里【没有】的模型名 —— 只有用发现结果才可能被调到 */
+    discoveredLadders: { T3_deep: ['newprov/shiny-new-model'] },
+  });
+
+  const r = await router.callByTier('T3_deep', [{ role: 'user', content: 'x' }], { baseMaxTokens: 128 });
+  assert.equal(r.modelId, 'newprov/shiny-new-model', '★ 必须用发现到的模型（新上线的那个）');
+  assert.deepEqual(called, ['newprov/shiny-new-model']);
+});
+
+test('★ 发现失败（没给候选链）时回退静态档案 —— 不能因此瘫痪', async () => {
+  const router = new ModelRouter({
+    call: async (modelId) => ({ text: `来自 ${modelId}`, latencyMs: 1, usage: { promptTokens: 0, completionTokens: 0 } }),
+  });
+  const r = await router.callByTier('T1_fast', [{ role: 'user', content: 'x' }], { baseMaxTokens: 128 });
+  assert.ok(r.modelId.length > 0, '没有发现结果时仍要能选出模型');
+});
+
+test('★ 空的发现结果不覆盖静态档案（空数组不等于"没有可用模型"）', async () => {
+  /*
+   * 边界：发现成功但该档位恰好为空（例如网关只暴露了少量模型）。
+   * 这时应当回退档案，而不是直接报"没有候选模型"。
+   */
+  const router = new ModelRouter({
+    call: async (modelId) => ({ text: `来自 ${modelId}`, latencyMs: 1, usage: { promptTokens: 0, completionTokens: 0 } }),
+    discoveredLadders: { T1_fast: [] },
+  });
+  const r = await router.callByTier('T1_fast', [{ role: 'user', content: 'x' }], { baseMaxTokens: 128 });
+  assert.ok(r.modelId.length > 0, '空发现结果应回退档案');
+});

@@ -20,7 +20,7 @@ import { checkConfigReachability } from '../risk/reachability.js';
 import { AgentRuntime } from './agent/runtime.js';
 import { AutoTrader, type DecisionModel } from './autoTrader.js';
 import { ModelRouter } from '../llm/modelRouter.js';
-import { createMagpieCallFactory, looksLikeMagpieGateway } from './magpieGateway.js';
+import { createMagpieCallFactory, discoverFromGateway, looksLikeMagpieGateway } from './magpieGateway.js';
 import { createRoutedDecisionModel, createTeamDecisionModel, tierForRole } from './routedModel.js';
 
 const log = createLogger('manager');
@@ -666,7 +666,7 @@ export class TraderManager {
    * 「模型用尽那你启动以后页面上提示就行了」）：
    * 出口不通用 `error` 状态说清，而不是让机器人起不来。
    */
-  private buildTeamModel(aiModelId: number, traderId: number): TeamModelBuild {
+  private async buildTeamModel(aiModelId: number, traderId: number): Promise<TeamModelBuild> {
     const row = aiModels.getWithSecret(aiModelId);
     if (!row) {
       return { model: null, reason: `找不到 AI 模型 #${aiModelId}（记录可能已被删除）。` };
@@ -692,6 +692,72 @@ export class TraderManager {
       return { model: null, reason: '这条网关记录没有 API Key。' };
     }
 
+    /*
+     * ── **自动发现：让系统跟上模型的变化**（用户 2026-10-12 的明确要求）──
+     *
+     * 用户原话：
+     *
+     * > 「万一今天能用，明天不能用、改了名字或者限量了，又或者**突然上线了什么模型**
+     * >  （假如系统运行中这个提供商增加了一个模型，很好用智商高，**系统是否会自动发现，
+     * >  自动调研判断模型档次，然后应用到相应的智能体中**）」
+     *
+     * ## 为什么要在**装配时**拉一次（而不是每次决策都拉）
+     *
+     * · 装配发生在启动时 → **不占决策时间**（一轮决策本来就要几十秒）；
+     * · 模型上下线是**低频**事件（小时/天级），每次决策都拉纯属浪费；
+     * · 失败就退回静态档案（`modelCatalog`）—— **发现不了也要能跑**。
+     *
+     * ## 发现结果怎么"应用到智能体"
+     *
+     * `catalog.byTier` 是"档位 → 模型 id（免费优先排序）"。
+     * 它被喂给 `ModelRouter` 当**候选链**，于是角色路由用的就是**当前真实存在**
+     * 的模型，而不是档案里那份可能已经过期的清单。
+     *
+     * 这也是"合理安排使用"的落地点：`byTier` 的排序把 `free: 'all'` 排在前面，
+     * 所以体力活（T1/T2）会优先走不限量的通道，把付费额度留给真正需要判断的环节。
+     */
+    const catalog = await discoverFromGateway({
+      baseUrl,
+      apiKey,
+      timeoutSeconds: row.timeout_seconds,
+      maxRetries: row.max_retries,
+      temperature: row.temperature,
+      /*
+       * ⚠️ `plugin-providers.json` 是 **Docker 卷里的文件**，
+       * 只在同机部署时读得到。读不到就退化为"不知道免费与否"（`free: 'unknown'`），
+       * **绝不猜** —— 猜错的代价是把免费模型当付费的避开（白烧额度），
+       * 或者反过来（以为免费其实烧钱）。
+       */
+      pluginProvidersPath: process.env.MAGPIE_PLUGIN_PROVIDERS_PATH ?? null,
+    });
+
+    if (catalog !== null) {
+      /*
+       * 把"发现了什么"写进日志 —— 用户要求"看得见系统在做什么"，
+       * 而"模型目录变了"正是最该被看见的一类变化（它会影响后续所有决策）。
+       */
+      runtimeLogs.write(
+        traderId,
+        'info',
+        'team',
+        `模型目录已刷新：共 ${catalog.models.length} 个（免费 ${catalog.models.filter((m) => m.free === 'all').length} 个）；` +
+          `T3 ${catalog.byTier.T3_deep.length} / T2 ${catalog.byTier.T2_mid.length} / T1 ${catalog.byTier.T1_fast.length}`,
+      );
+      if (catalog.appeared.length > 0) {
+        runtimeLogs.write(traderId, 'info', 'team', `发现新模型：${catalog.appeared.slice(0, 10).join('、')}`);
+      }
+      if (catalog.disappeared.length > 0) {
+        runtimeLogs.write(traderId, 'warn', 'team', `模型已消失：${catalog.disappeared.slice(0, 10).join('、')}`);
+      }
+    } else {
+      runtimeLogs.write(
+        traderId,
+        'warn',
+        'team',
+        '未能从网关拉取模型目录 —— 本轮使用内置的静态模型档案（不影响交易，但可能错过新模型或已下线的模型）。',
+      );
+    }
+
     const router = new ModelRouter({
       call: createMagpieCallFactory({
         baseUrl,
@@ -699,7 +765,14 @@ export class TraderManager {
         timeoutSeconds: row.timeout_seconds,
         maxRetries: row.max_retries,
         temperature: row.temperature,
+        pluginProvidersPath: process.env.MAGPIE_PLUGIN_PROVIDERS_PATH ?? null,
       }),
+      /*
+       * **把发现到的候选链交给路由器** —— 这就是"应用到相应的智能体中"那一步。
+       *
+       * `null`（没发现成功）时路由器回退到静态档案，行为与之前一致。
+       */
+      ...(catalog !== null ? { discoveredLadders: catalog.byTier } : {}),
       /*
        * 观测：每一次降级都写进本机器人的日志。
        * 用户反复要求"看得见系统在做什么"，而降级正是最该被看见的事
@@ -1113,7 +1186,7 @@ export class TraderManager {
        */
       const teamBuild =
         trader.mode === 'ai_team'
-          ? this.buildTeamModel(trader.aiModelId, trader.id)
+          ? await this.buildTeamModel(trader.aiModelId, trader.id)
           : { model: null, reason: null };
       const routedTeamModel = teamBuild.model;
 
