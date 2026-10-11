@@ -230,6 +230,37 @@ chown -R autoquant:autoquant $RemoteDir 2>/dev/null || true
 chmod 600 .env 2>/dev/null || true
 
 # ---------------------------------------------------------------------------
+# magpie 网关 key 副本（团队模式的模型出口 + 联网搜索都要它）
+# ---------------------------------------------------------------------------
+# ## 为什么需要（实测踩到）
+#
+# `caller-keys.json` 权限同样是 `-rw-------`（属主 UID 65532，容器内用户），
+# 服务以 `autoquant` 身份跑，**读不到**它。
+#
+# 后果非常具体（实测日志）：
+#
+#     [error] AI 团队模式未启用：找不到 magpie 网关配置
+#
+# 也就是说：**AI 团队模式静默退回了单模型**，而界面上还写着"AI 团队"。
+# 与 `plugin-providers.json` 是同一类问题 —— 上一轮我只修了那个档案文件、
+# **漏了这个 key 文件**，于是同一个坑换个文件又踩一次。
+#
+# 团队模式的模型出口与联网搜索**都依赖这个 key**，所以它是硬依赖。
+#
+# ⚠️ 复制失败**不阻断部署**，但会在 `MAGPIE_GATEWAY_KEY` 缺席时
+# 让团队模式明确报告"未启用"（而不是静默降级）。
+MAGPIE_KEY_SRC=/var/lib/docker/volumes/magpie-config/_data/magpie/caller-keys.json
+MAGPIE_KEY_DST=$RemoteDir/data/magpie-caller-keys.json
+if [ -r "`$MAGPIE_KEY_SRC" ]; then
+  mkdir -p $RemoteDir/data
+  cp "`$MAGPIE_KEY_SRC" "`$MAGPIE_KEY_DST" 2>/dev/null && chown autoquant:autoquant "`$MAGPIE_KEY_DST" 2>/dev/null || true
+  chmod 600 "`$MAGPIE_KEY_DST" 2>/dev/null || true
+  echo "  magpie 网关 key 已同步"
+else
+  echo "  ⚠️  读不到 magpie 网关 key（`$MAGPIE_KEY_SRC）—— 团队模式将不可用"
+fi
+
+# ---------------------------------------------------------------------------
 # magpie 模型档案副本（供"自动发现"读免费/付费标注）
 # ---------------------------------------------------------------------------
 # ## 为什么要复制一份，而不是直接读原文件

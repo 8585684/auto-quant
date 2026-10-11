@@ -48,13 +48,22 @@ export interface TeamGatewayConfig {
 export const DEFAULT_MAGPIE_URL = 'http://127.0.0.1:3425/v1';
 
 /**
- * magpie 网关 key 的**候选位置**（本机部署时按序尝试）。
+ * magpie 网关 key 的**候选位置**（按序尝试）。
  *
- * ⚠️ 这些是 magpie 自己的配置文件。**只读，绝不修改** ——
- * 我们没有理由去动另一个程序的配置，而且它随时可能重写这些文件。
+ * ⚠️ **顺序很重要**：`data/magpie-caller-keys.json` 是**部署脚本同步的副本**
+ * 放在**第一位** —— 因为 magpie 自己的那份权限是 `-rw-------`（属主 UID 65532，
+ * 容器内用户），**服务读不到**（实测确认，日志里表现为
+ * 「AI 团队模式未启用：找不到 magpie 网关配置」→ 静默退回单模型）。
+ *
+ * 后面的路径是"原生安装 magpie"时的位置，保留作为兜底。
+ *
+ * ⚠️ **只读，绝不修改** —— 我们没有理由去动另一个程序的配置，
+ * 而且它随时可能重写这些文件。
  */
 const MAGPIE_KEY_PATHS = [
-  /* Docker 卷（本项目的实际部署形态）。 */
+  /* ⭐ 部署脚本同步的副本（服务可读）—— 首选。 */
+  '/opt/autoquant/data/magpie-caller-keys.json',
+  /* Docker 卷（原文件；权限通常是 0600，服务多半读不到）。 */
   '/var/lib/docker/volumes/magpie-config/_data/magpie/caller-keys.json',
   /* 原生安装（magpie 默认配置目录）。 */
   '/root/.config/magpie/caller-keys.json',
@@ -77,6 +86,25 @@ export function resolveTeamGateway(
   const key = env.MAGPIE_GATEWAY_KEY?.trim();
   if (url && key) {
     return { baseUrl: url, apiKey: key, source: '.env（显式配置）' };
+  }
+
+  /*
+   * ①b **只配了 key 的文件路径**（`MAGPIE_GATEWAY_KEY_FILE`）。
+   *
+   * 这条路径存在的理由：服务器上 key 是**部署脚本同步的副本**，
+   * 而"把 key 本身写进 .env"意味着它同时出现在两个地方（副本 + .env），
+   * 轮换时要改两处。指个文件路径就只有一处真相。
+   */
+  const keyFile = env.MAGPIE_GATEWAY_KEY_FILE?.trim();
+  if (keyFile !== undefined && keyFile.length > 0) {
+    try {
+      const secret = firstSecret(JSON.parse(readFile(keyFile)));
+      if (secret !== null) {
+        return { baseUrl: url ?? DEFAULT_MAGPIE_URL, apiKey: secret, source: `${keyFile}（显式指定）` };
+      }
+    } catch {
+      /* 读不到就走下面的自动发现。 */
+    }
   }
 
   /* ② 自动发现：地址用默认值，key 从 magpie 的配置里读。 */
