@@ -99,13 +99,13 @@ test('★ 能从 magpie 配置里分出"不限量"与"消耗积分"', () => {
 
 test('★ `/v1/models` 不含 free —— 两处必须合并（实测结论）', () => {
   const wire = parseWireModels(wirePayload([{ id: 'workbuddy-ai/deepseek-v4.1-flash' }]));
-  assert.equal(wire[0]!.free, null, '★ 只从 /v1/models 拿不到免费标记，必须是 null 而不是 false');
+  assert.equal(wire[0]!.free, 'unknown', '★ 只从 /v1/models 拿不到免费标记，必须是 null 而不是 false');
 
   const merged = mergeDiscovered(
     wire,
     parsePluginLimits(pluginPayload([{ provider: 'workbuddy-ai', model: 'deepseek-v4.1-flash', free: true }])),
   );
-  assert.equal(merged[0]!.free, true, '合并后才拿到 true');
+  assert.equal(merged[0]!.free, 'all', '合并后才拿到 all（全免费）');
 });
 
 test('★ 查不到 ≠ 收费（`null` 与 `false` 不能混）', () => {
@@ -117,7 +117,7 @@ test('★ 查不到 ≠ 收费（`null` 与 `false` 不能混）', () => {
     parseWireModels(wirePayload([{ id: 'brand-new-provider/shiny-model' }])),
     new Map(),
   );
-  assert.equal(merged[0]!.free, null, '★ 没查到必须是 null（不知道），不是 false（要收费）');
+  assert.equal(merged[0]!.free, 'unknown', '★ 没查到必须是 null（不知道），不是 false（要收费）');
 });
 
 /* -------------------------------------------------------------------------- */
@@ -133,7 +133,7 @@ test('★ `group/auto-*` 的免费属性按成员推断', () => {
     pluginPayload([{ provider: 'workbuddy-ai', model: 'gpt-6-astra', free: true }]),
   );
   const merged = mergeDiscovered(parseWireModels(wirePayload([{ id: 'group/auto-gpt-6-astra' }])), limits);
-  assert.equal(merged[0]!.free, true, '★ 成员免费 → 组免费');
+  assert.equal(merged[0]!.free, 'all', '★ 成员全免费 → 组 all');
 });
 
 test('★ 组里有付费成员时保守标为 false（不能把付费的当免费的烧）', () => {
@@ -144,7 +144,7 @@ test('★ 组里有付费成员时保守标为 false（不能把付费的当免�
     ]),
   );
   const merged = mergeDiscovered(parseWireModels(wirePayload([{ id: 'group/auto-same-model' }])), limits);
-  assert.equal(merged[0]!.free, false, '★ 有一个付费就不能标免费（保守）');
+  assert.equal(merged[0]!.free, 'some', '★ 有一个付费就不能标免费（保守）');
 });
 
 /* -------------------------------------------------------------------------- */
@@ -154,7 +154,7 @@ test('★ 组里有付费成员时保守标为 false（不能把付费的当免�
 test('★ 自动分档：不会思考且输出小的 → 快档（体力活）', () => {
   const m: DiscoveredModel = {
     id: 'x/y', displayName: 'y', provider: 'x', contextTokens: 128_000, maxOutputTokens: 8_000,
-    reasoning: false, reasoningLevels: [], image: false, free: null, rate: null, released: '', fast: false,
+    reasoning: false, reasoningLevels: [], image: false, free: 'unknown', rate: null, released: '', fast: false,
   };
   assert.equal(inferTier(m), 'T1_fast');
 });
@@ -162,7 +162,7 @@ test('★ 自动分档：不会思考且输出小的 → 快档（体力活）',
 test('★ 自动分档：标了 fast 的直接进快档', () => {
   const m: DiscoveredModel = {
     id: 'x/y', displayName: 'y', provider: 'x', contextTokens: 1_000_000, maxOutputTokens: 100_000,
-    reasoning: true, reasoningLevels: [], image: false, free: null, rate: null, released: '', fast: true,
+    reasoning: true, reasoningLevels: [], image: false, free: 'unknown', rate: null, released: '', fast: true,
   };
   assert.equal(inferTier(m), 'T1_fast', '★ fast 标记优先于其他启发式');
 });
@@ -170,7 +170,7 @@ test('★ 自动分档：标了 fast 的直接进快档', () => {
 test('★ 自动分档：会思考 + 输出能力大 → 强推理档', () => {
   const m: DiscoveredModel = {
     id: 'x/y', displayName: 'y', provider: 'x', contextTokens: 1_000_000, maxOutputTokens: 128_000,
-    reasoning: true, reasoningLevels: ['low', 'high', 'medium', 'xhigh'], image: false, free: null, rate: null, released: '', fast: false,
+    reasoning: true, reasoningLevels: ['low', 'high', 'medium', 'xhigh'], image: false, free: 'unknown', rate: null, released: '', fast: false,
   };
   assert.equal(inferTier(m), 'T3_deep');
 });
@@ -184,7 +184,7 @@ test('★ 名称里的 `flash` 优先级高于"输出大"（实测踩到的坑�
   const m: DiscoveredModel = {
     id: 'workbuddy-ai/deepseek-v4.1-flash', displayName: 'x', provider: 'workbuddy-ai',
     contextTokens: 1_000_000, maxOutputTokens: 128_000, reasoning: true,
-    reasoningLevels: ['low', 'high', 'medium', 'xhigh'], image: false, free: null, rate: null, released: '', fast: false,
+    reasoningLevels: ['low', 'high', 'medium', 'xhigh'], image: false, free: 'unknown', rate: null, released: '', fast: false,
   };
   assert.equal(inferTier(m), 'T1_fast', '★ flash 就是快档，不能因为输出大就当旗舰');
 });
@@ -205,7 +205,7 @@ test('★ 归一化：`.` 与 `-` 视为同一个名字（magpie 会改写）', 
     parseWireModels(wirePayload([{ id: 'group/auto-deepseek-v4-1-flash' }])),
     limits,
   );
-  assert.equal(merged[0]!.free, true, '★ 组必须认出它是免费的（用户明说这个不限量）');
+  assert.equal(merged[0]!.free, 'all', '★ 组必须认出它是免费的（用户明说这个不限量）');
 });
 
 test('★ 自动分档：会思考但输出平常 + 思考档位少 → 中档（主力分析）', () => {
@@ -215,7 +215,7 @@ test('★ 自动分档：会思考但输出平常 + 思考档位少 → 中档�
    */
   const m: DiscoveredModel = {
     id: 'x/y', displayName: 'y', provider: 'x', contextTokens: 200_000, maxOutputTokens: 32_000,
-    reasoning: true, reasoningLevels: ['low', 'high'], image: false, free: null, rate: null, released: '', fast: false,
+    reasoning: true, reasoningLevels: ['low', 'high'], image: false, free: 'unknown', rate: null, released: '', fast: false,
   };
   assert.equal(inferTier(m), 'T2_mid', '★ 不能一律塞进 T3');
 });
@@ -228,7 +228,7 @@ test('★ 自动分档：思考等级丰富（≥4 档）也算旗舰信号', ()
   const m: DiscoveredModel = {
     id: 'x/y', displayName: 'y', provider: 'x', contextTokens: 200_000, maxOutputTokens: 32_000,
     reasoning: true, reasoningLevels: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'],
-    image: false, free: null, rate: null, released: '', fast: false,
+    image: false, free: 'unknown', rate: null, released: '', fast: false,
   };
   assert.equal(inferTier(m), 'T3_deep');
 });
@@ -236,7 +236,7 @@ test('★ 自动分档：思考等级丰富（≥4 档）也算旗舰信号', ()
 test('★ 自动分档：不会思考 → 体力活档（不管上下文多大）', () => {
   const m: DiscoveredModel = {
     id: 'x/y', displayName: 'y', provider: 'x', contextTokens: 2_000_000, maxOutputTokens: 500_000,
-    reasoning: false, reasoningLevels: [], image: false, free: null, rate: null, released: '', fast: false,
+    reasoning: false, reasoningLevels: [], image: false, free: 'unknown', rate: null, released: '', fast: false,
   };
   assert.equal(inferTier(m), 'T1_fast', '★ 不会思考就是体力活，上下文大不代表聪明');
 });
@@ -306,9 +306,10 @@ test('★★ 候选链里免费的排前面（"合理安排使用"的机器表�
     ]),
   );
   const merged = mergeDiscovered(cat.models, limits);
-  const ordered = [...merged].sort((a, b) => (a.free === true ? 0 : 1) - (b.free === true ? 0 : 1));
-  assert.equal(ordered[0]!.free, true, '★ 免费的要排在前面');
-  assert.equal(ordered[1]!.free, false);
+  const rank = { all: 0, some: 1, unknown: 2, none: 3 } as const;
+  const ordered = [...merged].sort((a, b) => rank[a.free] - rank[b.free]);
+  assert.equal(ordered[0]!.free, 'all', '★ 免费的要排在前面');
+  assert.equal(ordered[1]!.free, 'none');
 });
 
 /* -------------------------------------------------------------------------- */
@@ -318,5 +319,5 @@ test('★★ 候选链里免费的排前面（"合理安排使用"的机器表�
 test('读不到 plugin-providers 时降级为"只有基础信息"，不抛错', () => {
   const cat = buildCatalog(wirePayload([{ id: 'a/b' }]), '/不存在的路径/x.json', null);
   assert.equal(cat.models.length, 1);
-  assert.equal(cat.models[0]!.free, null, '读不到配置就是"不知道"');
+  assert.equal(cat.models[0]!.free, 'unknown', '读不到配置就是"不知道"');
 });

@@ -25,6 +25,25 @@
 
 import { readFileSync } from 'node:fs';
 
+/** 单个**成员**（某个供应商上的某个模型）的限额事实 —— 这里是布尔，因为成员是确定的。 */
+export interface MemberLimit {
+  free: boolean | null;
+  rate: number | null;
+  released: string;
+  fast: boolean;
+}
+type MemberLimits = Map<string, MemberLimit>;
+
+/**
+ * 免费状态。
+ *
+ * - `all`     —— 全部成员免费（**放心当体力活主力用**）
+ * - `some`    —— 部分成员免费（有机会不烧额度，但可能被路由到付费成员）
+ * - `none`    —— 全部付费
+ * - `unknown` —— 配置里查不到（**不是付费**，只是不知道）
+ */
+export type FreeStatus = 'all' | 'some' | 'none' | 'unknown';
+
 /** 从 magpie 发现的原始模型信息（两处数据合并后）。 */
 export interface DiscoveredModel {
   /** magpie 上的调用 id（`provider/model` 或 `group/auto-*`）。 */
@@ -41,15 +60,29 @@ export interface DiscoveredModel {
   /** 是否支持图片输入。 */
   image: boolean;
   /**
-   * **是否免费/不限量**。
+   * **免费状态** —— 四态，不是布尔。
    *
-   * `true` = 用户说的"免费不限量供应"；`false` = 要消耗积分/额度；
-   * `null` = **不知道**（`plugin-providers.json` 里没有这条）。
+   * ## 为什么必须是四态（实测逼出来的）
    *
-   * ⚠️ **`null` 与 `false` 是两件事**：`false` 是"查到了，要收费"，
-   * `null` 是"没查到"。混为一谈会让新上线的免费模型被当成付费的而排到最后。
+   * `deepseek-v4.1-flash` 这个模型在 magpie 里有 **8 个成员**，
+   * 其中**只有 `workbuddy-ai` 那一个是免费**的，其余 7 个都要额度：
+   *
+   *     workbuddy-ai  deepseek-v4.1-flash      free=true    ← 不限量
+   *     workbuddy-ai  deepseek-v4.1-flash-sg   free=false   rate=0.03
+   *     workbuddy     deepseek-v4.1-flash      free=false
+   *     cline / factory / devin …              free=false
+   *
+   * 所以网关上的 `group/auto-deepseek-v4-1-flash` **既不是"免费"也不是"付费"**
+   * —— 它**有一部分免费容量**（magpie 的 smart 路由会优先用有额度的成员）。
+   *
+   * 用布尔表示只能二选一，两种都错：
+   *   · 判 `true` → 以为不烧额度，实际可能被路由到付费成员（**烧钱**）；
+   *   · 判 `false` → 完全避开它，**白白放弃一个不限量的通道**（用户明确说这个不限量）。
+   *
+   * 所以分四态，并且**`unknown` 与 `none` 绝不合并**（`unknown` 是"没查到"，
+   * 合并会让新上线的免费模型被当成付费的而排到最后）。
    */
-  free: boolean | null;
+  free: FreeStatus;
   /** 消耗费率（`rate`）；`null` = 不知道。 */
   rate: number | null;
   /** 发布日期（`released`）；空字符串 = 未知。用于判断"是不是新上线的"。 */
@@ -131,8 +164,8 @@ export function parseWireModels(payload: unknown): DiscoveredModel[] {
       reasoning: m.reasoning === true,
       reasoningLevels: levels,
       image,
-      /* 这两列要等合并 plugin-providers 才知道。 */
-      free: null,
+      /* 这两列要等合并 plugin-providers 才知道 —— 先用 `unknown`（**不是 `none`**）。 */
+      free: 'unknown' as FreeStatus,
       rate: null,
       released: '',
       fast: false,
@@ -173,8 +206,8 @@ function normalizeModelName(name: string): string {
  *
  * 返回归一化后的 `provider/model → { free, rate, released, fast }` 映射。
  */
-export function parsePluginLimits(payload: unknown): Map<string, { free: boolean | null; rate: number | null; released: string; fast: boolean }> {
-  const map = new Map<string, { free: boolean | null; rate: number | null; released: string; fast: boolean }>();
+export function parsePluginLimits(payload: unknown): MemberLimits {
+  const map: MemberLimits = new Map();
   const providers = Array.isArray(payload) ? payload : ((payload as { providers?: unknown })?.providers ?? []);
   if (!Array.isArray(providers)) return map;
 
@@ -216,10 +249,10 @@ export function parsePluginLimits(payload: unknown): Map<string, { free: boolean
  */
 export function mergeDiscovered(
   wire: readonly DiscoveredModel[],
-  limits: Map<string, { free: boolean | null; rate: number | null; released: string; fast: boolean }>,
+  limits: MemberLimits,
 ): DiscoveredModel[] {
   /* 先按"模型名"（去掉 provider 前缀、归一化）索引免费信息，供组推断使用。 */
-  const byModelName = new Map<string, Array<{ free: boolean | null; rate: number | null; released: string; fast: boolean }>>();
+  const byModelName = new Map<string, MemberLimit[]>();
   for (const [key, value] of limits) {
     const slash = key.indexOf('/');
     const modelName = slash >= 0 ? key.slice(slash + 1) : key;
@@ -235,7 +268,15 @@ export function mergeDiscovered(
 
     /* ① 精确匹配（**归一化后**比 —— magpie 会用 `-` 替换 `.`）。 */
     const exact = limits.get(`${providerPart}/${normalizeModelName(modelPart)}`);
-    if (exact) return { ...m, ...exact };
+    if (exact) {
+      return {
+        ...m,
+        free: exact.free === true ? 'all' : exact.free === false ? 'none' : 'unknown',
+        rate: exact.rate,
+        released: exact.released,
+        fast: exact.fast,
+      };
+    }
 
     /* ② 路由组：`group/auto-<name>` → 用 `<name>` 的成员信息推断。 */
     if (m.id.startsWith('group/auto-')) {
@@ -246,15 +287,27 @@ export function mergeDiscovered(
          * 全部成员免费 → 组免费；只要有一个付费 → 标 false。
          * **保守**：宁可把免费组当付费的（少用它），也不要把付费的当免费的（烧额度）。
          */
-        const allFree = members.every((x) => x.free === true);
-        const anyKnown = members.some((x) => x.free !== null);
+        const freeCount = members.filter((x) => x.free === true).length;
+        const paidCount = members.filter((x) => x.free === false).length;
+        const anyKnown = freeCount + paidCount > 0;
+        /*
+         * 四态判定：全免费 = `all`；有免费也有付费 = `some`（**有机会不烧额度**）；
+         * 全付费 = `none`；一个都没查到 = `unknown`。
+         */
+        const freeStatus: FreeStatus = !anyKnown
+          ? 'unknown'
+          : paidCount === 0
+            ? 'all'
+            : freeCount === 0
+              ? 'none'
+              : 'some';
         const bestRate = members.reduce<number | null>((min, x) => {
           if (x.rate === null) return min;
           return min === null ? x.rate : Math.min(min, x.rate);
         }, null);
         return {
           ...m,
-          free: anyKnown ? allFree : null,
+          free: freeStatus,
           rate: bestRate,
           released: members.map((x) => x.released).filter(Boolean).sort().pop() ?? '',
           fast: members.some((x) => x.fast),
@@ -375,10 +428,17 @@ export function buildCatalog(
    */
   const freeOf = new Map(models.map((m) => [m.id, m.free]));
   const ctxOf = new Map(models.map((m) => [m.id, m.contextTokens]));
+  /*
+   * **"合理安排使用"的排序**：`all`（全免费）→ `some`（有免费容量）→ `unknown` → `none`。
+   *
+   * `some` 排在 `unknown` 前面：前者**确定**有一条不烧额度的通道，
+   * 后者只是"没查到" —— 确定的优先于不确定的。
+   */
+  const rank: Record<FreeStatus, number> = { all: 0, some: 1, unknown: 2, none: 3 };
   for (const tier of Object.keys(byTier) as Array<keyof typeof byTier>) {
     byTier[tier].sort((a, b) => {
-      const fa = freeOf.get(a) === true ? 0 : 1;
-      const fb = freeOf.get(b) === true ? 0 : 1;
+      const fa = rank[freeOf.get(a) ?? 'unknown'];
+      const fb = rank[freeOf.get(b) ?? 'unknown'];
       if (fa !== fb) return fa - fb;
       return (ctxOf.get(b) ?? 0) - (ctxOf.get(a) ?? 0);
     });
