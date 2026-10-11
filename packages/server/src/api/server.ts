@@ -12,6 +12,7 @@ import {
   StrategyConfigSchema,
   defaultStrategyConfig,
   providerDefaults,
+  defaultAiTeamConfig,
   unboundedAiManagedConfig,
   type PositionView,
   type ServerEvent,
@@ -1772,19 +1773,27 @@ export async function buildServer(deps: ApiDependencies): Promise<FastifyInstanc
      *
      * ---
      *
-     * ⚠️ **只有 `ai_managed` 播种这份配置 —— `ai_team` 刻意不借用它。**
+     * ⚠️ **`ai_team` 用【自己那份】配置，不借用智能托管的。**
      *
-     * `unboundedAiManagedConfig` 是**单智能体**的参数集：让那一个模型自己决定。
-     * 而 AI 团队模式的参数形态不同（按**角色**分配模型与提示词，见设计 §二/§三），
-     * 拿它去播种等于给团队塞一份它不认识的配置 ——
-     * 那正是本次更新反复要避免的「一个模式借用另一个模式的语义」。
+     * `unboundedAiManagedConfig` 是**单智能体**的参数集；团队模式有**风控官**在
+     * 裁决之后把关，语义不同（见设计 §二/§三）。
      *
-     * 团队模式的初始配置由它自己的实现负责（S3 阶段）。**在那之前新建的 `ai_team`
-     * 机器人不会有 `agent_config_json`** —— 这是刻意的，不是遗漏：
-     * 宁可它明确地"还没配置好"，也不要它带着语义不对的配置跑起来。
+     * 但上一轮我**漏了给团队模式播种**（只写了注释说"留给 S3"），于是实测踩到：
+     *
+     *     机器人 #11 的配置里没有任何候选标的（静态列表为空、也没开动态候选池）
+     *     —— 它不会交易任何东西。
+     *
+     * 也就是说：团队模式**跑得起来、界面显示"运行中"，但永远不会开任何仓**。
+     * 而用户要的正是「然后做相应的动作（**开仓、平仓、调仓**等等）」。
+     *
+     * 所以现在两种模式**各自播种自己那份**：
+     *   · `ai_managed` → `unboundedAiManagedConfig()`（单智能体口径）
+     *   · `ai_team`    → `defaultAiTeamConfig()`（含**动态标的池**）
      */
     if (parsed.data.mode === 'ai_managed') {
       traders.setAgentConfig(trader.id, JSON.stringify(unboundedAiManagedConfig()));
+    } else if (parsed.data.mode === 'ai_team') {
+      traders.setAgentConfig(trader.id, JSON.stringify(defaultAiTeamConfig()));
     }
 
     return { ...trader, equitySource };

@@ -474,6 +474,69 @@ export function unboundedAiManagedConfig(): StrategyConfig {
 }
 
 /**
+ * **AI 团队模式**的初始配置。
+ *
+ * ## 为什么不复用 `unboundedAiManagedConfig()`
+ *
+ * 那份配置是**单智能体**的口径：上限顶格、门槛归零，让那一个模型自己决定。
+ * 它**没有候选标的池**（默认 `staticCoins: []`）——
+ * 而团队模式如果没有标的，会**跑得起来但永远不会交易任何东西**
+ *（实测：日志报「配置里没有任何候选标的」，而界面显示"运行中"）。
+ *
+ * 用户 2026-10-12 的原话：
+ * > 「开启以后，整个智能体团队就开始并发工作……然后做相应的动作
+ * >  （**开仓、平仓、调仓**等等）」
+ *
+ * 一个不交易任何标的的机器人**不满足这个要求** —— 所以团队模式必须
+ * 自带一个**可用的起点**。
+ *
+ * ## 风控口径：与智能托管一致的"不设边界"
+ *
+ * 用户明确要求「系统不再设置内置风控……风格由智能体负责」，
+ * 而团队模式另有**风控官**在裁决之后把关（见 `riskOfficer.ts`）。
+ * 所以数值口径与 `unboundedAiManagedConfig` 一致：上限顶格、门槛归零，
+ * **唯一保留的是 `requireStopLoss`**（那是结构要求，不是策略偏好 ——
+ * 没有止损的仓位等于没有下限）。
+ *
+ * ## 标的池为什么用**动态**而不是写死几个币
+ *
+ * 团队模式要「模拟真实专业量化机构」—— 而机构不会永远只盯两个币。
+ * 用 `coinpool`（按成交额排序的全市场筛选）让它**每轮都能看到当下的机会**，
+ * 同时用 `coinPoolLimit` 限制数量（候选太多会把提示词吃满）。
+ */
+export function defaultAiTeamConfig(): StrategyConfig {
+  return StrategyConfigSchema.parse({
+    coinSource: {
+      /* 动态池 + 成交额排序：最主流、流动性最好的那些。 */
+      sourceType: 'coinpool',
+      useCoinPool: true,
+      coinPoolLimit: 20,
+      coinPoolRank: 'quote_volume',
+      /* 同时看持仓量增长最快的 —— 那往往是"有新资金进来"的信号。 */
+      useOITop: true,
+      oiTopLimit: 10,
+      /* 过滤掉稳定币与成交额太小的（滑点会把利润吃光）。 */
+      excludeStablecoins: true,
+      /* ⚠️ 字段名必须是 minQuoteVolume24h —— 写成 minQuoteVolume 会被 schema 静默丢弃。 */
+      minQuoteVolume24h: 50_000_000,
+    },
+    riskControl: {
+      maxPositions: 20,
+      btcEthMaxLeverage: 125,
+      altcoinMaxLeverage: 125,
+      btcEthMaxPositionValueRatio: 50,
+      altcoinMaxPositionValueRatio: 50,
+      maxMarginUsage: 100,
+      minRiskRewardRatio: 0,
+      minConfidence: 0,
+      requireTakeProfit: false,
+      /* ⚠️ **保留**：没有止损的仓位等于没有下限。这是结构要求，不是策略偏好。 */
+      requireStopLoss: true,
+    },
+  });
+}
+
+/**
  * Style presets mirroring the three trading modes. These only seed the
  * *prompt* sections and a few numeric knobs — the user is free to edit
  * everything afterwards.
