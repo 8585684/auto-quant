@@ -148,7 +148,35 @@ export interface DiscoveredModel {
 }
 
 /** 机器人的运行模式。**这是机器人的属性，不是一个策略** —— 见 `M7_TRADER_MODE` 的注释。 */
-export type TraderMode = 'strategy' | 'ai_managed';
+/**
+ * 机器人的运行模式。
+ *
+ * ## `ai_team` 与 `ai_managed` 是**两个不同的东西**（用户 2026-10-12 明确要求）
+ *
+ * 用户原话：
+ *
+ * > 「这次更新应该是一个**全新的项目**，和现在智能托管是 2 个东西，也就是说你现在的
+ * >  更新迭代**不要影响我现在实盘跑的机器人**……等这个更新做完以后新建机器人就应该
+ * >  有**除了智能托管外**这次更新的模式」
+ *
+ * | 模式 | 是什么 | 谁在跑 |
+ * |---|---|---|
+ * | `strategy` | 固定策略：参数由人对策略配置决定 | — |
+ * | `ai_managed` | **智能托管**：单智能体 + 定时轮询，AI 自己调参 | 实盘机器人 #10 `赚大钱` |
+ * | `ai_team` | **多智能体团队**（本次新增）：7×24 事件驱动、分工协作、辩论裁决 | 待建 |
+ *
+ * ⚠️ **隔离纪律**：`ai_team` 必须走**独立代码路径**。
+ * 前两个模式的语义一个字都不能改 —— 它们上面挂着用户的真金白银。
+ */
+export type TraderMode = 'strategy' | 'ai_managed' | 'ai_team';
+
+/** 需要 AI 自己决策（而不是按固定策略执行）的模式 —— 加新模式时**必须**在这里登记。 */
+export const AI_DRIVEN_MODES: readonly TraderMode[] = ['ai_managed', 'ai_team'];
+
+/** 这个模式是不是由 AI 驱动。 */
+export function isAiDriven(mode: TraderMode): boolean {
+  return AI_DRIVEN_MODES.includes(mode);
+}
 
 export type TraderStatus = 'running' | 'stopped' | 'starting' | 'error' | 'safe_mode';
 

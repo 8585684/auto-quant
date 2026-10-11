@@ -525,14 +525,39 @@ export function NewTraderModal({
                   </span>
                 </span>
               </label>
+              {/*
+                ⚠️ **AI 团队是「智能托管」之外的另一套东西（用户 2026-10-12 明确要求）。**
+                原话：「这次更新应该是一个全新的项目，和现在智能托管是 2 个东西……
+                等这个更新做完以后**新建机器人就应该有除了智能托管外这次更新的模式**」。
+
+                所以它作为**独立选项**出现在这里，而不是替换或改造智能托管 ——
+                已有机器人（含正在实盘跑的那台）的模式与服务端行为一个字都不变。
+              */}
+              <label className="flex cursor-pointer items-start gap-2 text-base">
+                <input
+                  type="radio"
+                  name="trader-mode"
+                  className="mt-0.5"
+                  checked={mode === 'ai_team'}
+                  onChange={() => setMode('ai_team')}
+                />
+                <span>
+                  <span className="font-medium">AI 团队（多智能体 · 7×24）</span>
+                  <span className="block text-xs text-ink-faint">
+                    一支分工协作的智能体团队：调度官统筹，分析师并行调研（行情、新闻、社区情绪），
+                    多空研究员对抗辩论，风控官把关，交易员执行。持续工作、事件驱动，
+                    每次决策都有完整审计轨迹。
+                  </span>
+                </span>
+              </label>
             </div>
           </Field>
 
           <Field
             label="策略"
             hint={
-              mode === 'ai_managed'
-                ? 'AI 托管模式下这项被忽略 —— 参数来自 AI 自己（每个机器人独立一份）。仍需选一个是为了保留数据库约束，它不会影响 AI 的决策。'
+              mode === 'ai_managed' || mode === 'ai_team'
+                ? 'AI 模式下这项被忽略 —— 参数来自 AI 自己（每个机器人独立一份）。'
                 : undefined
             }
           >

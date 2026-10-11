@@ -252,12 +252,18 @@ const TraderInputSchema = z.object({
   /**
    * 运行模式。
    *
-   * `'ai_managed'` 表示由 AI 智能体托管：参数由它自己设定并持续调整，
+   * `'ai_managed'` 表示由 **AI 智能体托管**：参数由它自己设定并持续调整，
    * 存在 `agent_config_json`（按机器人隔离），**策略参数被忽略**。
+   *
+   * `'ai_team'` 表示由 **AI 团队托管**（2026-10-12 新增的多智能体模式）：
+   * 7×24 事件驱动、多个角色分工协作、辩论与裁决。**与 `ai_managed` 是两套独立的
+   * 代码路径** —— 用户明确要求「不要影响我现在实盘跑的机器人」。
+   *
+   * 两种 AI 模式都**不引用策略**（参数由 AI 自己管），所以下面的校验对它们同等生效。
    *
    * 默认 `'strategy'`，所以既有调用点（前端与脚本）行为完全不变。
    */
-  mode: z.enum(['strategy', 'ai_managed']).default('strategy'),
+  mode: z.enum(['strategy', 'ai_managed', 'ai_team']).default('strategy'),
 });
 
 /* -------------------------------------------------------------------------- */
@@ -1617,11 +1623,21 @@ export async function buildServer(deps: ApiDependencies): Promise<FastifyInstanc
      * 两个方向都要拦：只拦一边的话，要么建出"没有配置的固定策略机器人"，
      * 要么又把 AI 托管绑回一个它用不上的策略（这正是要修的那个问题）。
      */
-    const isAiManaged = parsed.data.mode === 'ai_managed';
+    /*
+     * ⚠️ 用 `isAiDriven` 而不是 `=== 'ai_managed'` —— **加新模式时这里必须自动生效**。
+     *
+     * 写死单个模式名的话，新建 `ai_team` 机器人时会被下面那个 `else` 分支
+     * 要求"必须选一个策略"，而 AI 团队模式的参数**整份由团队自己管**，
+     * 根本没有可选策略 —— 于是新模式一建就报错。
+     *
+     * 这正是共享包把 `AI_DRIVEN_MODES` 导出来的理由：**让"哪些模式由 AI 驱动"
+     * 只有一个定义处**，而不是散在各层的字符串比较里。
+     */
+    const isAiDrivenMode = parsed.data.mode === 'ai_managed' || parsed.data.mode === 'ai_team';
     const requestedStrategyId = parsed.data.strategyId ?? null;
-    if (isAiManaged) {
+    if (isAiDrivenMode) {
       if (requestedStrategyId !== null) {
-        throw new Error('智能托管模式不引用任何策略 —— 请不要为它选择策略。');
+        throw new Error('AI 托管模式不引用任何策略 —— 请不要为它选择策略。');
       }
     } else {
       if (requestedStrategyId === null) throw new Error('固定策略模式必须选择一个策略。');
@@ -1678,8 +1694,21 @@ export async function buildServer(deps: ApiDependencies): Promise<FastifyInstanc
      * 上限顶格、门槛归零，唯一的例外是 `requireStopLoss`（那是结构要求，
      * 不是策略偏好）。**已有机器人不会被追溯修改** —— 它们的参数已经在自己的
      * `agent_config_json` 里，怎么调由模型与操作员决定。
+     *
+     * ---
+     *
+     * ⚠️ **只有 `ai_managed` 播种这份配置 —— `ai_team` 刻意不借用它。**
+     *
+     * `unboundedAiManagedConfig` 是**单智能体**的参数集：让那一个模型自己决定。
+     * 而 AI 团队模式的参数形态不同（按**角色**分配模型与提示词，见设计 §二/§三），
+     * 拿它去播种等于给团队塞一份它不认识的配置 ——
+     * 那正是本次更新反复要避免的「一个模式借用另一个模式的语义」。
+     *
+     * 团队模式的初始配置由它自己的实现负责（S3 阶段）。**在那之前新建的 `ai_team`
+     * 机器人不会有 `agent_config_json`** —— 这是刻意的，不是遗漏：
+     * 宁可它明确地"还没配置好"，也不要它带着语义不对的配置跑起来。
      */
-    if (isAiManaged) {
+    if (parsed.data.mode === 'ai_managed') {
       traders.setAgentConfig(trader.id, JSON.stringify(unboundedAiManagedConfig()));
     }
 
