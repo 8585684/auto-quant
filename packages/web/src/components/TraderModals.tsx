@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
-import type { TraderMode, TraderStatus } from '@aq/shared';
+import { isAiDriven, type TraderMode, type TraderStatus } from '@aq/shared';
 import {
   api,
   type AiModelRow,
@@ -42,7 +42,23 @@ import type { Catalog } from '../lib/api';
  * 策略 id（`#9`），提交时照样会被带上。**界面上"选不了"不等于请求里"没有"。**
  */
 export function strategyIdFor(mode: TraderMode, selected: number): number | null {
-  return mode === 'ai_managed' ? null : selected;
+  /*
+   * ⚠️ **用共享的 `isAiDriven`，不要写死 `'ai_managed'`**（2026-10-12 复核发现的 P0）。
+   *
+   * 原来写死单模式名，于是加了 `ai_team` 之后：
+   *
+   *   strategy   -> 返回选中的策略 id
+   *   ai_managed -> null
+   *   ai_team    -> **返回选中的策略 id** ← 前端把真实策略 id 提交上去
+   *
+   * 而服务端对所有 AI 驱动模式都会拒绝非 null 的 `strategyId`
+   *（「AI 托管模式不引用任何策略」）→ **`ai_team` 机器人在界面上根本创建不出来**，
+   * 报错信息还指向"策略"，与用户实际做的事（选了个 AI 团队）完全对不上。
+   *
+   * 这与 2026-10-03 报过的「创建不了机器人」是**同一个 bug**，
+   * 只是换到了新模式的路径上 —— 因为两处规则各自写了一遍模式名。
+   */
+  return isAiDriven(mode) ? null : selected;
 }
 
 export function NewTraderModal({
@@ -564,7 +580,7 @@ export function NewTraderModal({
             <Select
               value={strategyId}
               onChange={(e) => setStrategyId(Number(e.target.value))}
-              disabled={mode === 'ai_managed'}
+              disabled={isAiDriven(mode)}
             >
               {strategyList?.map((strategy) => (
                 <option key={strategy.id} value={strategy.id}>

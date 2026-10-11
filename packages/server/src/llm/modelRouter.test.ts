@@ -271,3 +271,134 @@ test('profileOf 能按 id 取到档案', () => {
   assert.ok(profileOf('workbuddy-ai/deepseek-v4.1-flash'));
   assert.equal(profileOf('不存在的模型'), undefined);
 });
+
+/* -------------------------------------------------------------------------- */
+/*  复核发现的问题的回归测试（2026-10-12）—— 每条都对应一个真实缺陷              */
+/* -------------------------------------------------------------------------- */
+
+test('★★ budgetFor 绝不能【缩小】预算（复核发现的 P1-D）', () => {
+  /*
+   * 第一版的 `Math.min(maxOutput, base*4)` 在 `maxOutput < base*4` 时
+   * 返回的比 base 还小 —— 例如 big-pickle（maxOutput=32000）配 base=131072
+   * → 返回 32000（base 的 0.24 倍），**正好制造它要防的 `content: null`**。
+   *
+   * 原来的测试用 `find(m => m.reasoning && m.tier === 'T3_deep')` 取到 kimi-k3，
+   * 而它 `maxOutputTokens === 0`（走 base×4 那条路）——
+   * **测试恰好只覆盖了唯一不会暴露 bug 的那个模型**。
+   *
+   * 所以这里**遍历所有思维链模型**，而不是挑一个。
+   */
+  const reasoning = MODEL_PROFILES.filter((m) => m.reasoning);
+  assert.ok(reasoning.length > 0);
+  for (const m of reasoning) {
+    const base = 131_072;
+    const budget = budgetFor(m, base);
+    assert.ok(
+      budget >= base,
+      `★ ${m.id}（maxOutput=${m.maxOutputTokens}）的预算 ${budget} 小于基准 ${base} —— 绝不能缩小`,
+    );
+  }
+});
+
+test('★ budgetFor 对【报了上限】的思维链模型仍然放大，但不超过上限', () => {
+  const withLimit = MODEL_PROFILES.find((m) => m.reasoning && m.maxOutputTokens > 0);
+  assert.ok(withLimit, '档案里应当有"报了输出上限"的思维链模型');
+  const budget = budgetFor(withLimit, 1000);
+  assert.ok(budget > 1000, '★ 应当放大');
+  assert.ok(budget <= withLimit.maxOutputTokens, '★ 不超过供应商声明的上限');
+});
+
+test('★ 冷却【到期后会清零失败计数】（复核发现的 P1-E）', () => {
+  /*
+   * 原来只在 recordSuccess 里清零，于是到期后 `consecutiveFailures` 仍是阈值，
+   * **下一次单点失败立刻又冷却** —— 一个"每 5 分钟试一次就再关 5 分钟"的模型
+   * 实际可用率接近 0，与本类"单次失败不足以判死"的承诺相反。
+   */
+  let now = 1_000_000;
+  const h = new ModelHealthRegistry(2, 60_000, () => now);
+  h.recordFailure('m', 'a');
+  h.recordFailure('m', 'b');
+  assert.equal(h.isAvailable('m'), false, '连续两次失败应冷却');
+
+  now += 60_001;
+  assert.equal(h.isAvailable('m'), true, '到期后应恢复');
+  /* ★ 关键：到期后**一次**失败不该立刻又冷却 */
+  h.recordFailure('m', 'c');
+  assert.equal(h.isAvailable('m'), true, '★ 到期后计数必须已清零 —— 单次失败不该立刻重新冷却');
+});
+
+test('★★ 被 token 上限截断 → 加大预算【重试同一个模型】（复核发现的 P1-C）', async () => {
+  /*
+   * `classifyFailure` 对 `empty_content + finishReason='length'` 明确返回
+   * `shouldRetry: true, shouldFallback: false`，理由写的是"加大 max_tokens 重试"。
+   * 但第一版的实现是"换下一个候选"—— 循环顶部跳过了 `tried`，
+   * **同一个模型永远不会被第二次选中**，那条分支等于白写。
+   *
+   * 而换模型会白白丢掉最强的那个（它只是这次话说得多了一点，不是坏了）。
+   */
+  const calls: Array<{ model: string; maxTokens: number }> = [];
+  const router = new ModelRouter({
+    call: async (modelId, _msgs, options) => {
+      calls.push({ model: modelId, maxTokens: options.maxTokens });
+      /* 第一次（小预算）被截断，第二次（大预算）成功 */
+      if (calls.length === 1) {
+        return { text: '', latencyMs: 5, usage: { promptTokens: 1, completionTokens: 0 }, finishReason: 'length' };
+      }
+      return { text: '成功了', latencyMs: 5, usage: { promptTokens: 1, completionTokens: 1 }, finishReason: 'stop' };
+    },
+  });
+
+  const r = await router.callByTier('T3_deep', [{ role: 'user', content: 'hi' }], { baseMaxTokens: 4096 });
+
+  assert.equal(r.text, '成功了');
+  assert.equal(calls.length, 2, '应当重试了一次');
+  assert.equal(calls[1]!.model, calls[0]!.model, '★ 必须重试【同一个】模型，而不是换模型');
+  assert.ok(
+    calls[1]!.maxTokens > calls[0]!.maxTokens,
+    `★ 第二次的预算必须【更大】（${calls[0]!.maxTokens} → ${calls[1]!.maxTokens}）`,
+  );
+});
+
+test('★ 空内容但【不是】被截断 → 走降级路径（不与截断混淆）', async () => {
+  /*
+   * 区分这两种情况是 `finishReason` 存在**唯一**的理由：
+   *   · 被截断 → 加大预算重试同一模型（它没坏）
+   *   · 真空回复 → 重试/降级（可能真的坏了）
+   */
+  const calls: string[] = [];
+  const ladder = ladderForTier('T1_fast').map((m) => m.id);
+  const router = new ModelRouter({
+    call: async (modelId) => {
+      calls.push(modelId);
+      if (calls.length === 1) {
+        /* 空内容，但 finishReason 不是 length → 真空回复 */
+        return { text: '', latencyMs: 5, usage: { promptTokens: 1, completionTokens: 0 }, finishReason: 'stop' };
+      }
+      return { text: 'ok', latencyMs: 5, usage: { promptTokens: 1, completionTokens: 1 }, finishReason: 'stop' };
+    },
+  });
+  const r = await router.callByTier('T1_fast', [{ role: 'user', content: 'x' }], { baseMaxTokens: 512 });
+  assert.equal(r.modelId, ladder[1]!, '★ 真空回复应当换模型，而不是原地重试');
+});
+
+test('★ 连续被截断时【只放大一次】，不无限重试（防死循环）', async () => {
+  /*
+   * MAST 分类法实测「步骤重复」是最高频失败模式（15.7%）。
+   * "预算越大、思维链写得越长"会收敛不了 —— 所以只放大一次。
+   */
+  let callCount = 0;
+  const router = new ModelRouter({
+    call: async () => {
+      callCount += 1;
+      return { text: '', latencyMs: 1, usage: { promptTokens: 1, completionTokens: 0 }, finishReason: 'length' };
+    },
+    maxFallbacks: 2,
+  });
+  await assert.rejects(
+    () => router.callByTier('T1_fast', [{ role: 'user', content: 'x' }], { baseMaxTokens: 512 }),
+    /都失败/,
+    '★ 应当以失败收场，而不是无限重试',
+  );
+  /* 4 个候选（maxFallbacks=2 → 至多 3 个）+ 至多 1 次放大重试 */
+  assert.ok(callCount <= 5, `★ 调用次数必须有界，实际 ${callCount}`);
+});

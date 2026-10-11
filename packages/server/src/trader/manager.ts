@@ -263,6 +263,24 @@ export interface StartResult {
 }
 
 /**
+ * `buildTeamModel` 的结果 —— **带原因**，而不是"成功给模型 / 失败给 null"。
+ *
+ * ## 为什么要带原因（复核发现的 P0，2026-10-12）
+ *
+ * 原来返回 `DecisionModel | null`，于是失败时调用点只能看到"没有模型"，
+ * 就**静默退回到单模型路径**了。一台标着「AI 团队」的机器人实际在用**一个模型**
+ * 跑，而界面上看不出任何异常 —— 用户以为团队在开会，其实没有。
+ *
+ * `reason` 让调用点能把失败**说清楚**（页面上的 preflight check + 日志），
+ * 同时仍然不阻断启动（与「模型不可达不阻止启动」的既有原则一致）。
+ */
+interface TeamModelBuild {
+  model: DecisionModel | null;
+  /** `null` = 成功。有值 = 失败原因（给人看的中文）。 */
+  reason: string | null;
+}
+
+/**
  * Owns the lifecycle of every running trader.
  *
  * Each trader gets its own exchange connection, market-data cache and model
@@ -648,11 +666,10 @@ export class TraderManager {
    * 「模型用尽那你启动以后页面上提示就行了」）：
    * 出口不通用 `error` 状态说清，而不是让机器人起不来。
    */
-  private buildTeamModel(aiModelId: number, traderId: number): DecisionModel | null {
+  private buildTeamModel(aiModelId: number, traderId: number): TeamModelBuild {
     const row = aiModels.getWithSecret(aiModelId);
     if (!row) {
-      log.warn(`机器人 #${traderId} 的团队模式找不到 AI 模型 ${aiModelId} —— 团队路由不可用。`);
-      return null;
+      return { model: null, reason: `找不到 AI 模型 #${aiModelId}（记录可能已被删除）。` };
     }
     const baseUrl = row.base_url ?? '';
     if (!looksLikeMagpieGateway(baseUrl)) {
@@ -663,16 +680,16 @@ export class TraderManager {
        * 而一个普通供应商的 baseUrl 只有一个模型。硬用会让每一轮都失败，
        * 且错误信息（404 模型不存在）指向不了真正的问题（配置错了）。
        */
-      log.warn(
-        `机器人 #${traderId} 是 AI 团队模式，但所选模型的基址不是 magpie 网关（${baseUrl}）。` +
+      return {
+        model: null,
+        reason:
+          `所选模型的基址不是 magpie 网关（${baseUrl}）。` +
           '团队模式需要一个能按模型名路由的网关 —— 请在「AI 模型」里配置指向 http://127.0.0.1:3425/v1 的记录。',
-      );
-      return null;
+      };
     }
     const apiKey = this.vault.decryptOptional(row.api_key_enc);
     if (!apiKey) {
-      log.warn(`机器人 #${traderId} 的团队模式网关记录没有 API Key。`);
-      return null;
+      return { model: null, reason: '这条网关记录没有 API Key。' };
     }
 
     const router = new ModelRouter({
@@ -708,7 +725,7 @@ export class TraderManager {
      *
      * 这也是"不碰交易循环"的具体形态 —— 见 `routedModel.ts` 的文件头说明。
      */
-    return createTeamDecisionModel({
+    const model = createTeamDecisionModel({
       router,
       baseMaxTokens: Math.max(row.max_tokens, MIN_MAX_TOKENS_FOR_REASONING),
       /*
@@ -720,10 +737,10 @@ export class TraderManager {
         runtimeLogs.write(traderId, 'info', 'team', `[${phase}] ${role}：${note}`);
       },
     });
+
+    return { model, reason: null };
   }
 
-  /** 记日志用的机器人 id（`buildTeamModel` 在装配期被调用，那时还没有实例字段可用）。 */
-  private traderIdForLog = 0;
   private async buildModel(aiModelId: number): Promise<{ client: LlmClient; config: ReturnType<typeof aiModels.get> }> {
     const row = aiModels.getWithSecret(aiModelId);
     if (!row) throw new Error(`找不到 AI 模型 ${aiModelId}`);
@@ -1094,10 +1111,49 @@ export class TraderManager {
        * 模型名由角色路由在运行时决定（见 `magpieGateway.ts` 的文件头说明）。
        * **这样用户不用学新配置概念** —— 他已经在「AI 模型」里配过 magpie 了。
        */
-      const routedTeamModel =
+      const teamBuild =
         trader.mode === 'ai_team'
           ? this.buildTeamModel(trader.aiModelId, trader.id)
-          : null;
+          : { model: null, reason: null };
+      const routedTeamModel = teamBuild.model;
+
+      /*
+       * ⚠️ **团队模式没能启用时必须【显式报告】，不能静默走回单模型。**
+       *
+       * ## 复核发现的 P0（2026-10-12）
+       *
+       * 原来的实现是：`buildTeamModel` 失败 → 返回 `null` → 下面那句
+       * `if (routedTeamModel)` 不成立 → **悄悄退回到 `client.complete()`（单模型）**。
+       *
+       * 后果很严重：一台标着「AI 团队」的机器人，实际在用**一个模型**跑，
+       * 而**界面上看不出任何异常** —— 用户以为团队在开会，其实没有。
+       * 这直接违背了本文件里写下的承诺「`ai_team` 走另一条构造路径」。
+       *
+       * 而且触发条件很容易达成：网关端口改了、换了地址、忘了填 Key、模型记录被删
+       *（`looksLikeMagpieGateway` 用 `:3425` 子串判断，换端口即失效）。
+       *
+       * 所以：失败时**必须**同时
+       *   ① push 一条 `severity: 'error'` 的 preflight check（页面可见）
+       *   ② 写一条 error 级 runtime 日志（日志可见）
+       * 并且**如实说明"当前按单模型运行"** —— 而不是只写一句"团队模式未启用"，
+       * 那会让人以为"没跑"，而真相是"跑错了东西"。
+       *
+       * ⚠️ 仍然**不阻断启动** —— 这与「模型不可达不阻止启动」（用户 2026-10-10 定的
+       * 「模型用尽那你启动以后页面上提示就行了」）保持一致：
+       * 说清楚，但让机器人能起来。
+       */
+      if (trader.mode === 'ai_team' && teamBuild.reason !== null) {
+        const detail = `AI 团队模式未启用：${teamBuild.reason} 当前这台机器人会按**单模型**运行（不是团队）。`;
+        checks.push({
+          name: 'AI 团队模式',
+          severity: 'error',
+          ok: false,
+          detail,
+          blocking: false,
+        });
+        runtimeLogs.write(trader.id, 'error', 'manager', detail);
+        log.warn(`机器人 #${trader.id} ${detail}`);
+      }
 
       /* --- Assemble ----------------------------------------------------- */
       const marketData = new MarketDataService(connection.market, connection.registry);

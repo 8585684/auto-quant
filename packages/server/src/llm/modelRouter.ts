@@ -71,6 +71,16 @@ export type CallModel = (
   text: string;
   latencyMs: number;
   usage: RouterCallResult['usage'];
+  /**
+   * 结束原因。**必须透传** —— 它是区分两种"空内容"的唯一依据：
+   *
+   *   · `'length'`  → 被 token 上限截断（思维链吃光预算）→ **加大预算重试**
+   *   · 其他/null   → 真的空回复 → **重试，仍空则降级**
+   *
+   * 不透传的话，`classifyFailure` 里那条 `finishReason === 'length'` 分支
+   * **永远不会命中**（实测发现的问题：那条分支曾是死代码）。
+   */
+  finishReason?: string | null;
   /** 失败时由实现抛出；路由器据此分类。 */
 }>;
 
@@ -99,6 +109,15 @@ export interface ModelRouterOptions {
  * 所以对 `reasoning: true` 的模型，预算必须放大。
  */
 const REASONING_BUDGET_MULTIPLIER = 4;
+
+/**
+ * 因"被 token 上限截断"而重试时，预算再乘的倍数。
+ *
+ * **只乘一次**（`budgetBoosted` 是单次标记）。不设"反复加倍直到成功"的理由：
+ * 那是 MAST 分类法里"步骤重复 15.7%"的形状 —— 预算越大思维链可能写得越长，
+ * 收敛不了。**宁可这一次拿不到内容，也不要陷进无界重试。**
+ */
+const EMPTY_CONTENT_RETRY_MULTIPLIER = 2;
 
 export class ModelRouter {
   private readonly health: ModelHealthRegistry;
@@ -136,6 +155,11 @@ export class ModelRouter {
     const attempts: RouterCallResult['attempts'] = [];
     const tried: string[] = [];
     let previousModel: string | null = null;
+    /*
+     * 被 token 上限截断时**放大预算原地重试**用的标记；`null` = 还没用过这个额度。
+     * 只允许一次（见空内容分支里的说明：防止"预算越大、思维链越长"的死循环）。
+     */
+    let budgetBoosted: number | null = null;
 
     for (let i = 0; i <= this.maxFallbacks; i += 1) {
       const modelId = pickAvailable(ladder, this.health, tried);
@@ -158,14 +182,48 @@ export class ModelRouter {
       try {
         const result = await this.options.call(modelId, messages, {
           ...(options.signal ? { signal: options.signal } : {}),
-          maxTokens: budgetFor(profile, options.baseMaxTokens),
+          maxTokens: budgetFor(profile, budgetBoosted ?? options.baseMaxTokens),
         });
         const ms = Date.now() - started;
 
         /* ② 空内容检查 —— 实测的"HTTP 200 但没吐字"。 */
         if (result.text.trim().length === 0) {
-          const verdict = classifyFailure({ status: 200, message: '', emptyContent: true, finishReason: null });
+          const verdict = classifyFailure({
+            status: 200,
+            message: '',
+            emptyContent: true,
+            finishReason: result.finishReason ?? null,
+          });
           attempts.push({ modelId, ok: false, ms, note: verdict.reason });
+
+          /*
+           * ⚠️ **"被 token 上限截断"不该换模型**，而该**给同一个模型更多预算重试**。
+           *
+           * 实测：`gpt-6-astra` 在 mt=16/128 时 `content: null`（思维链吃光了预算），
+           * mt=512 就正常吐字。**它不是坏了，是这次话说得多了一点** ——
+           * 换模型会白白丢掉最强的那个（T3 候选链里它排第一）。
+           *
+           * 原来的实现是"换下一个候选"，与 `classifyFailure` 里
+           * `shouldRetry: true, shouldFallback: false` 的承诺**不符**：
+           * 循环顶部的 `pickAvailable` 跳过了 `tried`，所以永远试不到同一模型
+           * —— 那条 `finishReason === 'length'` 分支等于白写。
+           *
+           * 这里改成：**不加入 `tried`，把预算翻倍后原地重试一次**。
+           * 只重试一次（`budgetBoosted` 标记），避免"预算越大、思维链写得越长"
+           * 的死循环 —— 那正是 MAST 分类法里"步骤重复 15.7%"的形状。
+           */
+          if (verdict.kind === 'empty_content' && result.finishReason === 'length' && budgetBoosted === null) {
+            /*
+             * ⚠️ **必须真的翻倍** —— 第一版这里写的是 `= options.baseMaxTokens`，
+             * 那与"什么都不设置"完全等价：重试拿到**同样的预算**，必然再次被截断。
+             * 等于"重试了一次但什么都没改变"，白花一次调用。
+             */
+            budgetBoosted = options.baseMaxTokens * EMPTY_CONTENT_RETRY_MULTIPLIER;
+            tried.pop(); /* 允许重选同一个模型 */
+            previousModel = modelId;
+            continue;
+          }
+
           this.health.recordFailure(modelId, verdict.reason);
           previousModel = modelId;
           continue;
@@ -209,14 +267,39 @@ export class ModelRouter {
  * 给一个模型算输出预算。
  *
  * ⚠️ **思维链模型必须放大** —— 否则实测会出现 `content: null`（预算被思维链吃光）。
+ *
+ * ## 修过一次的 bug（2026-10-12 复核发现）
+ *
+ * 第一版写的是：
+ *
+ *     Math.min(maxOutputTokens > 0 ? maxOutputTokens : base * 4, base * 4)
+ *
+ * **它在 `maxOutputTokens < base × 4` 时返回的比 `base` 还小**，例如
+ * `big-pickle`（maxOutput=32000）配上 `base=131072` → 返回 **32000（base 的 0.24 倍）**。
+ * 也就是说：这个函数**在四个模型上把预算缩小了**，正好制造它要防的
+ * `content: null` —— **注释承诺放大、代码执行缩小**。
+ *
+ * 为什么原来的测试没抓住：它用 `MODEL_PROFILES.find(m => m.reasoning && m.tier === 'T3_deep')`
+ * 取到的是 `kimi-k3`，而它的 `maxOutputTokens === 0`（走 `base × 4` 那条路）——
+ * **测试恰好只覆盖了唯一不会暴露 bug 的那个模型**。
+ *
+ * ## 正确的语义
+ *
+ * 「**放大，但不低于原值，也不超过供应商声明的上限**」：
+ *
+ *   · 供应商没报上限（0）→ `base × 倍率`
+ *   · 报了上限 → 在 `[base, min(上限, base × 倍率)]` 之间取
+ *     （`Math.max(base, …)` 保证**永不小于 base**）
  */
 export function budgetFor(profile: ModelProfile | undefined, baseMaxTokens: number): number {
   if (profile?.reasoning !== true) return baseMaxTokens;
-  return Math.min(
-    /* 供应商报的最大输出（0 = 没报，用放大后的值）。 */
-    profile.maxOutputTokens > 0 ? profile.maxOutputTokens : baseMaxTokens * REASONING_BUDGET_MULTIPLIER,
-    baseMaxTokens * REASONING_BUDGET_MULTIPLIER,
-  );
+  const amplified = baseMaxTokens * REASONING_BUDGET_MULTIPLIER;
+  if (profile.maxOutputTokens <= 0) return amplified;
+  /*
+   * `Math.max(baseMaxTokens, …)` 是关键那一半：**下限是原值**。
+   * 少了它，供应商报的上限比 base 小的时候就会把预算缩下去。
+   */
+  return Math.max(baseMaxTokens, Math.min(profile.maxOutputTokens, amplified));
 }
 
 /** 从错误对象上尽力取 HTTP 状态码（不同层可能挂在 `status` 或 `statusCode`）。 */

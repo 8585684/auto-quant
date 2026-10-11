@@ -235,6 +235,23 @@ export class ModelHealthRegistry {
   /** 记一次失败，并返回它是否已进入冷却。 */
   recordFailure(modelId: string, reason: string): { coolingDown: boolean } {
     const e = this.entry(modelId);
+    /*
+     * ⚠️ **冷却已到期时，这次失败算新一轮的开始**（2026-10-12 复核发现的 P1-E）。
+     *
+     * 原来只在 `recordSuccess` 里清零，于是冷却到期后 `consecutiveFailures`
+     * **仍然是阈值**（例如 2）—— 下一次单点失败**立刻又冷却 5 分钟**。
+     * 后果：一个"每 5 分钟试一次、试一次就再关 5 分钟"的模型，**实际可用率接近 0**，
+     * 与本类注释的承诺（「失败只让它冷却一段时间……否则一个瞬时抖动会把好模型
+     * 永久踢出候选链」）**正好相反**。
+     *
+     * 清零放在这里（写入时）而不是 `isAvailable`（读取时），是因为后者会被
+     * `pickAvailable` 在每次失败之间调用 —— 放在那里会导致"连续失败"永远
+     * 累积不到阈值（实测立刻被测试抓到）。
+     */
+    if (e.cooldownUntil > 0 && this.now() >= e.cooldownUntil) {
+      e.consecutiveFailures = 0;
+      e.cooldownUntil = 0;
+    }
     e.consecutiveFailures += 1;
     e.failCount += 1;
     e.lastFailure = reason;
@@ -245,7 +262,16 @@ export class ModelHealthRegistry {
     return { coolingDown: false };
   }
 
-  /** 现在能不能用它。 */
+  /**
+   * 现在能不能用它。
+   *
+   * ⚠️ **纯读，无副作用** —— 这一点很重要：`pickAvailable` 会在**每次失败之间**
+   * 调用它，如果在这里清零计数，"连续失败"就永远累积不到阈值。
+   * 那是第一版的修法，实测立刻被测试抓到（`连续第二次失败才冷却` 失败）。
+   *
+   * 清零改在 `recordFailure` 里做 —— 语义上也是那里更对：
+   * **"是否该把这次失败算作新一轮的开始"是写入时才需要判断的事。**
+   */
   isAvailable(modelId: string): boolean {
     const e = this.entries.get(modelId);
     if (!e) return true;

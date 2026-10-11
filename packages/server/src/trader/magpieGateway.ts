@@ -109,6 +109,17 @@ export function createMagpieCallFactory(gateway: MagpieGatewayConfig): CallModel
         cachedTokens: result.usage.cachedTokens,
         reasoningTokens: result.usage.reasoningTokens,
       },
+      /*
+       * ⚠️ **必须透传 `finishReason`** —— 它是路由器区分两种"空内容"的唯一依据：
+       *
+       *   · `'length'` → 被 token 上限截断 → **加大预算重试同一模型**
+       *   · 其他       → 真的空回复       → 重试，仍空则降级
+       *
+       * 漏掉这一行，路由器那条"被截断就加大预算"的分支**永远不会命中**
+       *（因为它只看得到 `undefined`）—— 而症状是"最强那个模型总是被跳过"，
+       * 从表面完全看不出原因。
+       */
+      finishReason: result.finishReason ?? null,
     };
   };
 }
