@@ -37,6 +37,23 @@ function roleAwareCall(): { call: CallModel; seen: string[] } {
         usage: { promptTokens: 100, completionTokens: 50 },
       };
     }
+    /*
+     * ⚠️ **风控官必须明确表态**（用户需求 #3）。
+     *
+     * 它的输出会被 `parseRiskOfficerVerdict` 解析：说"批准"才放行。
+     * 桩若返回一句含糊的话（如"我看一下"），解析器会走**保守策略** ——
+     * 拦住所有增加风险的动作。所以这个桩必须明确说"批准"。
+     *
+     * （实测就是这个行为：加风控官后本测试的决策数组变空 —— 因为桩没表态，
+     *   保守策略把开仓拦了。那**恰好证明风控官在工作**。）
+     */
+    if (system.includes('「risk_officer」')) {
+      return {
+        text: '批准。仓位与当前敞口匹配，未发现集中度问题。',
+        latencyMs: 15,
+        usage: { promptTokens: 60, completionTokens: 20 },
+      };
+    }
     return {
       text: `我是 ${system.includes('「') ? system.slice(system.indexOf('「') + 1, system.indexOf('」')) : '未知角色'}，这是我的产出。`,
       latencyMs: 15,
@@ -72,16 +89,21 @@ test('★★ 团队模式一次 complete() 背后跑完整个交易台，并产�
   assert.ok(result.text.includes('<team>'), '★ 要有团队审计块');
 });
 
-test('★ 七个角色真的都被调用了（不是只问了裁决）', async () => {
+test('★ 八个角色真的都被调用了（不是只问了裁决）', async () => {
   const { call, seen } = roleAwareCall();
   const model = createTeamDecisionModel({ router: new ModelRouter({ call }), baseMaxTokens: 4096 });
   await model.complete(SYS, USER, {});
 
-  /* 7 = 4 分析师 + bull + bear + judge */
-  assert.equal(seen.length, 7, `应当有 7 次角色调用，实际 ${seen.length}`);
+  /*
+   * **8 = 4 分析师 + bull + bear + judge + 风控官**
+   *
+   * 风控官是用户需求 #3（"风控由一个智能体来负责"）的落地 ——
+   * 它在裁决之后、渲染之前被问一次。
+   */
+  assert.equal(seen.length, 8, `应当有 8 次角色调用（7 角色 + 风控官），实际 ${seen.length}`);
 
-  /* 关键角色都要在 */
-  for (const role of ['market_analyst', 'technical', 'newscaster', 'sentiment', 'bull', 'bear', 'judge']) {
+  /* 关键角色都要在（含风控官） */
+  for (const role of ['market_analyst', 'technical', 'newscaster', 'sentiment', 'bull', 'bear', 'judge', 'risk_officer']) {
     assert.ok(
       seen.some((s) => s.includes(`「${role}」`)),
       `★ 角色 ${role} 没有被调用`,

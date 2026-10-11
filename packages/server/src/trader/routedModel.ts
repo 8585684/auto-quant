@@ -27,11 +27,13 @@
  * 是两个独立构造函数。智能托管用原来那个单客户端的适配器，一行都不用改。
  */
 
+import type { Decision } from '@aq/shared';
 import type { DecisionModel } from './autoTrader.js';
 import type { ModelTier } from '../llm/modelCatalog.js';
 import { ModelRouter, type CallModel } from '../llm/modelRouter.js';
-import { runTradingDesk, type AskRole, type DeskRoleOutput } from './agent/tradingDesk.js';
-import { renderDeskOutcome } from './agent/deskOutput.js';
+import { runTradingDesk, type AskRole, type DeskOutcome, type DeskRoleOutput } from './agent/tradingDesk.js';
+import { renderDeskOutcome, extractFirstJsonArray } from './agent/deskOutput.js';
+import { parseRiskOfficerVerdict } from './agent/riskOfficer.js';
 
 /** 一次「向模型提问」要用的档位与角色。 */
 export interface RoleRequest {
@@ -264,11 +266,103 @@ export function createTeamDecisionModel(options: {
         ...(limits ? { limits } : {}),
       });
 
+      /*
+       * ── **风控官关卡**（用户需求 #3：风控由智能体负责，不是内置规则）──────
+       *
+       * 位置很关键：**在裁决之后、渲染之前**。
+       *
+       *   · 在裁决**之前**问 → 风控官看不到团队讨论的结论，只能空谈；
+       *   · 在渲染**之后**问 → 来不及改决策，只能"事后评论"（那正是
+       *     TradingAgents 的教训：只提建议的风控等于没有风控）。
+       *
+       * ## 为什么这一层仍然不是"全部交给智能体"
+       *
+       * 风控官（本层）管**策略判断**：仓位大小、集中度、该不该收手 ——
+       * 那是真正需要智能的部分，也是用户要的"风格由智能体负责"。
+       *
+       * 而**物理底线**（保证金够不够、数量可不可交易、止损存不存在）
+       * 仍在下一层 `RiskEngine`，**它不可被绕过** ——
+       * 把"保证金够不够"交给会幻觉的模型判断，等于拿爆仓换"智能"。
+       */
+      const risk = await askRiskOfficer(ask, outcome, onStep);
+
       return {
-        text: renderDeskOutcome(outcome),
+        text: renderDeskOutcome(outcome, risk),
         latencyMs: Date.now() - started,
         usage: { promptTokens: null, completionTokens: null },
       };
     },
   };
+}
+
+/**
+ * 问风控官。
+ *
+ * ## 提取裁决里的决策 → 交给风控官 → 解析它的结论
+ *
+ * 决策从**裁决文本**里抽（与渲染用的是同一个抽取器）—— 保证"风控官审的东西"
+ * 与"最终执行的"是**同一份**。用两次不同的抽取会引入"审的是 A、执行的是 B"的风险。
+ *
+ * ## 失败时不阻断
+ *
+ * 风控官调用失败（额度尽、网关抖动）→ 返回 `null` → 渲染层会标明
+ * "本轮未经风控官审阅"。**不抛错**：一次抖动不该让整轮决策作废
+ *（而下一层 `RiskEngine` 的物理底线仍在，安全不靠这一层单独保证）。
+ */
+async function askRiskOfficer(
+  ask: AskRole,
+  outcome: DeskOutcome,
+  onStep?: (step: { role: string; phase: string; note: string }) => void,
+): Promise<{
+  approved: boolean;
+  adjusted: Decision[] | null;
+  reason: string;
+  concern: string | null;
+  modelId: string | null;
+} | null> {
+  const extracted = outcome.verdict?.ok === true ? extractFirstJsonArray(outcome.verdict.raw) : null;
+  const decisions = (extracted?.decisions ?? []) as Decision[];
+
+  /* 没有决策要审（本轮本来就不行动）→ 不必多花一次调用。 */
+  if (decisions.length === 0) return null;
+
+  onStep?.({ role: 'risk_officer', phase: 'risk', note: `审阅 ${decisions.length} 条决策` });
+
+  try {
+    const out = await ask({
+      role: 'risk_officer',
+      tier: tierForRole('risk_officer'),
+      context: [
+        '## 待审决策',
+        JSON.stringify(decisions, null, 2),
+        '## 团队讨论摘要',
+        outcome.summary,
+        '## 裁决官结论',
+        outcome.verdict?.raw.slice(0, 1500) ?? '（缺失）',
+      ].join('\n\n'),
+      task:
+        '审阅上面的决策，判断**风险是否可接受**。你有权**否决**或**建议削减仓位**。' +
+        '必须明确表态：说"批准"或"否决"（或"削减"）。' +
+        '同时给出一句话理由，以及你担心的主要风险。' +
+        '⚠️ 你的职责是**风险**，不是方向 —— 不要因为"我觉得会涨"而批准，' +
+        '也不要因为"我觉得会跌"而否决；只看**风险敞口是否合适**。',
+    });
+
+    const verdict = parseRiskOfficerVerdict(out.raw, decisions);
+    onStep?.({
+      role: 'risk_officer',
+      phase: 'risk',
+      note: verdict.approved ? (verdict.reduced ? '削减后放行' : '放行') : '否决',
+    });
+    return {
+      approved: verdict.approved,
+      adjusted: verdict.adjusted,
+      reason: verdict.reason,
+      concern: verdict.concern,
+      modelId: out.modelId,
+    };
+  } catch (error) {
+    onStep?.({ role: 'risk_officer', phase: 'risk', note: `调用失败：${(error as Error).message}` });
+    return null;
+  }
 }

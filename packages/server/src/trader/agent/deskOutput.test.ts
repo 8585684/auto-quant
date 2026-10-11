@@ -150,3 +150,71 @@ test('角色失败时审计块要如实标注，不掩盖', () => {
   assert.ok(text.includes('失败'), '★ 失败的角色要在审计块里标明');
   assert.ok(text.includes('newscaster'));
 });
+
+/* -------------------------------------------------------------------------- */
+/*  风控官的应用（用户需求 #3：风控由智能体负责）                                */
+/* -------------------------------------------------------------------------- */
+
+test('★★ 风控官【否决】→ 决策被清空（本轮不行动）', () => {
+  /*
+   * 这是"风控由智能体负责"的核心：裁决官说开仓，风控官说不许，**结论是不许**。
+   * 若这一条不成立，风控智能体就只是"提建议" —— 而调研明确指出
+   * "只提建议的风控等于没有风控"（TradingAgents 的教训）。
+   */
+  const out = outcome({
+    verdict: role('judge', '[{"symbol":"BTCUSDT","action":"open_long","positionSizeUsd":200}]'),
+  });
+  const text = renderDeskOutcome(out, {
+    approved: false,
+    adjusted: null,
+    reason: '当前回撤已达上限，不应再增加敞口。',
+    concern: '连续 3 笔亏损',
+  });
+
+  const extracted = extractFirstJsonArray(text.slice(text.indexOf('<decision>')));
+  assert.equal(extracted.status, 'ok');
+  assert.deepEqual(extracted.decisions, [], '★ 风控否决必须真的清空决策');
+  assert.ok(text.includes('<risk>'), '要有风控审计块');
+  assert.ok(text.includes('否决'), '★ 审计块要说清是"否决"');
+  assert.ok(text.includes('回撤'), '★ 理由要能读');
+});
+
+test('★★ 风控官【削减】→ 用削减后的决策（而不是原决策）', () => {
+  const out = outcome({
+    verdict: role('judge', '[{"symbol":"BTCUSDT","action":"open_long","positionSizeUsd":200}]'),
+  });
+  const text = renderDeskOutcome(out, {
+    approved: true,
+    adjusted: [{ symbol: 'BTCUSDT', action: 'open_long', positionSizeUsd: 100 } as never],
+    reason: '仓位减半。',
+    concern: null,
+  });
+
+  const extracted = extractFirstJsonArray(text.slice(text.indexOf('<decision>')));
+  assert.equal(extracted.status, 'ok');
+  const first = extracted.decisions?.[0] as Record<string, unknown>;
+  assert.equal(first.positionSizeUsd, 100, '★ 必须用削减后的金额，而不是裁决官原本的 200');
+  assert.ok(text.includes('削减后放行'), '★ 审计块要标明这是削减过的');
+});
+
+test('★★ 风控官【没跑】时必须在审计块里标明（不能静默跳过）', () => {
+  /*
+   * 静默跳过会让操作员以为"风控看过了" —— 而实际上没有。
+   * 用户要求看得见，这里就是最该被看见的一件事。
+   */
+  const out = outcome({ verdict: role('judge', '[{"symbol":"BTCUSDT","action":"open_long"}]') });
+  const text = renderDeskOutcome(out, null);
+
+  assert.ok(text.includes('未经风控官审阅'), '★ 必须明确说没审阅');
+  const extracted = extractFirstJsonArray(text.slice(text.indexOf('<decision>')));
+  assert.equal(extracted.status, 'ok');
+  assert.equal(extracted.decisions?.length, 1, '没审阅时按裁决官结论放行（不擅自拦截）');
+});
+
+test('风控官放行时不改动决策', () => {
+  const out = outcome({ verdict: role('judge', '[{"symbol":"BTCUSDT","action":"open_long"}]') });
+  const text = renderDeskOutcome(out, { approved: true, adjusted: null, reason: '仓位合适。', concern: null });
+  const extracted = extractFirstJsonArray(text.slice(text.indexOf('<decision>')));
+  assert.equal(extracted.decisions?.length, 1);
+  assert.ok(text.includes('放行'));
+});
