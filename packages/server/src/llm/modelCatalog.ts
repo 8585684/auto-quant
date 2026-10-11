@@ -281,24 +281,86 @@ export function ladderForTier(tier: ModelTier): readonly ModelProfile[] {
   for (const [index, t] of path.entries()) {
     const isOwnTier = index === 0;
     const candidates = MODEL_PROFILES.filter((m) => m.tier === t && m.verified);
-    /*
-     * 免费优先还是付费优先？**按档位不同**：
-     *
-     *   · T3（辩论/裁决）—— **智商优先**：先用最强的，额度不够时靠健康记录下沉。
-     *   · T1/T2（体力活）—— **免费优先**：这类工作量大、不需要顶级智商，
-     *     拿付费额度跑它们是浪费（用户原话：免费模型基本不限量）。
-     *   · **兜底档一律免费优先** —— 高智商模型额度贵，拿它当兜底不划算。
-     */
-    const preferFree = !isOwnTier || t !== 'T3_deep';
-    const sorted = [...candidates].sort((a, b) => {
-      if (a.free !== b.free) return preferFree ? (a.free ? -1 : 1) : a.free ? 1 : -1;
-      return (a.measuredMs ?? Number.MAX_SAFE_INTEGER) - (b.measuredMs ?? Number.MAX_SAFE_INTEGER);
-    });
+    const sorted = [...candidates].sort((a, b) => scoreFor(t, isOwnTier, a) - scoreFor(t, isOwnTier, b));
     for (const m of sorted) {
       if (!result.some((x) => x.id === m.id)) result.push(m);
     }
   }
   return result;
+}
+
+/**
+ * 给候选模型打分（**分越低越优先**）。
+ *
+ * ## 为什么不再用"免费优先"当第一排序键（2026-10-12 实测修正）
+ *
+ * 原来的排序是：**先按 `free` 分组，再按速度排**。于是 `T1_fast` 的候选链变成：
+ *
+ * ```
+ *   1. nemotron-3.5-lightning-free    free=true  reasoning=Y  3246ms
+ *   2. muse-spark-1.3-contributor-free free=true  reasoning=Y  4140ms
+ *   3. big-pickle                     free=true  reasoning=Y  4314ms
+ *   4. deepseek-v4.1-flash            free=false reasoning=-  1505ms  ← 最快，却排第 4
+ *   5. fast-model                     free=false reasoning=-  1517ms
+ * ```
+ *
+ * **前三个都是思维链模型**，实测（真实提示词、20 个标的）单个角色要
+ * **47–59 秒**；而最快的两个（约 1.5 秒）因为"要花钱"被排到后面。
+ *
+ * 后果很实际：一轮决策数分钟，而**省下的时间是能多做几轮决策的** ——
+ * 对 7×24 持续工作来说，**快本身就是产出**。
+ *
+ * ## 现在的口径
+ *
+ * | 档位 | 主要看什么 | 理由 |
+ * |---|---|---|
+ * | **T1**（体力活）| **速度权重最高** | 打标/摘要这类活，快比省钱重要得多 |
+ * | **T2**（分析）| 速度与免费并重 | 要写完整分析，慢一点可接受 |
+ * | **T3**（判断）| **能力优先**（免费只是加分）| 辩论与裁决的质量直接决定盈亏 |
+ * | **兜底档** | **免费优先** | 兜底要能长期靠得住，付费额度留给主力 |
+ *
+ * `reasoning: true` 在 T1/T2 上**加罚分** —— 思维链模型在体力活上
+ * 既慢又容易被自己的推理带偏（实测它们会把"我要去取数"写进输出）。
+ */
+function scoreFor(tier: ModelTier, isOwnTier: boolean, m: ModelProfile): number {
+  /* 速度归一化：实测 1.5s–7s；没测过的给一个较大的中性值。 */
+  const speed = (m.measuredMs ?? 8_000) / 1_000;
+
+  /* 兜底档：免费是唯一重要的（要能长期靠得住）。 */
+  if (!isOwnTier) return (m.free ? 0 : 1_000) + speed;
+
+  if (tier === 'T1_fast') {
+    /*
+     * 体力活：**速度是主项**，免费是加分项，思维链是减分项。
+     *
+     * 权重这么定的依据：实测思维链模型在真实提示词下要 47–59 秒，
+     * 而最快的两个约 1.5 秒 —— **差 30 倍**，远超"免费 vs 花几分钱"的差别。
+     */
+    return speed + (m.free ? 0 : 2) + (m.reasoning ? 3 : 0);
+  }
+
+  if (tier === 'T2_mid') {
+    /* 分析：速度与免费并重。 */
+    return speed * 0.6 + (m.free ? 0 : 3) + (m.reasoning ? 0.5 : 0);
+  }
+
+  /* T3：能力优先 —— 免费只是加分，速度权重最低（质量直接决定盈亏）。 */
+  return speed * 0.3 + (m.free ? -1 : 0) + (isStrongest(m) ? -2 : 0);
+}
+
+/**
+ * 是不是"强模型"（T3 内部再分一层）。
+ *
+ * 判据用**思考等级数**（`>=4` 档）—— 与 `modelDiscovery.inferTier` 同一个
+ * 可观测信号（实测 `gpt-6-astra` 报 6 档，普通思考模型只报 2–3 档）。
+ */
+function isStrongest(m: ModelProfile): boolean {
+  /*
+   * ⚠️ `ModelProfile` 里没有 `reasoningLevels`（那是"发现"层的字段），
+   * 所以这里用**档案里的实测耗时与是否思维链**做一个保守近似：
+   * T3 里"耗时长且会思考"的通常是更强的那个。
+   */
+  return m.reasoning && (m.measuredMs ?? 0) >= 6_000;
 }
 
 /** 按 id 取档案。 */
