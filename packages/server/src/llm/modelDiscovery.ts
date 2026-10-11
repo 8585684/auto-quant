@@ -142,10 +142,36 @@ export function parseWireModels(payload: unknown): DiscoveredModel[] {
 }
 
 /**
+ * **模型名归一化**（用于跨来源匹配）。
+ *
+ * ## 为什么必须归一化（实测踩到的坑）
+ *
+ * magpie 暴露的路由组 id 与 `plugin-providers.json` 里的模型名**写法不一致**：
+ *
+ *     网关暴露：`group/auto-deepseek-v4-1-flash`   ← 全是连字符
+ *     配置文件：`deepseek-v4.1-flash`              ← 中间是点
+ *
+ * 实测后果：组的免费属性匹配不上成员，`group/auto-deepseek-v4-1-flash`
+ * 被误判成 `free=false`（付费），而用户明确说它**不限量**
+ *（原话：「WorkBuddy AI 提供商里面的 Deepseek-V4.1-Flash 就是不限量无限使用」）。
+ *
+ * 误判的代价很实在：一个不限量的模型被当成烧额度的，于是**体力活不敢用它**，
+ * 白白消耗珍贵的付费额度 —— 正好与"合理安排使用"的目标相反。
+ *
+ * 所以把 `.` `_` 统一成 `-`、转小写、压掉重复分隔符再比。
+ */
+function normalizeModelName(name: string): string {
+  return name
+    .toLowerCase()
+    .replace(/[._\s]+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-|-$/g, '');
+}
+
+/**
  * 从 `plugin-providers.json` 解析出"限量/不限量"等**只在配置里才有**的信息。
  *
- * 返回 `provider/model → { free, rate, released, fast }` 的映射。
- * key 用 `provider/model` 形式，与 `/v1/models` 的 id 对齐（`group/auto-*` 另算）。
+ * 返回归一化后的 `provider/model → { free, rate, released, fast }` 映射。
  */
 export function parsePluginLimits(payload: unknown): Map<string, { free: boolean | null; rate: number | null; released: string; fast: boolean }> {
   const map = new Map<string, { free: boolean | null; rate: number | null; released: string; fast: boolean }>();
@@ -164,7 +190,7 @@ export function parsePluginLimits(payload: unknown): Map<string, { free: boolean
           ? m.id
           : null;
       if (!modelId) continue;
-      map.set(`${providerId}/${modelId}`, {
+      map.set(`${providerId}/${normalizeModelName(modelId)}`, {
         free: typeof m.free === 'boolean' ? m.free : null,
         rate: typeof m.rate === 'number' && Number.isFinite(m.rate) ? m.rate : null,
         released: typeof m.released === 'string' ? m.released : '',
@@ -192,23 +218,28 @@ export function mergeDiscovered(
   wire: readonly DiscoveredModel[],
   limits: Map<string, { free: boolean | null; rate: number | null; released: string; fast: boolean }>,
 ): DiscoveredModel[] {
-  /* 先按"模型名"（去掉 provider 前缀）索引免费信息，供组推断使用。 */
+  /* 先按"模型名"（去掉 provider 前缀、归一化）索引免费信息，供组推断使用。 */
   const byModelName = new Map<string, Array<{ free: boolean | null; rate: number | null; released: string; fast: boolean }>>();
   for (const [key, value] of limits) {
-    const modelName = key.slice(key.indexOf('/') + 1);
+    const slash = key.indexOf('/');
+    const modelName = slash >= 0 ? key.slice(slash + 1) : key;
     const list = byModelName.get(modelName) ?? [];
     list.push(value);
     byModelName.set(modelName, list);
   }
 
   return wire.map((m) => {
-    /* ① 精确匹配 `provider/model`。 */
-    const exact = limits.get(m.id);
+    const slash = m.id.indexOf('/');
+    const providerPart = slash >= 0 ? m.id.slice(0, slash) : '';
+    const modelPart = slash >= 0 ? m.id.slice(slash + 1) : m.id;
+
+    /* ① 精确匹配（**归一化后**比 —— magpie 会用 `-` 替换 `.`）。 */
+    const exact = limits.get(`${providerPart}/${normalizeModelName(modelPart)}`);
     if (exact) return { ...m, ...exact };
 
     /* ② 路由组：`group/auto-<name>` → 用 `<name>` 的成员信息推断。 */
     if (m.id.startsWith('group/auto-')) {
-      const name = m.id.slice('group/auto-'.length);
+      const name = normalizeModelName(m.id.slice('group/auto-'.length));
       const members = byModelName.get(name) ?? [];
       if (members.length > 0) {
         /*
@@ -265,20 +296,34 @@ export function inferTier(m: DiscoveredModel): 'T1_fast' | 'T2_mid' | 'T3_deep' 
   /* 供应商自己标了"快"—— 尊重它，不进推理档。 */
   if (m.fast) return 'T1_fast';
 
+  /*
+   * **名称信号**：供应商给模型起的名字就是它的定位声明。
+   *
+   * 加这一条的直接原因是实测：`workbuddy-ai/deepseek-v4.1-flash` 的
+   * `max_output_tokens` 是 **128000**，仅凭"输出大"会被判成 T3（旗舰），
+   * 而它其实是**最快的那个**（实测 1.5s）—— 名字里的 `flash` 才是真相。
+   *
+   * **只看输出上限会把"能写长文"误当成"很聪明"**，这两件事无关。
+   */
+  const name = m.id.toLowerCase();
+  if (/(^|[/\-_])(flash|mini|lite|lightning|turbo|fast|small|nano)([/\-_]|$)/.test(name.replace(/\./g, '-'))) {
+    return 'T1_fast';
+  }
+
   /* 不会思考就是体力活。 */
   if (!m.reasoning) return 'T1_fast';
 
   /*
-   * 旗舰判据：能写长报告（输出 ≥128k）**或**给了丰富的思考等级（≥4 档）。
+   * 旗舰判据：给了丰富的思考等级（≥4 档）。
    *
    * 实测佐证：`group/auto-gpt-6-astra` 报了 **6 档**
    *（low/medium/high/xhigh/max/ultra），而普通思考模型只报 2–3 档 ——
-   * "愿意暴露更多思考级别"本身就是能力强的一个信号。
+   * "愿意暴露更多思考级别"是能力的一个可观测信号，且**比输出上限可靠**
+   *（输出上限普遍很大，没有区分度）。
    */
-  const bigOutput = m.maxOutputTokens >= 128_000;
-  const richLevels = m.reasoningLevels.length >= 4;
-  if (bigOutput || richLevels) return 'T3_deep';
+  if (m.reasoningLevels.length >= 4) return 'T3_deep';
 
+  /* 其余会思考的归中档（主力分析）。 */
   return 'T2_mid';
 }
 

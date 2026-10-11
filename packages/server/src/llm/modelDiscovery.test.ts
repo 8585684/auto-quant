@@ -92,7 +92,7 @@ test('★ 能从 magpie 配置里分出"不限量"与"消耗积分"', () => {
       { provider: 'workbuddy-ai', model: 'hy4-preview', free: false, rate: 0.29 },
     ]),
   );
-  assert.equal(limits.get('workbuddy-ai/deepseek-v4.1-flash')?.free, true, '★ 不限量的要认出来');
+  assert.equal(limits.get('workbuddy-ai/deepseek-v4-1-flash')?.free, true, '★ 不限量的要认出来（键已归一化：. → -）');
   assert.equal(limits.get('workbuddy-ai/hy4-preview')?.free, false);
   assert.equal(limits.get('workbuddy-ai/hy4-preview')?.rate, 0.29, '费率要读到');
 });
@@ -170,9 +170,42 @@ test('★ 自动分档：标了 fast 的直接进快档', () => {
 test('★ 自动分档：会思考 + 输出能力大 → 强推理档', () => {
   const m: DiscoveredModel = {
     id: 'x/y', displayName: 'y', provider: 'x', contextTokens: 1_000_000, maxOutputTokens: 128_000,
-    reasoning: true, reasoningLevels: ['low', 'high'], image: false, free: null, rate: null, released: '', fast: false,
+    reasoning: true, reasoningLevels: ['low', 'high', 'medium', 'xhigh'], image: false, free: null, rate: null, released: '', fast: false,
   };
   assert.equal(inferTier(m), 'T3_deep');
+});
+
+test('★ 名称里的 `flash` 优先级高于"输出大"（实测踩到的坑）', () => {
+  /*
+   * 实测：`workbuddy-ai/deepseek-v4.1-flash` 的 max_output 是 **128000**，
+   * 光看输出会被判成旗舰，而它其实是**最快的那个**（实测 1.5s）。
+   * **"能写长文"与"很聪明"是两件事** —— 名字里的 `flash` 才是定位声明。
+   */
+  const m: DiscoveredModel = {
+    id: 'workbuddy-ai/deepseek-v4.1-flash', displayName: 'x', provider: 'workbuddy-ai',
+    contextTokens: 1_000_000, maxOutputTokens: 128_000, reasoning: true,
+    reasoningLevels: ['low', 'high', 'medium', 'xhigh'], image: false, free: null, rate: null, released: '', fast: false,
+  };
+  assert.equal(inferTier(m), 'T1_fast', '★ flash 就是快档，不能因为输出大就当旗舰');
+});
+
+test('★ 归一化：`.` 与 `-` 视为同一个名字（magpie 会改写）', () => {
+  /*
+   * 实测：网关暴露 `group/auto-deepseek-v4-1-flash`，而配置里是 `deepseek-v4.1-flash`。
+   * 不归一化就匹配不上成员，组会被误判成付费 —— 而用户明确说它**不限量**。
+   * 误判的代价：不限量的模型被当成烧额度的，体力活不敢用它，白耗珍贵额度。
+   */
+  const limits = parsePluginLimits(
+    pluginPayload([{ provider: 'workbuddy-ai', model: 'deepseek-v4.1-flash', free: true, rate: 0 }]),
+  );
+  /* 看一眼归一化后的键 */
+  assert.ok(limits.has('workbuddy-ai/deepseek-v4-1-flash'), '★ 键必须被归一化成连字符形式');
+
+  const merged = mergeDiscovered(
+    parseWireModels(wirePayload([{ id: 'group/auto-deepseek-v4-1-flash' }])),
+    limits,
+  );
+  assert.equal(merged[0]!.free, true, '★ 组必须认出它是免费的（用户明说这个不限量）');
 });
 
 test('★ 自动分档：会思考但输出平常 + 思考档位少 → 中档（主力分析）', () => {
@@ -232,10 +265,13 @@ test('★★ 核心：新上线的模型会被自动发现并分到档位里', (
   );
 
   assert.deepEqual(after.appeared, ['newprov/shiny-new-model'], '★ 新模型必须被识别出来');
-  assert.ok(
-    after.byTier.T3_deep.includes('newprov/shiny-new-model'),
-    '★ 新模型必须自动进入某个档位（否则永远不会被用上）',
-  );
+  /*
+   * ⚠️ 断言的是"进了某个档位"，**不是"进了 T3"** ——
+   * 分档靠启发式（名称 + 思考等级数），新模型未必是旗舰。
+   * 要求的是**别把它漏掉**，那才是"自动发现"的意义。
+   */
+  const tier = (['T1_fast', 'T2_mid', 'T3_deep'] as const).find((x) => after.byTier[x].includes('newprov/shiny-new-model'));
+  assert.ok(tier, '★ 新模型必须自动进入某个档位（否则永远不会被用上）');
 });
 
 test('★ 消失的模型会被识别（改名/下线要能告警）', () => {
