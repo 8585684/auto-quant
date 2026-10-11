@@ -30,7 +30,9 @@ import {
 /* -------------------------------------------------------------------------- */
 
 /** `/v1/models` 的响应（字段与实测一致）。 */
-function wirePayload(ids: Array<{ id: string; reasoning?: boolean; ctx?: number; out?: number }>): unknown {
+function wirePayload(
+  ids: Array<{ id: string; reasoning?: boolean; ctx?: number; out?: number; levels?: number }>,
+): unknown {
   return {
     data: ids.map((m) => ({
       id: m.id,
@@ -42,7 +44,10 @@ function wirePayload(ids: Array<{ id: string; reasoning?: boolean; ctx?: number;
       max_input_tokens: m.ctx ?? 200_000,
       max_output_tokens: m.out ?? 32_000,
       reasoning: m.reasoning ?? false,
-      supported_reasoning_levels: [{ effort: 'low' }, { effort: 'high' }],
+      /* 默认 2 档（普通思考模型）；旗舰会报 4–6 档（实测 gpt-6-astra 报 6 档）。 */
+      supported_reasoning_levels: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra']
+        .slice(0, m.levels ?? 2)
+        .map((effort) => ({ effort })),
       modalities: { input: ['text'] },
     })),
     object: 'list',
@@ -168,6 +173,39 @@ test('★ 自动分档：会思考 + 输出能力大 → 强推理档', () => {
     reasoning: true, reasoningLevels: ['low', 'high'], image: false, free: null, rate: null, released: '', fast: false,
   };
   assert.equal(inferTier(m), 'T3_deep');
+});
+
+test('★ 自动分档：会思考但输出平常 + 思考档位少 → 中档（主力分析）', () => {
+  /*
+   * 这条是**实测后补的**：第一版阈值太松，导致 72 个模型里 59 个都进了 T3，
+   * 档位失去区分度 —— 那等于没分档。
+   */
+  const m: DiscoveredModel = {
+    id: 'x/y', displayName: 'y', provider: 'x', contextTokens: 200_000, maxOutputTokens: 32_000,
+    reasoning: true, reasoningLevels: ['low', 'high'], image: false, free: null, rate: null, released: '', fast: false,
+  };
+  assert.equal(inferTier(m), 'T2_mid', '★ 不能一律塞进 T3');
+});
+
+test('★ 自动分档：思考等级丰富（≥4 档）也算旗舰信号', () => {
+  /*
+   * 实测佐证：`group/auto-gpt-6-astra` 报了 6 档，而普通思考模型只报 2–3 档。
+   * "愿意暴露更多思考级别"本身是能力强的一个可观测信号。
+   */
+  const m: DiscoveredModel = {
+    id: 'x/y', displayName: 'y', provider: 'x', contextTokens: 200_000, maxOutputTokens: 32_000,
+    reasoning: true, reasoningLevels: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'],
+    image: false, free: null, rate: null, released: '', fast: false,
+  };
+  assert.equal(inferTier(m), 'T3_deep');
+});
+
+test('★ 自动分档：不会思考 → 体力活档（不管上下文多大）', () => {
+  const m: DiscoveredModel = {
+    id: 'x/y', displayName: 'y', provider: 'x', contextTokens: 2_000_000, maxOutputTokens: 500_000,
+    reasoning: false, reasoningLevels: [], image: false, free: null, rate: null, released: '', fast: false,
+  };
+  assert.equal(inferTier(m), 'T1_fast', '★ 不会思考就是体力活，上下文大不代表聪明');
 });
 
 /* -------------------------------------------------------------------------- */

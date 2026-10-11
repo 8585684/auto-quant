@@ -240,41 +240,46 @@ export function mergeDiscovered(
  * ## 为什么用启发式而不是查表
  *
  * 用户要求"自动调研判断模型档次"。**做不到真正测量智商**（那需要跑基准测试，
- * 代价极高且会随版本漂移），所以这里用**可观测的代理指标**：
+ * 代价极高且会随版本漂移），所以这里用**可观测的代理指标**。
  *
- * | 指标 | 推断 |
- * |---|---|
- * | `reasoning: true` | 会思考 → 至少 T2 |
- * | `maxOutputTokens` 大（≥64k）| 能写长报告 → 偏 T3 |
- * | `contextTokens` 大（≥500k）| 能吞大上下文 → 偏 T2 以上 |
- * | `fast: true` 或 `rate` 很低 | 定位就是快 → T1 |
- * | `free: true` | **体力活优先**（用户明确说免费的不限量，正适合重复性工作）|
+ * ## 阈值是怎么定的（第一版太宽松，实测后收紧）
  *
- * ⚠️ **这是"初判"，不是"结论"**：真正的档位由**运行期的实测延迟与成功率**
- * 修正（见 `ModelHealthRegistry`）。启发式只负责"新模型上线时先给它一个位置"，
+ * 第一版用 `reasoning && maxOutputTokens >= 64_000` 判 T3，结果 **72 个模型里
+ * 59 个进了 T3** —— 因为现代模型的输出上限普遍很大（`group/*` 动辄 128k+），
+ * 于是"顶级推理"这个档位失去了区分度，等于没分。
+ *
+ * 收紧后的判据（每条都对应一个可观测事实）：
+ *
+ * | 条件 | 档位 | 理由 |
+ * |---|---|---|
+ * | `fast === true` | **T1** | 供应商自己标了"快"，不跟它争 |
+ * | `reasoning === false` | **T1** | 不会思考 = 体力活（打标、摘要、字段映射）|
+ * | `reasoning` 且（输出 ≥128k **或** 思考等级 ≥4 档）| **T3** | 能写长报告 / 提供了丰富的思考级别 = 旗舰 |
+ * | 其余 `reasoning` | **T2** | 会思考但输出能力一般 = 主力分析 |
+ *
+ * ⚠️ **这仍然只是"初判"**：真正的档位由运行期的**实测延迟与成功率**修正
+ *（见 `ModelHealthRegistry`）。启发式只负责"新模型上线时先给它一个合理位置"，
  * 避免"新模型没人用"或"新模型被当成顶级模型去辩论"。
  */
 export function inferTier(m: DiscoveredModel): 'T1_fast' | 'T2_mid' | 'T3_deep' {
-  /* 明确标了"快"的，直接进快档。 */
+  /* 供应商自己标了"快"—— 尊重它，不进推理档。 */
   if (m.fast) return 'T1_fast';
 
-  const bigOutput = m.maxOutputTokens >= 64_000;
-  const hugeContext = m.contextTokens >= 500_000;
-
-  /* 不会思考 + 输出能力小 → 快档（体力活）。 */
-  if (!m.reasoning && !bigOutput) return 'T1_fast';
+  /* 不会思考就是体力活。 */
+  if (!m.reasoning) return 'T1_fast';
 
   /*
-   * 会思考 + 输出能力大 → 强推理档。
+   * 旗舰判据：能写长报告（输出 ≥128k）**或**给了丰富的思考等级（≥4 档）。
    *
-   * 这条判据的依据：实测 `gpt-6-astra`（T3 首选）输出上限 128k，
-   * 而 `deepseek-v4.1-flash`（T1 最快档）在 magpie 里 max_output 是 384k
-   * —— 所以**不能只看输出上限**，必须结合 `reasoning` 与供应商定位。
+   * 实测佐证：`group/auto-gpt-6-astra` 报了 **6 档**
+   *（low/medium/high/xhigh/max/ultra），而普通思考模型只报 2–3 档 ——
+   * "愿意暴露更多思考级别"本身就是能力强的一个信号。
    */
-  if (m.reasoning && bigOutput) return 'T3_deep';
+  const bigOutput = m.maxOutputTokens >= 128_000;
+  const richLevels = m.reasoningLevels.length >= 4;
+  if (bigOutput || richLevels) return 'T3_deep';
 
-  /* 其余归中档。 */
-  return hugeContext ? 'T2_mid' : 'T2_mid';
+  return 'T2_mid';
 }
 
 /** 发现结果 + 分档，供 `modelCatalog` 动态构建候选链。 */
