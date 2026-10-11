@@ -1269,6 +1269,24 @@ export type ServerEvent = Replayable<
       level: 'info' | 'warn' | 'error';
       message: string;
       at: string;
+      /**
+       * **哪个智能体做的这一步**（`ai_team` 模式才有）。
+       *
+       * 用户 2026-10-12 要求团队看板「直观显示**有哪些智能体，都是什么分工，都在做什么**」。
+       * 没有这个字段，界面上只有一串按时间排的日志 —— 看不出"谁在干活"。
+       *
+       * `null`/缺省 = 这一步不属于某个角色（普通/智能托管模式的步骤，或调度层）。
+       */
+      role?: string | null;
+      /**
+       * **处于哪个阶段**（团队模式的编排阶段）。
+       *
+       * `dispatch`（派发）· `analysis`（并行分析）· `debate`（对抗辩论）·
+       * `verdict`（裁决）· `execute`（执行）
+       *
+       * 界面靠它把步骤**分组**显示，而不是一条流水账。
+       */
+      phase?: string | null;
     }
   | { type: 'decision'; traderId: number; record: DecisionRecord }
   | { type: 'positions'; traderId: number; positions: PositionView[] }

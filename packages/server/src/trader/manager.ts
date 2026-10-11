@@ -835,6 +835,37 @@ export class TraderManager {
        */
       onStep: ({ role, phase, note }) => {
         runtimeLogs.write(traderId, 'info', 'team', `[${phase}] ${role}：${note}`);
+        /*
+         * ⚠️ **同时推给前端事件流**（2026-10-12）。
+         *
+         * 用户要求团队看板「直观显示**有哪些智能体，都是什么分工，都在做什么**」。
+         * 只写 `runtime_logs` 的话，界面得靠轮询日志才能看到 —— 而团队的每一步
+         * 是**实时**发生的（分析师并行、辩论、裁决），轮询既慢又拿不到"正在进行中"。
+         *
+         * 带 `role` 与 `phase` 推 `cycle_step`，界面就能**按角色分组、按阶段排序**
+         * 显示成"团队正在开会"的形态，而不是一串时间戳日志。
+         *
+         * `cycleNumber` 用当前轮次（`autoTrader` 那边也会推它自己的步骤，
+         * 两者用同一个 `traderId` + `cycleNumber` 就自然归到同一轮）。
+         */
+        eventBus.publish({
+          type: 'cycle_step',
+          traderId,
+          /*
+           * 轮次取自数据库的 `last_cycle_number` **+1** —— 团队会议发生在
+           * 决策循环的第 7 步，那时 `last_cycle_number` 还是**上一轮**的值，
+           * 所以 +1 就是"正在跑的这一轮"。
+           *
+           * 用数据库而不是内存计数：**跨重启一致**（部署重启后轮次不会错位），
+           * 而且与 `autoTrader` 那边推的 `cycleNumber` 同源，能自然归到同一轮。
+           */
+          cycleNumber: (traders.get(traderId)?.lastCycleNumber ?? 0) + 1,
+          level: 'info',
+          message: note,
+          at: new Date().toISOString(),
+          role,
+          phase,
+        });
       },
     });
 

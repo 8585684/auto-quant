@@ -549,6 +549,9 @@ export const useEvents = create<EventState>((set, get) => ({
               at: event.at,
               level: event.level,
               message: event.message,
+              /* 团队模式会带角色与阶段；其他模式是 `undefined`（界面据此判断）。 */
+              ...(event.role !== undefined ? { role: event.role } : {}),
+              ...(event.phase !== undefined ? { phase: event.phase } : {}),
             }].slice(-MAX_CYCLE_STEPS);
           }
           break;

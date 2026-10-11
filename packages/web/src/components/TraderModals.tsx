@@ -412,6 +412,7 @@ export function NewTraderModal({
               第二种**必须来自接口**而不是内置静态列表：聚合网关的内置列表是空的，
               照静态列表做出来的下拉在那些厂商上会一个模型都不显示。
             */}
+            {mode !== 'ai_team' && (
             <Field label="模型厂商">
               <Select
                 value={providerId}
@@ -430,7 +431,26 @@ export function NewTraderModal({
                 ))}
               </Select>
             </Field>
+            )}
 
+            {/*
+              ⚠️ **团队模式不显示模型选择**（用户 2026-10-12 明确要求）。
+
+              用户原话：
+              > 「团队多智能体模式，在创建/修改的时候就**不应该采用 AI 模型列表里面的**，
+              >  而是**直接采用系统的 magpie**，（系统 AI 列表里面添加的那些
+              >  **不应该给这个模式使用**），因为这个模式很多东西会和其他的冲突」
+
+              理由（实测确认过）：团队模式的模型出口来自**独立的 magpie 网关配置**
+              （见 `teamGateway.ts`），而「AI 模型」列表是给普通机器人用的。
+              两者共用会造成"改一条记录去调 A 机器人，连带改掉所有团队机器人" ——
+              用户实测发现了这个现象。
+
+              所以这里**不渲染**选择器，而不是渲染了再禁用 ——
+              禁用会让用户以为"这里有个选项只是现在不能改"，
+              而真相是**这个字段与团队模式无关**。
+            */}
+            {mode !== 'ai_team' && (
             <Field
               label="模型"
               hint={
@@ -497,6 +517,7 @@ export function NewTraderModal({
                 </p>
               )}
             </Field>
+            )}
           </div>
 
           {/*
@@ -568,6 +589,22 @@ export function NewTraderModal({
               </label>
             </div>
           </Field>
+
+          {/*
+            团队模式的说明 —— 告诉用户"模型从哪来"。
+            用户 2026-10-12 要求团队模式"直接采用系统的 magpie"，
+            所以这里要说清它**不**用上面那个列表。
+          */}
+          {mode === 'ai_team' && (
+            <div className="rounded-md border border-line bg-surface-2 px-3 py-2 text-base text-ink-soft">
+              <span className="font-medium">模型由系统 magpie 网关统一调度</span>
+              <span className="block text-xs text-ink-faint">
+                团队模式不使用「AI 模型」列表里的任何记录 —— 它的模型出口是独立的 magpie 网关
+                （在服务器 <code>​.env</code> 里配置，或自动从 magpie 发现）。
+                每个智能体按工作内容分到不同档位的模型，某个模型额度用尽会自动向下平替。
+              </span>
+            </div>
+          )}
 
           <Field
             label="策略"

@@ -141,6 +141,7 @@ import {
 import { exchangeErrorLabel, type DecisionRecord, type Decision, type ExecutionLogEntry } from '@aq/shared';
 import { api, type MarketSymbol } from '../lib/api';
 import { useLiveCycle, useEvents, type LiveCycle } from '../lib/store';
+import { TeamRoster } from './TeamRoster';
 import { usePolled } from '../lib/hooks';
 import { Badge, Empty, Panel, Spinner3, cn } from './ui';
 import { ActionBadge, STATUS_LABELS, actionLabel, isOpenAction } from './DecisionAudit';
@@ -524,11 +525,22 @@ export function DecisionFeed({
   running,
   actions,
   nextCycleAt = null,
+  mode = 'strategy',
 }: {
   traderId: number;
   running?: boolean;
   actions?: ReactNode;
   nextCycleAt?: number | null;
+  /**
+   * 机器人模式 —— **决定实时区显示什么**（用户 2026-10-12 要求三种模式看板分开）。
+   *
+   * · `ai_team` —— 显示**团队编制表**（谁在做什么、什么分工、并行还是串行）
+   * · 其他 —— 显示原来的线性步骤列表
+   *
+   * ⚠️ 默认值是 `'strategy'`，所以**既有调用点（另两种模式）行为完全不变** ——
+   * 不传 `mode` 就与改动前逐字节一致。
+   */
+  mode?: 'strategy' | 'ai_managed' | 'ai_team';
 }) {
   const live = useEvents((s) => s.byTrader[traderId]?.decisions);
   const liveCycle = useLiveCycle(traderId);
@@ -896,7 +908,27 @@ export function DecisionFeed({
             放在下面等于要操作者先划过一整盒已经结束的决策才看见"它在动"。
             它不受分页影响：它不属于任何一页，只是钉在这个列表的顶部。
           */}
-          {showLive && liveCycle && <LiveCycleBlock key={liveCycle.cycleNumber} live={liveCycle} />}
+          {showLive && liveCycle && mode === 'ai_team' && (
+            /*
+             * **团队模式：显示编制表，而不是线性步骤列表。**
+             *
+             * 用户原话：「团队模式下，决策看板应该很大区别于前两种了，
+             * 看板应该直观显示**有哪些智能体，都是什么分工，都在做什么**」。
+             *
+             * 为什么不能沿用 `LiveCycleBlock`：它是**按时间**排的一串步骤，
+             * 而团队是**并行**的 —— 按时间排会让 4 个分析师的步骤互相交错，
+             * 看不出"谁在干什么"。编制表按**角色**归并，才是团队的样子。
+             */
+            <TeamRoster
+              key={`team-${liveCycle.cycleNumber}`}
+              steps={liveCycle.steps}
+              cycleNumber={liveCycle.cycleNumber}
+              startedAt={liveCycle.startedAt}
+            />
+          )}
+          {showLive && liveCycle && mode !== 'ai_team' && (
+            <LiveCycleBlock key={liveCycle.cycleNumber} live={liveCycle} />
+          )}
 
           {runs.map((run) => (
             <div key={run.record.id}>

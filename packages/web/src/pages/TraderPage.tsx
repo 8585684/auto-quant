@@ -1262,6 +1262,14 @@ export function TraderPage() {
           <DecisionFeed
             traderId={traderId}
             running={running}
+            /*
+             * ⚠️ **把模式传下去** —— 团队模式的看板与另两种根本不同
+             *（用户 2026-10-12 要求"3 种模式进去以后看板 UI 显示内容也应该是要分开的"）。
+             *
+             * 默认值是 `'strategy'`，所以这里即使不传也不改变既有行为；
+             * 传下去是为了让团队模式显示**编制表**而不是线性步骤列表。
+             */
+            mode={trader?.mode ?? 'strategy'}
             /* 下一轮决策的预定时刻 —— 由服务端给出，界面只显示倒计时（见 CycleCountdown）。 */
             nextCycleAt={trader?.nextCycleAt ?? null}
             actions={
