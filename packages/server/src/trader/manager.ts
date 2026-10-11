@@ -20,7 +20,7 @@ import { AgentRuntime } from './agent/runtime.js';
 import { AutoTrader, type DecisionModel } from './autoTrader.js';
 import { ModelRouter } from '../llm/modelRouter.js';
 import { createMagpieCallFactory, looksLikeMagpieGateway } from './magpieGateway.js';
-import { createRoutedDecisionModel, tierForRole } from './routedModel.js';
+import { createRoutedDecisionModel, createTeamDecisionModel, tierForRole } from './routedModel.js';
 
 const log = createLogger('manager');
 
@@ -698,17 +698,26 @@ export class TraderManager {
     });
 
     /*
-     * 用哪个角色/档位调用，由 `autoTrader` 在**每一轮**告诉模型（它会传不同的
-     * system prompt）。第一版先固定为"调度官"档 —— 也就是团队模式的默认档，
-     * 真正的按角色分派留给 S3（`agent/team.ts`）接入。
+     * ⚠️ **这里返回的是「跑整个交易台」的模型，不是单角色路由**（S3 完成接线）。
      *
-     * ⚠️ 这不是"忘了做"，而是**先把出口打通、再按角色细分**：
-     * 一次只改一层，出问题时能立刻定位是哪一层。
+     * 为什么这个区别重要：`autoTrader` 只会 `complete(system, user)` 一次，
+     * 而团队模式需要**一次调用背后跑完 7 个角色**（4 分析师并行 → 辩论 → 裁决）。
+     * 所以编排必须**封装在模型层内部**，交易循环那边看到的仍然是
+     * "一个模型给了一段 `<decision>` 文本"。
+     *
+     * 这也是"不碰交易循环"的具体形态 —— 见 `routedModel.ts` 的文件头说明。
      */
-    return createRoutedDecisionModel({
+    return createTeamDecisionModel({
       router,
-      request: { role: 'supervisor', tier: tierForRole('supervisor') },
       baseMaxTokens: Math.max(row.max_tokens, MIN_MAX_TOKENS_FOR_REASONING),
+      /*
+       * 每一步都写进本机器人的日志 —— 用户反复要求"看得见系统在做什么"。
+       * 多智能体模式下这一步尤其关键：否则界面上只是一轮很慢的决策，
+       * 看不出"它在开会"。
+       */
+      onStep: ({ role, phase, note }) => {
+        runtimeLogs.write(traderId, 'info', 'team', `[${phase}] ${role}：${note}`);
+      },
     });
   }
 

@@ -1,5 +1,5 @@
 /**
- * **决策模型路由器** —— 把 `ModelRouter` 适配成 `DecisionModel`。
+ * **决策模型路由器** —— 把 `ModelRouter` 适配成 `DecisionModel`，并承载交易台编排。
  *
  * ## 它在架构里的位置
  *
@@ -7,31 +7,31 @@
  *   autoTrader.runCycleBody 第 7 步
  *         ↓  this.deps.model.complete(system, user)
  *   【本文件】DecisionModel 适配层
- *         ↓  按角色/档位选模型 → 失败自动降级
+ *         ├─ 单模型路径：按档位选模型 → 失败自动降级
+ *         └─ 团队路径：跑整个交易台 → 翻成 <decision> 格式
  *   ModelRouter → magpie 网关
  * ```
  *
- * ## 为什么需要它（而不是直接在 manager 里写）
+ * ## 为什么团队编排放在这里，而不是改 `autoTrader`
  *
- * 考古报告认定的**模型侧唯一接缝**是 `DecisionModel`（`autoTrader.ts:381-434`），
- * 而适配层原来只有一句 `client.complete(...)` —— 单一模型、单一客户端
- *（考古报告 H2：「单模型单客户端，`reasoningEffort` 硬编码」）。
+ * `autoTrader` 是**最安全攸关**的文件（10201 行）。考古报告认定的模型侧唯一接缝
+ * 就是 `DecisionModel`（`autoTrader.ts:381-434`）—— 它只要求"给我一段文本"。
  *
- * 把多模型逻辑放在**这里**而不是 `autoTrader` 里，是因为：
- *
- *   · `autoTrader` 是**最安全攸关**的文件（10201 行），改动越少越好；
- *   · 团队模式与智能托管**必须互不干扰**（用户硬约束）——
- *     用一层适配器切换，比在交易循环里加 `if (mode === 'ai_team')` 干净得多。
+ * 所以团队模式的全部复杂度（并行分析、辩论、裁决、格式翻译）**都关在这一层**：
+ * `autoTrader` 完全不知道它在跟一个团队说话，它只是收到一段
+ * `<decision>[...]</decision>`。**这就是"不碰交易循环"的具体形态。**
  *
  * ## 与 `ai_managed` 的关系：**零影响**
  *
- * 这个适配器**只在 `ai_team` 模式下构造**。智能托管仍然用原来那个
- * 单客户端的适配器 —— 一行都不用改。
+ * 单模型路径（`createRoutedDecisionModel`）与团队路径（`createTeamDecisionModel`）
+ * 是两个独立构造函数。智能托管用原来那个单客户端的适配器，一行都不用改。
  */
 
 import type { DecisionModel } from './autoTrader.js';
 import type { ModelTier } from '../llm/modelCatalog.js';
 import { ModelRouter, type CallModel } from '../llm/modelRouter.js';
+import { runTradingDesk, type AskRole, type DeskRoleOutput } from './agent/tradingDesk.js';
+import { renderDeskOutcome } from './agent/deskOutput.js';
 
 /** 一次「向模型提问」要用的档位与角色。 */
 export interface RoleRequest {
@@ -164,3 +164,101 @@ export function createRoutedDecisionModel(options: {
  * **路由器不关心模型怎么调**，它只关心"选谁、失败了怎么办"。
  */
 export type ModelCallFactory = (modelId: string) => CallModel;
+
+/* -------------------------------------------------------------------------- */
+/*  团队模式：跑整个交易台，返回 <decision> 文本                                 */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * 造一个**跑交易台**的 `DecisionModel`。
+ *
+ * ## 它是怎么把"多角色协作"藏在一层适配器后面的
+ *
+ * `autoTrader` 调 `complete(system, user)` 时，这里：
+ *
+ *   1. 把 `system` + `user`（交易循环给的完整材料）当作**交易台的市场与持仓材料**；
+ *   2. 跑 `runTradingDesk()` —— 4 分析师并行 → 多空辩论 → 裁决；
+ *   3. 用 `renderDeskOutcome()` 把裁决翻成 `<decision>[...]</decision>` 返回。
+ *
+ * 交易循环那边看到的就是"模型给了个决策数组"，**它不知道背后有 7 个角色**。
+ *
+ * ## 两个必须守住的边界
+ *
+ * · **`system` 提示词被保留**：它是交易循环的规则说明（输出格式、纪律）。
+ *   交易台的角色提示词是**叠加**在它之上的，不是替换 —— 否则团队会不知道
+ *   要输出 `<decision>` 格式，而那是**唯一**能让它的结论生效的形式。
+ *
+ * · **失败不抛出，而是返回空决策块**：一次团队会议失败（某个模型额度尽、
+ *   网关抖动）不该让整轮决策抛错。`renderDeskOutcome` 已经把"为什么没结论"
+ *   写进 `<team>` 块了 —— **返回"不行动 + 说清原因"比抛错更有用**：
+ *   前者操作员看得懂，后者只会在日志里留一条栈。
+ */
+export function createTeamDecisionModel(options: {
+  router: ModelRouter;
+  /** 交易循环给的系统提示词（含输出格式要求）。团队角色提示词会叠加在它之上。 */
+  /** 每一步的回调（可观测性：让界面看得见团队在做什么）。 */
+  onStep?: (step: { role: string; phase: string; note: string }) => void;
+  /** 单次响应的输出预算。 */
+  baseMaxTokens: number;
+  /** 覆盖默认上限（测试用）。 */
+  limits?: { maxCalls: number; maxDebateRounds: number };
+}): DecisionModel {
+  const { router, onStep, baseMaxTokens, limits } = options;
+
+  /** 把一个角色的问题交给路由器。 */
+  const ask: AskRole = async ({ role, tier, context, task }): Promise<DeskRoleOutput> => {
+    const started = Date.now();
+    try {
+      const result = await router.callByTier(
+        tier,
+        [
+          { role: 'system', content: `你是交易台的「${role}」。${task}` },
+          { role: 'user', content: context },
+        ],
+        { baseMaxTokens },
+      );
+      return {
+        role,
+        modelId: result.modelId,
+        data: null,
+        raw: result.text,
+        latencyMs: Date.now() - started,
+        ok: true,
+      };
+    } catch (error) {
+      return {
+        role,
+        modelId: '（未调用成功）',
+        data: null,
+        raw: '',
+        latencyMs: Date.now() - started,
+        ok: false,
+        error: (error as Error).message,
+      };
+    }
+  };
+
+  return {
+    complete: async (systemPrompt, userPrompt) => {
+      const started = Date.now();
+      /*
+       * 交易循环给的 `systemPrompt`（规则与输出格式）**并入市场材料** ——
+       * 见上面第二段边界说明：不能丢掉它，否则团队不知道要输出什么格式。
+       */
+      const outcome = await runTradingDesk({
+        ask,
+        marketContext: systemPrompt,
+        newsContext: userPrompt,
+        positionContext: '',
+        ...(onStep ? { onStep } : {}),
+        ...(limits ? { limits } : {}),
+      });
+
+      return {
+        text: renderDeskOutcome(outcome),
+        latencyMs: Date.now() - started,
+        usage: { promptTokens: null, completionTokens: null },
+      };
+    },
+  };
+}
