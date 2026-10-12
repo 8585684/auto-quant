@@ -33,7 +33,7 @@
 import { Suspense, lazy, useEffect, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { Bot, CircleAlert, RefreshCw } from 'lucide-react';
-import type { EquitySnapshot, TraderStatus } from '@aq/shared';
+import type { EquitySnapshot, TraderMode, TraderStatus } from '@aq/shared';
 import { api, type TraderRow } from '../lib/api';
 import { useApp, useEvents } from '../lib/store';
 import { useSummaries } from '../lib/summaries';
@@ -440,6 +440,34 @@ export function OverviewPage() {
       </header>
 
       <PageShell aside={rail}>
+        {/*
+          **运行模式分布**（用户 2026-10-12 要求三种模式在 UI 上分开）。
+
+          用户的原话：
+          > 「既然现在有 3 种模式了（普通、智能、团队），那么 **UI 上面也要加上相应得显示**，
+          >  并且 3 种模式进去以后看板 UI 显示内容什么的**也应该是要分开的**」
+
+          ## 为什么总览页需要这一块
+
+          总览页此前把所有机器人**混在一起**统计（"共 N 个机器人"）——
+          而三种模式的运行方式、成本、风险完全不同：
+
+          | 模式 | 谁在决策 | 一轮要多久 |
+          |---|---|---|
+          | 普通 | 固定策略，**不用 AI** | 秒级 |
+          | 智能托管 | **一个**模型 | 1–10 分钟 |
+          | AI 团队 | **一队**模型（开会） | 数分钟 |
+
+          混在一起时，"有 3 个在跑"看不出**有多少个在烧模型额度**。
+
+          ## 为什么不做成"分模式各显示一套指标"
+
+          那会让总览页在只有一种模式时**显得残缺**（大块空白区域），
+          而用户要的是**增量**：现有模式的表现**一点都不能变**。
+          所以这里只是**加一块**分布视图，不动任何既有指标。
+        */}
+        <ModeBreakdown traders={traders} onOpen={(id) => navigate(`/traders/${id}`)} />
+
         {/* ---------------------------------------------------------------- */}
         {/*  1. 资金曲线 —— 有形状才展开成图表（§4）                          */}
         {/* ---------------------------------------------------------------- */}
@@ -651,5 +679,92 @@ export function OverviewPage() {
         }}
       />
     </div>
+  );
+}
+
+
+/**
+ * **运行模式分布** —— 三种模式在总览页分开显示（用户 2026-10-12 要求）。
+ *
+ * ## 为什么需要它
+ *
+ * 总览页此前把所有机器人**混在一起**统计（"共 N 个机器人"）——
+ * 而三种模式的运行方式与成本完全不同：
+ *
+ * | 模式 | 谁在决策 | 一轮要多久 |
+ * |---|---|---|
+ * | 普通 | 固定策略，**不用 AI** | 秒级 |
+ * | 智能托管 | **一个**模型 | 1–10 分钟 |
+ * | AI 团队 | **一队**模型（开会） | 数分钟 |
+ *
+ * 混在一起时，"有 3 个在跑"看不出**有多少个在烧模型额度**。
+ *
+ * ## 为什么三种模式【都列】，即使数量为 0
+ *
+ * 只列有机器人的模式，会让"这个系统支持三种模式"这件事**看不出来** ——
+ * 而用户的原话正是「**UI 上面也要加上相应得显示**」。
+ * 数量为 0 时显示成灰的，而不是隐藏。
+ *
+ * ## 为什么不做成"分模式各一套指标"
+ *
+ * 那会让总览页在只有一种模式时**显得残缺**（大块空白），
+ * 而用户要的是**增量**：现有模式的表现**一点都不能变**。
+ * 所以这里只**加一块**分布视图，不动任何既有指标。
+ */
+function ModeBreakdown({
+  traders,
+  onOpen,
+}: {
+  traders: TraderRow[];
+  onOpen: (id: number) => void;
+}): React.ReactElement {
+  const groups: Array<{ mode: TraderMode; label: string; hint: string }> = [
+    { mode: 'strategy', label: '普通', hint: '固定策略，不用 AI' },
+    { mode: 'ai_managed', label: '智能托管', hint: '一个模型决策' },
+    { mode: 'ai_team', label: 'AI 团队', hint: '一队模型开会' },
+  ];
+
+  return (
+    <section aria-labelledby="overview-modes">
+      <SectionLabel title="运行模式" />
+      <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+        {groups.map((g) => {
+          const mine = traders.filter((t) => t.mode === g.mode);
+          const running = mine.filter((t) => t.status === 'running');
+          return (
+            <Panel key={g.mode} className="p-3">
+              <div className="flex items-baseline gap-2">
+                <span className="text-base font-medium text-ink-hi">{g.label}</span>
+                <span className="num text-sm text-ink-soft">{mine.length}</span>
+                {running.length > 0 && <span className="text-xs text-ok">运行中 {running.length}</span>}
+              </div>
+              <p className="mt-0.5 text-xs text-ink-faint">{g.hint}</p>
+              {mine.length === 0 ? (
+                <p className="mt-1.5 text-xs text-ink-faint">（暂无）</p>
+              ) : (
+                <ul className="mt-1.5 space-y-0.5">
+                  {mine.map((t) => (
+                    <li key={t.id}>
+                      <button
+                        type="button"
+                        onClick={() => onOpen(t.id)}
+                        className="flex w-full items-center gap-1.5 text-left text-xs hover:text-ink-hi"
+                      >
+                        <span
+                          className={`h-1.5 w-1.5 shrink-0 rounded-full ${
+                            t.status === 'running' ? 'bg-ok' : 'bg-ink-faint/50'
+                          }`}
+                        />
+                        <span className="min-w-0 flex-1 truncate text-ink-lo">{t.name}</span>
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </Panel>
+          );
+        })}
+      </div>
+    </section>
   );
 }
