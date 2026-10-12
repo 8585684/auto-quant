@@ -2925,19 +2925,56 @@ function renderUserPrompt(
          *（`minNotionalOf(symbol)`），**不是一个固定数**。写死 20 等于
          * **假设所有标的的交易所下限都是 20**，而实际常见的下限是 5 USDT。
          *
-         * ## 修法
+         * ## 修法（⚠️ 我第一版又改错了，这是第二版）
          *
-         * 取**本轮候选里最大的交易所下限**（保守：用最大的那个算出的上限最小，
-         * 于是不会把"其实做不了"的标的算成能做）。
+         * ### 第一版（错）：取候选里【最大】的交易所下限
+         *
+         * 我当时的理由是"保守：用最大的算出上限最小，不会把做不了的算成能做"。
+         * **但那个理由站不住** —— 实测现场（`#2445`）模型是这样反应的：
+         * ```
+         *   止损上限 = 0.4150 ÷ (名义 50 × 1.5) = 0.55%
+         *   等一下…上面写的是"名义 50"，但实际约束是"单笔最小名义 12 USDT"，
+         *   而 BTC/ETH 交易所最小名义 50、其他标的 5。
+         * ```
+         * 它**看穿了这个口径不一致**，然后自己重新算 —— 而
+         * **0.55% 比原来硬编码 20 得到的 1.38% 还小**（更糟）。
+         *
+         * **根本问题**：模型是在候选里**挑一个**标的，不是只能做 BTC。
+         * 用最大值等于**假设它只能做 BTC/ETH**（下限 50），
+         * 而它本可以做山寨币（下限 5）。
+         *
+         * ### 第二版（本版）：取【最小的有效名义额】
+         *
+         * 这一段要回答的问题是"**有没有任何标的可做**" ——
+         * 所以应当用**最宽松**的那条边界：
+         * ```
+         *   有效名义 = max(minPositionSize, exchangeMin(symbol))
+         *   取所有候选里【最小】的那个 → 得到最大的止损上限
+         * ```
+         * 若连最宽松的都做不了，那才是**真的没得做**。
+         *
+         * ⚠️ **同时把"主流币更严"写出来** —— 否则模型可能以为
+         * "所有标的都能到这个上限"，而 BTC/ETH 的实际上限更低。
          * 拿不到交易所下限时**退回配置值**（而不是编一个数）。
          */
-        const exchangeMins = ctx.minNotionalOf === undefined
-          ? []
-          : ctx.candidates
-            .map((c) => ctx.minNotionalOf!(c.symbol))
-            .filter((n) => Number.isFinite(n) && n > 0);
-        const exchangeMin = exchangeMins.length > 0 ? Math.max(...exchangeMins) : 0;
-        const notional = Math.max(ctx.config.riskControl.minPositionSize, exchangeMin);
+        const effNotionals = ctx.minNotionalOf === undefined
+          ? [ctx.config.riskControl.minPositionSize]
+          : ctx.candidates.map((c) => {
+            const ex = ctx.minNotionalOf!(c.symbol);
+            return Math.max(
+              ctx.config.riskControl.minPositionSize,
+              Number.isFinite(ex) && ex > 0 ? ex : 0,
+            );
+          });
+        /*
+         * 取最小值 = **最宽松**的那条边界（回答"有没有任何标的可做"）。
+         * 若数组为空（没有候选）则退回配置值 —— 不能编数。
+         */
+        const notional = effNotionals.length > 0
+          ? Math.min(...effNotionals)
+          : ctx.config.riskControl.minPositionSize;
+        /* 最大的有效名义（通常来自 BTC/ETH）—— 用来提示"主流币更严"。 */
+        const strictestNotional = effNotionals.length > 0 ? Math.max(...effNotionals) : notional;
         if (!Number.isFinite(equity) || equity <= 0 || atrPcts.length < 5) return [];
         const riskBudget = (equity * riskPerTradePercent) / 100;
         const stopCapPercent = (riskBudget / (notional * stopToRiskMultiple)) * 100;
@@ -2962,6 +2999,26 @@ function renderUserPrompt(
           `- 止损上限 = ${riskBudget.toFixed(4)} ÷ (名义 ${notional} × ${stopToRiskMultiple}) = **${stopCapPercent.toFixed(2)}%**`,
           `- 而你的止损下限是 ${atrToStopMultiple} × ATR14 → **可做标的的 15m ATR 必须 ≤ ${atrCapPercent.toFixed(2)}%**`,
           `- 本轮 ${atrPcts.length} 个候选里，ATR 在这个上限以内的有 **${within} 个**。`,
+          /*
+           * ⚠️ **必须说清"这个上限对应哪个名义额"**（2026-10-12 实测踩到）。
+           *
+           * 上面那个 `notional` 是**候选里最小的有效名义额**（最宽松的边界，
+           * 用来回答"**有没有任何标的可做**"）。
+           *
+           * 而**交易所对主流币的下限更高**（实测 BTC/ETH 是 50，山寨币是 5）——
+           * 若不写这一句，模型会以为"所有标的都能到这个上限"，
+           * 而 BTC/ETH 的**实际上限要低得多**。
+           *
+           * 实测现场（`#2445`）模型确实自己发现了这个不一致并重新算了一遍 ——
+           * 那次它算对了，但**它不该需要自己去发现**：
+           * 口径不一致本身就会消耗它的注意力，而且换一个模型可能就算错了。
+           */
+          ...(strictestNotional > notional
+            ? [`- ⚠️ **注意**：这个上限对应的是**最宽松**的标的（名义 ${notional}）。` +
+               `主流币（BTC/ETH）的交易所下限更高（名义 ${strictestNotional}），` +
+               `**它们的止损上限只有 ${((riskBudget / (strictestNotional * stopToRiskMultiple)) * 100).toFixed(2)}%** —— ` +
+               `所以"能做"的标的里，主流币往往是最先被排除的那一批。`]
+            : []),
           '⚠️ **这只是一条门槛**（波动率能否塞进你的止损带），' +
             '**方向一致性、磁吸位缓冲、盈亏比、独立证据数量这些都没有算在内** —— ' +
             '所以这 N 个**不等于**"N 个合格机会"，别把它当成"还有得做"的证据。',
