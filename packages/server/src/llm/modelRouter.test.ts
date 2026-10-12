@@ -635,3 +635,40 @@ test('★★★ 一家供应商额度耗尽 → 熔断它的【全部】模型�
   /* 别家不受影响 —— 否则一次额度耗尽会把整个路由掐死。 */
   assert.equal(registry.isAvailable('other-ai/d'), true, '★ 别家供应商不该被牵连');
 });
+test('★★★ 供应商熔断的冷却必须【长于一轮】——否则每轮都重撞同一家死掉的供应商', () => {
+  /*
+   * ## 实测（2026-10-12）
+   *
+   * 复验日志：
+   * ```
+   *   第 1 轮：technical / sentiment / newscaster 失败（workbuddy-ai/deepseek-v4.1-flash-sg）
+   *   第 2 轮：technical / sentiment / newscaster 失败（workbuddy-ai/primary-model）
+   *   第 3 轮：全部成功 ✅
+   * ```
+   *
+   * **为什么熔断没拦住第 2 轮**：模型级冷却是 **5 分钟**，
+   * 而团队模式**一轮要 7 分钟** —— 冷却**在下一轮开始之前就到期了**。
+   *
+   * 代价：每轮浪费 4 次调用 + 整轮决策失败。
+   *
+   * 判据：**额度耗尽不是抖动** —— 5 分钟不会让账上多出钱。
+   */
+  let t = 1_000_000;
+  const registry = new ModelHealthRegistry(2, 5 * 60_000, () => t);
+  const ladder = ['dead-ai/a', 'dead-ai/b', 'dead-ai/c'];
+
+  registry.recordProviderFailure('dead-ai/a', 'Credits exhausted', ladder);
+  assert.equal(registry.isAvailable('dead-ai/b'), false, '熔断立即生效');
+
+  /* 一轮团队决策要 7 分钟 —— 7 分钟后**仍然必须**是冷却状态。 */
+  t += 7 * 60_000;
+  assert.equal(
+    registry.isAvailable('dead-ai/b'),
+    false,
+    '★ 7 分钟后（一轮的长度）仍应处于熔断 —— 否则每轮都会重撞',
+  );
+
+  /* 但也**不能永久**熔断：30 分钟之后应当恢复试探。 */
+  t += 30 * 60_000;
+  assert.equal(registry.isAvailable('dead-ai/b'), true, '冷却终究会到期（不该永久踢出）');
+});

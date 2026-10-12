@@ -243,10 +243,24 @@ export class ModelHealthRegistry {
     private readonly failureThreshold = 2,
     /** 冷却时长（毫秒）。默认 5 分钟。 */
     private readonly cooldownMs = 5 * 60_000,
+    /**
+     * **供应商级熔断的冷却时长**（毫秒）。默认 30 分钟。
+     *
+     * ⚠️ 必须比 `cooldownMs`（5 分钟）长得多 —— 实测（2026-10-12）：
+     * 团队模式一轮要 **7 分钟**，5 分钟的冷却**在下一轮开始前就到期了**，
+     * 于是每轮都重新撞同一家已死的供应商（每轮浪费 4 次调用 + 整轮失败）。
+     *
+     * 判据：**额度耗尽不是抖动** —— 5 分钟不会让账上多出钱。
+     */
     /** 注入时钟，便于测试。 */
     private readonly now: () => number = Date.now,
+    /*
+     * ⚠️ `providerCooldownMs` 排在**最后** —— 不能插在 `now` 之前：
+     * 现有测试用 `new ModelHealthRegistry(2, 60_000, () => now)` 三参数调用，
+     * 插在中间会让那个 `() => now` 落到这个 number 参数上（实测编译报错）。
+     */
+    private readonly providerCooldownMs = 30 * 60_000,
   ) {}
-
   /** 记一次成功。 */
   recordSuccess(modelId: string): void {
     const e = this.entry(modelId);
@@ -343,7 +357,19 @@ export class ModelHealthRegistry {
        * 因为这是"账上没钱了"，不是"这个模型抖动了一下"。
        */
       e.consecutiveFailures = Math.max(e.consecutiveFailures, this.failureThreshold);
-      e.cooldownUntil = this.now() + this.cooldownMs;
+      /*
+       * ⚠️ **用更长的冷却**（`providerCooldownMs`，默认 30 分钟）——
+       * 实测（2026-10-12）：团队模式一轮要 **7 分钟**，而模型级冷却是
+       * **5 分钟** → **冷却在下一轮开始之前就到期了**。
+       *
+       * 后果：每一轮都重新撞同一家已死的供应商，日志里看到的是
+       * "第 1 轮失败 → 第 2 轮失败 → 第 3 轮才成功" ——
+       * 而那两轮的代价是 **8 次模型调用 + 两轮决策失败**。
+       *
+       * 判据：**额度耗尽不是抖动** —— 5 分钟不会让一家供应商的账上多出钱。
+       * 所以这条路径用独立的、长得多的冷却时间。
+       */
+      e.cooldownUntil = this.now() + this.providerCooldownMs;
       e.lastFailure = reason;
       affected += 1;
     }
