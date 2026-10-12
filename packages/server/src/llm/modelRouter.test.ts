@@ -11,9 +11,9 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { MODEL_PROFILES, ladderForTier, profileOf } from './modelCatalog.js';
+import { MODEL_PROFILES, ladderForTier, profileOf, type ModelProfile } from './modelCatalog.js';
 import { ModelHealthRegistry, classifyFailure, pickAvailable } from './modelHealth.js';
-import { ModelRouter, budgetFor, type CallModel } from './modelRouter.js';
+import { ModelRouter, budgetFor, retryBudgetFor, type CallModel } from './modelRouter.js';
 
 /* -------------------------------------------------------------------------- */
 /*  模型档案                                                                   */
@@ -504,4 +504,95 @@ test('★ 已有的额度判据没被破坏（回归）', () => {
   for (const msg of ['insufficient balance', 'quota exceeded', '额度已尽', 'endpoint is unavailable']) {
     assert.equal(classifyFailure({ status: 429, message: msg }).shouldFallback, true, `「${msg}」应当触发降级`);
   }
+});
+/* -------------------------------------------------------------------------- */
+/*  空内容重试的预算（实测：翻倍被 budgetFor 吃掉，成了空转）                     */
+/* -------------------------------------------------------------------------- */
+
+test('★★★ 重试的预算不得低于首次（实测真缺陷：思维链模型首次 16384、重试 8192）', () => {
+  /*
+   * ## 实测缺陷（2026-10-12）
+   *
+   * `budgetFor` 第一行是 `if (profile?.reasoning !== true) return baseMaxTokens;`
+   * —— 对首次调用正确，但让"空内容重试"**空转**：
+   *
+   *   ① 模型（实测 `stepfun/step-5-preview`，网关报 `reasoning=false`）返回空内容
+   *      （`finish_reason=length`，被截断）；
+   *   ② `ModelRouter` 把预算设成 `baseMaxTokens × 2`（**真的翻倍了**）；
+   *   ③ 重试时**又走 `budgetFor`** → 返回 `baseMaxTokens`；
+   *   ④ 重试用同一份预算 → **必然再次被截断**。
+   *
+   * 净效果：**白花一次调用，什么都没改变。**
+   *
+   * 而这类模型在本项目的 magpie 部署里很常见（网关报 `reasoning=false`
+   * 或干脆不报元数据）。
+   */
+  const nonReasoning: ModelProfile = {
+    id: 'p/x',
+    tier: 'T1_fast',
+    free: true,
+    reasoning: false,
+    verified: true,
+    measuredMs: 1000,
+    maxOutputTokens: 32_000,
+    contextTokens: 200_000,
+  } as ModelProfile;
+
+  /* 首次调用：用 base（不放大）—— 这是对的行为，要保住。 */
+  assert.equal(budgetFor(nonReasoning, 4_096), 4_096, '首次调用不该放大');
+
+  /* 重试：**必须**用更大的预算，而不是被 reasoning 判断吃掉。 */
+  const boosted = 4_096 * 2;
+  assert.equal(
+    retryBudgetFor(nonReasoning, boosted, 4_096),
+    boosted,
+    '★ 翻倍重试必须真的用 8192，而不是退回 4096（那正是空转）',
+  );
+
+  /*
+   * ⚠️ **反面对照：这条注释原来写错了，被测试当场纠正。**
+   *
+   * 我原以为"非思维链模型走 `budgetFor` 会退回 `baseMaxTokens`，于是翻倍空转"。
+   * 实测：`budgetFor(nonReasoning, 8192)` 返回的**就是 8192** ——
+   * 因为那个分支是 `return baseMaxTokens`，而"重试路径"传进去的
+   * `baseMaxTokens` 参数**本身就是翻倍后的值**。
+   *
+   * 所以**非思维链模型的翻倍重试本来就没坏**。
+   * 真正坏掉的是**思维链模型**那条路径（见下面那条测试：首次 16384、
+   * 而 `budgetBoosted` 只用 `baseMaxTokens × 2 = 8192` → **比首次还小**）。
+   */
+  assert.equal(
+    budgetFor(nonReasoning, boosted),
+    boosted,
+    '非思维链模型会原样采用传入的预算（所以翻倍生效）',
+  );
+});
+
+test('★ 重试预算不超过模型自己报的上限（超过没意义）', () => {
+  const small: ModelProfile = {
+    id: 'p/small',
+    tier: 'T1_fast',
+    free: true,
+    reasoning: false,
+    verified: true,
+    measuredMs: 1000,
+    maxOutputTokens: 8_000,
+    contextTokens: 32_000,
+  } as ModelProfile;
+  /* 要求 16384，但模型只支持 8000 → 用 8000。 */
+  assert.equal(retryBudgetFor(small, 16_384, 4_096), 8_000);
+});
+
+test('★ 模型没报上限时，重试预算原样使用（不猜）', () => {
+  const noMeta: ModelProfile = {
+    id: 'p/none',
+    tier: 'T1_fast',
+    free: true,
+    reasoning: false,
+    verified: true,
+    measuredMs: 1000,
+    maxOutputTokens: 0,
+    contextTokens: 0,
+  } as ModelProfile;
+  assert.equal(retryBudgetFor(noMeta, 8_192, 4_096), 8_192, '没上限就别夹');
 });

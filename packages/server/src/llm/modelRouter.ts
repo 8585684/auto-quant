@@ -214,7 +214,17 @@ export class ModelRouter {
       try {
         const result = await this.options.call(modelId, messages, {
           ...(options.signal ? { signal: options.signal } : {}),
-          maxTokens: budgetFor(profile, budgetBoosted ?? options.baseMaxTokens),
+          maxTokens:
+            budgetBoosted === null
+              ? budgetFor(profile, options.baseMaxTokens)
+              /*
+               * ⚠️ 重试路径走 `retryBudgetFor` 而**不是** `budgetFor` ——
+               * 见那个函数的说明：`budgetFor` 对 `reasoning=false` 的模型
+               * 会返回原值，让"翻倍重试"空转。
+               *
+               * 第三个参数传**首次实际用的预算** —— 重试不得低于它。
+               */
+              : retryBudgetFor(profile, budgetBoosted, budgetFor(profile, options.baseMaxTokens)),
         });
         const ms = Date.now() - started;
 
@@ -246,11 +256,23 @@ export class ModelRouter {
            */
           if (verdict.kind === 'empty_content' && result.finishReason === 'length' && budgetBoosted === null) {
             /*
-             * ⚠️ **必须真的翻倍** —— 第一版这里写的是 `= options.baseMaxTokens`，
-             * 那与"什么都不设置"完全等价：重试拿到**同样的预算**，必然再次被截断。
-             * 等于"重试了一次但什么都没改变"，白花一次调用。
+             * ⚠️ **必须基于"首次【实际】用的预算"翻倍**，而不是 `baseMaxTokens`。
+             *
+             * 实测踩到（2026-10-12）：`T3` 首选的 `kimi-k3` 是思维链模型且
+             * 供应商没报输出上限 → `budgetFor()` 把它**放大 4 倍**：
+             *
+             * ```
+             *   首次：budgetFor(4096) = 16384
+             *   原来：budgetBoosted = baseMaxTokens × 2 = 8192   ← 比首次【还小】！
+             * ```
+             *
+             * 那会让"重试"拿到**更少的预算** —— 与目的正好相反。
+             * 项目的旧测试（`★★ 被 token 上限截断 → 加大预算重试同一个模型`）
+             * 断言 `calls[1].maxTokens > calls[0].maxTokens` ——
+             * 它**当场抓到了这个矛盾**。
              */
-            budgetBoosted = options.baseMaxTokens * EMPTY_CONTENT_RETRY_MULTIPLIER;
+            const firstBudget = budgetFor(profile, options.baseMaxTokens);
+            budgetBoosted = firstBudget * EMPTY_CONTENT_RETRY_MULTIPLIER;
             tried.pop(); /* 允许重选同一个模型 */
             previousModel = modelId;
             continue;
@@ -332,6 +354,61 @@ export function budgetFor(profile: ModelProfile | undefined, baseMaxTokens: numb
    * 少了它，供应商报的上限比 base 小的时候就会把预算缩下去。
    */
   return Math.max(baseMaxTokens, Math.min(profile.maxOutputTokens, amplified));
+}
+
+/**
+ * **空内容重试专用的预算计算**（2026-10-12 实测补上）。
+ *
+ * ## 为什么不能复用 `budgetFor`
+ *
+ * `budgetFor` 的第一行是：
+ *
+ * ```ts
+ * if (profile?.reasoning !== true) return baseMaxTokens;
+ * ```
+ *
+ * 对**首次调用**这是对的（非思维链模型不需要放大预算）。
+ * 但它让"空内容重试"**空转**：
+ *
+ * | 步骤 | 实际发生 |
+ * |---|---|
+ * | ① | 模型（实测 `stepfun/step-5-preview`，网关报 `reasoning=false`）返回空内容（`finish_reason=length`，被截断）|
+ * | ② | `ModelRouter` 把预算设成 `baseMaxTokens × 2`（**真的翻倍了**）|
+ * | ③ | 重试时**又走 `budgetFor`** → `reasoning !== true` → **返回 `baseMaxTokens`** |
+ * | ④ | 重试用同一份预算 → **必然再次被截断** |
+ *
+ * 净效果：**"翻倍重试"白花一次调用，什么都没改变。**
+ *
+ * 而这两种模型在本项目的 magpie 部署里**很常见**：要么网关报
+ * `reasoning=false`（实测 `omen-alpha` / `step-5-preview`），要么干脆不报元数据。
+ *
+ * ## 这里做什么
+ *
+ * 既然**已经知道上一次被截断了**，就直接用更大的预算 ——
+ * 不再经过"按 reasoning 判断"那道门。唯一仍然尊重的约束是
+ * **模型自己报的输出上限**（超过它没有意义，供应商会拒或截断）。
+ */
+export function retryBudgetFor(
+  profile: ModelProfile | undefined,
+  boosted: number,
+  /** 首次调用实际用的预算 —— 重试**不得低于**它。 */
+  originalBudget: number,
+): number {
+  /*
+   * ## 约束有两条（缺一不可）
+   *
+   * ① **不得低于首次** —— 我们已经知道输出被截断了，此时给更少的预算
+   *    与目的正好相反。（实测被自己的测试抓到过：首次 16384、重试 8192。）
+   * ② **不超过模型自己报的上限** —— 超过它没有意义（供应商会拒或照旧截断）。
+   *
+   * 取两者：先按上限夹，再与首次取大。若 `originalBudget` 本身已超上限
+   * （那说明调用方显式要求了更大预算），以它为准 —— 尊重调用方的意图。
+   */
+  if (profile === undefined || profile.maxOutputTokens <= 0) {
+    return Math.max(boosted, originalBudget);
+  }
+  const capped = Math.min(boosted, profile.maxOutputTokens);
+  return Math.max(capped, originalBudget);
 }
 
 /** 从错误对象上尽力取 HTTP 状态码（不同层可能挂在 `status` 或 `statusCode`）。 */
