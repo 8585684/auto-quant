@@ -599,6 +599,41 @@ const M11_PENDING_ENTRY = /* sql */ `
 ALTER TABLE positions ADD COLUMN entry_order_id TEXT;
 `;
 
+/**
+ * **成交的情报归因**（2026-10-12）—— `intel/signalHealth.ts` 的数据来源。
+ *
+ * ## 为什么需要它
+ *
+ * 消息面失效检测（胜率崩塌 / 连续亏损 / **反应衰减**）需要
+ * "**由某个信号驱动的成交**"。而实测核查发现这条信息**系统从未记录过**：
+ *
+ * ```
+ *   trades.source     → 只有 bot / reconciled（不是"哪个信号"）
+ *   open_reasoning    → 技术面理由
+ *   Decision          → 之前没有任何情报来源字段
+ * ```
+ *
+ * 所以 `signalHealth` 一直是**空转**（永远 `insufficient_data`）。
+ *
+ * ## 为什么存在 `trades` 上（而不是新建一张表）
+ *
+ * 归因是**成交的属性**：一笔成交对应"开仓时那条决策依据了哪些信号"。
+ * 新建表会带来"两处都要维护一笔成交"的问题（本项目在别处踩过：
+ * `positions` 与 `trade_events` 的一致性）。
+ *
+ * ## 格式
+ *
+ * JSON 数组，元素是 `signalKeyOf()` 的产出：`<域名>|<方向>|<标的>`。
+ * · **空数组 = 纯技术面成交**（没有情报依据）—— 与"列不存在"语义相同；
+ * · 只写**通过 `filterKnownIntelKeys` 校验**的键（编造的被剔除）。
+ *
+ * ⚠️ `DEFAULT '[]'` 让既有 225 笔历史成交**自然落到"纯技术面"**，
+ * 不需要 backfill —— 那也符合事实（它们确实没有情报归因）。
+ */
+const M16_TRADE_INTEL_ATTRIBUTION = /* sql */ `
+ALTER TABLE trades ADD COLUMN intel_keys TEXT NOT NULL DEFAULT '[]';
+`;
+
 const M12_STRATEGY_OPTIONAL = /* sql */ `
 -- ---------------------------------------------------------------------------
 -- AI 托管与策略**彻底解耦**：strategy_id 允许为空，删策略时置空而不是阻止
@@ -771,4 +806,5 @@ export const MIGRATIONS: readonly Migration[] = [
   { version: 13, name: 'order-margin-used', sql: M13_ORDER_MARGIN_USED },
   { version: 14, name: 'order-margin-type', sql: M14_ORDER_MARGIN_TYPE },
   { version: 15, name: 'pending-wait-minutes', sql: M15_PENDING_WAIT_MINUTES },
+  { version: 16, name: 'trade-intel-attribution', sql: M16_TRADE_INTEL_ATTRIBUTION },
 ];
