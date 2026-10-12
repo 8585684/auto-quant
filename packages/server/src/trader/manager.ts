@@ -26,6 +26,14 @@ import { collectMarketResearch, DEFAULT_SEARCH_ENDPOINT } from './agent/webSearc
 import { runAgentTask } from './agent/harness.js';
 import { parseIntelReport } from './intel/parseIntel.js';
 import { rankIntel } from './intel/freshness.js';
+import {
+  HUNTERS,
+  buildHunterTask,
+  mergeHunterReports,
+  summariseHunters,
+  type HunterReport,
+} from './intel/hunters.js';
+import { mapConcurrent } from './agent/pool.js';
 import { runSelfCheck } from './selfcheckRunner.js';
 import { createRoutedDecisionModel, createTeamDecisionModel, tierForRole } from './routedModel.js';
 
@@ -1020,71 +1028,94 @@ export class TraderManager {
          * harness 没装、超时、模型不认识 —— 任何一种都可能发生。
          * **兜底不是"退化成没用"，而是"至少还有原始搜索数据"**。
          */
-        const agentResult = await runAgentTask(
-          {
-            task:
-              `你是量化机构的新闻调研员。请联网查这几个标的**今天**的新闻与市场情绪：${symbols.join('、')}。\n\n` +
-              '要求：\n' +
-              '1. 每个标的给 1-3 条**真实的、带来源链接**的新闻（不要编造）；\n' +
-              '2. 说明该新闻对价格的方向含义（利多/利空/中性）；\n' +
-              '3. 如果查不到，**明确说查不到** —— 不要用常识填充成"新闻"；\n' +
-              '4. 最后用一段话概括当前市场情绪。\n' +
-              /*
-               * ── ⚠️ **第 5、6 条是"时效性"的落地**（2026-10-12）───────────────
-               *
-               * 用户主动点出了这件事：
-               * > 「消息面的东西**常常有时效性**，如果消息面的策略失效后，
-               * >  应当会及时修正、调整、改变」
-               *
-               * `trader/intel/freshness.ts` 已实现时效衰减与交叉验证，
-               * 但**它的输入必须是"每条消息的发布时刻与来源"** ——
-               * 而若提示词不要求，模型只会给一段散文，**那些字段根本不存在**，
-               * 衰减逻辑就成了空转（`publishedAt` 只能全部填"现在"）。
-               *
-               * 所以这两条是**让上游产出可用数据**的关键：
-               * · 第 5 条给出 `publishedAt` 的来源
-               * · 第 6 条让"同一条消息的多家转载"可被识别（交叉验证的输入）
-               */
-              '5. **每条新闻必须写明它的【发布时刻】**（例如"3 小时前"或具体时间）。' +
-              '只能确定到某一天就写那一天 —— **不要用"最近"这种模糊说法**；\n' +
-              '6. **同一件事若有多家媒体报道，列在同一条下面**（各自带链接）——' +
-              '这样能看出是"一个来源"还是"多个独立来源"。\n' +
-              /*
-               * ── ⚠️ **第 7 条：要求 JSON 输出**（2026-10-12，接线 `parseIntel`）──
-               *
-               * 前两条要求"写明发布时刻"，但**散文里的时间无法可靠解析**：
-               * ```
-               *   "3 小时前" / "昨天" / "10-08" / "最近"  → 无法机械转成时间戳
-               * ```
-               * 而**猜错的代价是静默的**：一条 3 天前的消息被当成"现在" →
-               * 它会被当作新鲜情报进入决策 —— **那正是消息面交易最典型的亏钱方式**。
-               *
-               * 所以让模型**直接给结构化字段**：
-               * · `hoursAgo` 用**相对小时数**而不是日期字符串 ——
-               *   避免时区与日历解析歧义（模型算日历也会错）
-               * · `sourceUrl` 必须是真实链接 —— **编不出可点的链接**
-               *   （这是防幻觉的第一道闸；`parseIntel` 会强制校验）
-               *
-               * **模型的活是"判断与表达"，把时间字符串解析成时间戳是代码的活。**
-               */
-              '\n**输出格式（必须严格遵守，只输出 JSON 数组，不要别的文字）**：\n' +
-              '```json\n' +
-              '[{"summary":"一句话摘要","sourceUrl":"https://真实链接",' +
-              '"direction":"bullish|bearish|neutral","symbols":["BTCUSDT"],' +
-              '"hoursAgo":2,"independentSources":["https://另一家的链接"]}]\n' +
-              '```\n' +
-              '· `hoursAgo` = **多少小时前发布**（数字，`0` = 刚刚；**不确定就按最保守的估**）；\n' +
-              '· `independentSources` = 报道**同一件事**的其它来源链接（可空数组）——\n' +
-              '  它决定这条消息是"一个来源"还是"多个独立来源"；\n' +
-              '· 查不到就输出 `[]` —— **不要编造**。\n',
-            allowedTools: 'WebSearch,WebFetch',
-            model: process.env.AQ_RESEARCH_GROUP ?? 'group/team-news',
-            fastModel: process.env.AQ_GRUNT_GROUP ?? 'group/team-grunt',
-            workdir: agentWorkdir(traderId),
-            timeoutMs: Number(process.env.AQ_RESEARCH_TIMEOUT_MS ?? 240_000),
-            authToken: apiKey,
+        /*
+         * ── **四个猎手并行调研**（2026-10-13 接线）─────────────────────────────
+         *
+         * ## 为什么从"一次调研"改成"四个猎手"
+         *
+         * 用户的要求：
+         * > 「总管委派子代理去做市场调研（查**新闻、各大交易所社区、
+         * >  **社交媒体、新闻源**等等）」
+         * > 「有**调查新闻的**、有**监控社区的**、有**查市场情绪的**」
+         *
+         * 而之前是**一段提示词 + 一次 agent 调用** ——
+         * **一个 agent 覆盖不了多个信息源**：它一次只能沿一个方向查，
+         * 结果必然是"查了新闻就没查社区"。
+         *
+         * ## 并行（墙钟不叠加）
+         *
+         * 实测一个 harness 调研约 **197 秒**，串行四个就是 13 分钟；
+         * 并行仍是约 200 秒。用户明确说过"不限制并发"（指 magpie 侧），
+         * 而**服务器侧的并发由闸门控**（`AQ_HUNTER_CONCURRENCY`，默认 2）。
+         *
+         * ## ⚠️ 失败者必须进结果（不能静默丢掉）
+         *
+         * 见 `hunters.ts`：把失败的猎手丢掉会让下游以为
+         * "**那个来源上什么都没有**" —— 而那是两件完全不同的事
+         *（"社区没有讨论" vs "社区猎手挂了"）。
+         */
+        const hunterLimit = Math.max(1, Number(process.env.AQ_HUNTER_CONCURRENCY ?? '') || 2);
+        const hunterTimeout = Number(process.env.AQ_RESEARCH_TIMEOUT_MS ?? 240_000);
+        const hunterResults = await mapConcurrent(
+          HUNTERS,
+          hunterLimit,
+          async (hunter): Promise<HunterReport> => {
+            const r = await runAgentTask({
+              task: buildHunterTask(hunter, symbols),
+              allowedTools: 'WebSearch,WebFetch',
+              model: process.env.AQ_RESEARCH_GROUP ?? 'group/team-news',
+              fastModel: process.env.AQ_GRUNT_GROUP ?? 'group/team-grunt',
+              workdir: agentWorkdir(traderId),
+              timeoutMs: hunterTimeout,
+              authToken: apiKey,
+            });
+            return {
+              hunterId: hunter.id,
+              label: hunter.label,
+              ok: r.ok,
+              text: r.text,
+              ...(r.error === undefined ? {} : { error: r.error }),
+              latencyMs: r.latencyMs,
+            };
           },
         );
+        /*
+         * ⚠️ **`mapConcurrent` 从不抛错** —— 里面抛出的异常会变成
+         * `{ ok: false, error, index }`。这一层映射把那个形状**还原成猎手**，
+         * 于是"猎手函数自己炸了"与"agent 跑失败"走同一条可见路径
+         *（都进 `hunterReports`、都在合并结果里写明原因）。
+         *
+         * 若这里漏掉失败分支，那种情况会**静默少一个猎手** ——
+         * 而下游会以为"那个来源上没有消息"。
+         */
+        const hunterReports: HunterReport[] = hunterResults.map((res, i) => {
+          if (res.ok) return res.value;
+          const hunter = HUNTERS[i];
+          return {
+            hunterId: hunter?.id ?? `hunter_${i}`,
+            label: hunter?.label ?? `猎手 ${i}`,
+            ok: false,
+            text: '',
+            error: res.error,
+            latencyMs: 0,
+          };
+        });
+        const okReports = hunterReports.filter((rep) => rep.ok);
+        const mergedText = mergeHunterReports(hunterReports);
+        runtimeLogs.write(traderId, 'info', 'team', `[调研] ${summariseHunters(hunterReports)}`);
+        /*
+         * ⚠️ 下面沿用原来的 `agentResult` 形状 —— 于是它后面的
+         * **时效过滤 / 交叉验证 / 退回原文**那三段一行都不用改。
+         *
+         * `text` 用**合并后的文本**（每个猎手一块，失败的写明原因）——
+         * 那样 `parseIntelReport` 能从成功的猎手块里解析出结构化情报，
+         * 而失败信息也不会丢。
+         */
+        const agentResult = {
+          ok: okReports.length > 0,
+          text: mergedText,
+          error: okReports.length > 0 ? undefined : '全部猎手都未产出',
+        };
 
         if (agentResult.ok) {
           /*
