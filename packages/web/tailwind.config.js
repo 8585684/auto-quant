@@ -1,3 +1,36 @@
+/**
+ * ## 颜色令牌为什么是 `rgb(var(...) / <alpha-value>)` 而不是十六进制
+ *
+ * 这套界面支持**多套模板**（`src/templates/`）：每套模板是一种完全不同的外壳
+ * 与配色，但它们共用同一批页面组件。颜色写死十六进制的话，每套模板都要复制
+ * 一份配置并重新编译；改成 CSS 变量之后，模板只需覆盖变量，页面代码不动。
+ *
+ * 默认值在 `index.css` 的 `:root` 里，**就是原来的配色**。
+ *
+ * ## ⚠️ 三元组是必需的，不是风格问题
+ *
+ * Tailwind 编译透明度修饰符的方式是把它塞进 `rgb(... / <alpha>)`：
+ *
+ *     bg-accent/10   →   rgb(var(--aq-accent-rgb) / 0.1)
+ *
+ * 而 `--aq-accent` 是十六进制（`#7060f5`），于是编译结果
+ * `rgb(#7060f5 / 0.1)` **不是合法 CSS** —— 浏览器整条声明丢弃。
+ *
+ * 危险在于它是**静默**的：类名生成了、构建过了、控制台干净，只是那一层
+ * 底色/边框根本不存在。仓库里 `down/10`、`warn/50`、`accent/10` 这类写法
+ * 有一百多处（徽章底、提示条底、选中行底、焦点环），全部会一起失效 ——
+ * 界面不会"坏"，只会变得寡淡。
+ *
+ * 更隐蔽的是它**在 `@apply` 里会直接报错**（"The `border-base-850/70`
+ * class does not exist"）—— 报错只出现在那几行，容易被当成个别问题修掉，
+ * 而剩下几十处继续静默失效。这条真的发生过。
+ *
+ * 所以每个颜色令牌在 `index.css` 里都配了一份空格分隔的 `R G B`，
+ * 这里统一走 `token()`。**两份值必须同步改** —— 只改一份的话，`bg-accent`
+ * 与 `bg-accent/10` 会变成两个色，而且不会有任何报错。
+ */
+const token = (name) => `rgb(var(--aq-${name}-rgb) / <alpha-value>)`;
+
 /** @type {import('tailwindcss').Config} */
 export default {
   content: ['./index.html', './src/**/*.{ts,tsx}'],
@@ -21,13 +54,13 @@ export default {
          * 面板边界糊在一起、看不出层次（这一条原来的理由依然成立）。
          */
         base: {
-          950: '#0a0a0a', // 页面底（参考锚点）
-          900: '#121212', // 面板
-          850: '#1a1a1a', // 抬升面板 / 表头（参考锚点）
-          800: '#212121', // 输入框 / hover
-          750: '#282828', // 分隔线（弱）
-          700: '#2f2f2f', // 边框（参考锚点）
-          600: '#3d3d3d', // 边框（强调）
+          950: token('base-950'), // 页面底（参考锚点）
+          900: token('base-900'), // 面板
+          850: token('base-850'), // 抬升面板 / 表头（参考锚点）
+          800: token('base-800'), // 输入框 / hover
+          750: token('base-750'), // 分隔线（弱）
+          700: token('base-700'), // 边框（参考锚点）
+          600: token('base-600'), // 边框（强调）
         },
 
         /*
@@ -38,11 +71,18 @@ export default {
          * （它的 G 通道略低于 R/B，是带一点紫的灰白），下面几级按同样的偏移推。
          */
         ink: {
-          hi: '#eae9f4', // 正文 / 主要信息（参考锚点）
-          mid: '#b0aec0', // 次要信息
-          lo: '#7d7a8c', // 标签 / 说明
-          faint: '#57545f', // 极弱：占位符、禁用
-          strong: '#ffffff', // 强调：关键数字
+          hi: token('ink'), // 正文 / 主要信息（参考锚点）
+          mid: token('ink-mid'), // 次要信息
+          lo: token('ink-lo'), // 标签 / 说明
+          faint: token('ink-faint'), // 极弱：占位符、禁用
+          strong: token('ink-strong'), // 强调：关键数字
+          /*
+           * ⚠️ `soft` 是**迁移期兼容别名**，值等于 `mid`（见 `index.css` 里
+           * 同一行变量上的注释）。上游的多智能体分支里有 13 处写着
+           * `text-ink-soft`，而那个类此前根本没被定义过 ——
+           * Tailwind 不报错、只是不生成样式，于是那些"次要信息"用了正文色。
+           */
+          soft: token('ink-soft'),
         },
 
         /*
@@ -54,17 +94,21 @@ export default {
          *
          * 两者明度仍然不同，红绿色盲用户能靠明暗区分（不能只依赖色相）。
          */
-        up: '#0ecb81', // 涨 / 多 / 盈利
-        down: '#f6465d', // 跌 / 空 / 亏损
+        up: token('up'), // 涨 / 多 / 盈利
+        down: token('down'), // 跌 / 空 / 亏损
         /*
          * 主操作：**紫**，取自参考（它在对方的构建产物里出现 31 次，是最多的一个色）。
          * 原来这里是蓝 `#5b8def`。
          */
-        accent: '#7060f5', // 主操作
-        'accent-hi': '#8172ff', // 主操作 hover
-        warn: '#f59e0b', // 警告
+        accent: token('accent'), // 主操作
+        'accent-hi': token('accent-hi'), // 主操作 hover
+        warn: token('warn'), // 警告
 
-        overlay: 'rgba(6, 6, 6, 0.72)',
+        /*
+         * `overlay` 是唯一不能走 `token()` 的：它本身是半透明的，
+         * 模板要能同时改色和改透明度，所以拆成两个变量拼出来。
+         */
+        overlay: 'rgb(var(--aq-overlay) / var(--aq-overlay-alpha))',
       },
 
       fontFamily: {

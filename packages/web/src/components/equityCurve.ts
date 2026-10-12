@@ -51,7 +51,68 @@ export const CHART_INK = {
   surface: '#121212',
   /** Large value inside an SVG gauge — `ink-hi`. */
   inkHi: '#eae9f4',
+  /**
+   * 图表内部的次要文字（价格轴标签、提示框里的小字）—— `ink-mid`。
+   *
+   * 与 `axis` 分开是有原因的：`axis` 是**刻度线**的颜色（要淡到不抢数据），
+   * 而这里是**价格本身**，淡到那个程度在 11px 上就读不清了。
+   */
+  inkMid: '#b0aec0',
 } as const;
+
+/**
+ * `CHART_INK` 的键 → CSS 变量名。**这是图表与配色之间的唯一映射。**
+ *
+ * ## 为什么图表不能直接用 CSS 变量
+ *
+ * canvas（`lightweight-charts` 的 K 线）与写进 `stroke` / `fill` 的 SVG
+ * **吃不了** `var(--aq-*)`：`ctx.strokeStyle = 'var(--aq-up)'` 不会报错，
+ * 只是**什么都不画**。所以它们必须拿到**当时算好的**十六进制字符串。
+ *
+ * ## 为什么要有这张表
+ *
+ * 因为现在有**两套模板**（见 `src/templates/`），它们的同一批令牌是不同的色
+ * —— 控制台是钢蓝、经典是原来的紫。图表如果在模块加载时就把颜色定死，
+ * 切模板后整页都变了、只有图表还是上一套配色。页面看起来"基本正常"，
+ * 只是曲线那个绿不是这个绿，而**没有人会因此去查代码**。
+ *
+ * 所以真正的取色在 `readChartInk()`：从 `<html>` 上读**此刻生效**的变量。
+ * 这张表是"哪个键读哪个变量"的对应关系 —— 读取与用例都走它，不各写一份。
+ */
+export const CHART_INK_VARS: Record<keyof typeof CHART_INK, string> = {
+  up: '--aq-up',
+  down: '--aq-down',
+  warn: '--aq-warn',
+  accent: '--aq-accent',
+  grid: '--aq-base-750',
+  axis: '--aq-ink-lo',
+  rule: '--aq-base-600',
+  track: '--aq-base-700',
+  surface: '--aq-base-900',
+  inkHi: '--aq-ink',
+  inkMid: '--aq-ink-mid',
+};
+
+/**
+ * 读**当前模板**下的图表色。
+ *
+ * ⚠️ **兜底不是可选的**：`getComputedStyle` 在样式表还没加载完（或某个变量
+ * 被模板删掉）时返回空串，而 canvas 拿到空串会静默画不出东西（不报错）。
+ * 任何一项读不到就退回 `CHART_INK` 的字面量 —— 那是**原版配色**。
+ *
+ * 不做缓存：切模板后必须重新读，缓存反而要额外的失效逻辑；这个函数只做
+ * 十几次 `getPropertyValue`，比一次 React 重渲染便宜得多。
+ */
+export function readChartInk(): typeof CHART_INK {
+  if (typeof window === 'undefined' || typeof document === 'undefined') return CHART_INK;
+  const styles = getComputedStyle(document.documentElement);
+  const out = {} as Record<keyof typeof CHART_INK, string>;
+  for (const key of Object.keys(CHART_INK) as Array<keyof typeof CHART_INK>) {
+    const value = styles.getPropertyValue(CHART_INK_VARS[key]).trim();
+    out[key] = value || CHART_INK[key];
+  }
+  return out as typeof CHART_INK;
+}
 
 /** One point on a rendered curve. */
 export interface EquityPoint {
