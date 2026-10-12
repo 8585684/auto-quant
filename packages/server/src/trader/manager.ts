@@ -24,6 +24,8 @@ import { createMagpieCallFactory, discoverFromGateway } from './magpieGateway.js
 import { resolveTeamGateway } from './teamGateway.js';
 import { collectMarketResearch, DEFAULT_SEARCH_ENDPOINT } from './agent/webSearch.js';
 import { runAgentTask } from './agent/harness.js';
+import { parseIntelReport } from './intel/parseIntel.js';
+import { rankIntel } from './intel/freshness.js';
 import { runSelfCheck } from './selfcheckRunner.js';
 import { createRoutedDecisionModel, createTeamDecisionModel, tierForRole } from './routedModel.js';
 
@@ -1046,7 +1048,35 @@ export class TraderManager {
               '5. **每条新闻必须写明它的【发布时刻】**（例如"3 小时前"或具体时间）。' +
               '只能确定到某一天就写那一天 —— **不要用"最近"这种模糊说法**；\n' +
               '6. **同一件事若有多家媒体报道，列在同一条下面**（各自带链接）——' +
-              '这样能看出是"一个来源"还是"多个独立来源"。\n',
+              '这样能看出是"一个来源"还是"多个独立来源"。\n' +
+              /*
+               * ── ⚠️ **第 7 条：要求 JSON 输出**（2026-10-12，接线 `parseIntel`）──
+               *
+               * 前两条要求"写明发布时刻"，但**散文里的时间无法可靠解析**：
+               * ```
+               *   "3 小时前" / "昨天" / "10-08" / "最近"  → 无法机械转成时间戳
+               * ```
+               * 而**猜错的代价是静默的**：一条 3 天前的消息被当成"现在" →
+               * 它会被当作新鲜情报进入决策 —— **那正是消息面交易最典型的亏钱方式**。
+               *
+               * 所以让模型**直接给结构化字段**：
+               * · `hoursAgo` 用**相对小时数**而不是日期字符串 ——
+               *   避免时区与日历解析歧义（模型算日历也会错）
+               * · `sourceUrl` 必须是真实链接 —— **编不出可点的链接**
+               *   （这是防幻觉的第一道闸；`parseIntel` 会强制校验）
+               *
+               * **模型的活是"判断与表达"，把时间字符串解析成时间戳是代码的活。**
+               */
+              '\n**输出格式（必须严格遵守，只输出 JSON 数组，不要别的文字）**：\n' +
+              '```json\n' +
+              '[{"summary":"一句话摘要","sourceUrl":"https://真实链接",' +
+              '"direction":"bullish|bearish|neutral","symbols":["BTCUSDT"],' +
+              '"hoursAgo":2,"independentSources":["https://另一家的链接"]}]\n' +
+              '```\n' +
+              '· `hoursAgo` = **多少小时前发布**（数字，`0` = 刚刚；**不确定就按最保守的估**）；\n' +
+              '· `independentSources` = 报道**同一件事**的其它来源链接（可空数组）——\n' +
+              '  它决定这条消息是"一个来源"还是"多个独立来源"；\n' +
+              '· 查不到就输出 `[]` —— **不要编造**。\n',
             allowedTools: 'WebSearch,WebFetch',
             model: process.env.AQ_RESEARCH_GROUP ?? 'group/team-news',
             fastModel: process.env.AQ_GRUNT_GROUP ?? 'group/team-grunt',
@@ -1057,13 +1087,64 @@ export class TraderManager {
         );
 
         if (agentResult.ok) {
+          /*
+           * ── **解析成结构化情报，并做时效/交叉验证过滤**（2026-10-12 接线）──
+           *
+           * ## 为什么要过滤（而不是把原文直接给下游）
+           *
+           * `intel/freshness.ts` 的规则是：
+           * · **过期**（> 48h）→ 权重 0，**不进决策**
+           * · **未确认**（只有一个独立来源）→ 默认**不进决策**
+           *
+           * 若不过滤，这两条规则就只是"写在代码里"而**从未生效** ——
+           * 而用户明确要求过：「消息面的东西常常有时效性，
+           * **如果消息面的策略失效后，应当会及时修正、调整、改变**」。
+           *
+           * ## ⚠️ 但解析失败时**不能丢原文**
+           *
+           * 模型可能没按 JSON 格式输出（尤其换模型之后）。
+           * 那时若我们只返回"解析失败"，团队就**一点情报都没有**了 ——
+           * 而原文里其实有可用信息（只是格式不对）。
+           *
+           * 所以：**解析成功 → 用过滤后的结构化文本；解析失败 → 退回原文**
+           * （并在日志里说明"格式没对上"）。
+           */
+          const parsed = parseIntelReport(agentResult.text, Date.now(), 'news_hunter');
+          if (parsed.intel.length > 0) {
+            const ranked = rankIntel(parsed.intel, Date.now());
+            const droppedByRule = parsed.intel.length - ranked.length;
+            runtimeLogs.write(
+              traderId, 'info', 'team',
+              `[调研] agent 查到 ${parsed.intel.length} 条情报 · ` +
+              `可用 ${ranked.length} 条（过期/未确认被剔除 ${droppedByRule} 条）` +
+              `${parsed.dropped.length > 0 ? ` · 格式不合规 ${parsed.dropped.length} 条` : ''}`,
+            );
+            if (ranked.length > 0) {
+              const text = ranked
+                .map((r) => {
+                  const h = (r.assessment.ageMs / 3_600_000).toFixed(1);
+                  return `- [${r.intel.direction}] ${r.intel.summary}\n` +
+                    `  来源：${r.intel.sourceUrl}（${r.assessment.independentSources} 个独立来源）\n` +
+                    `  ${h} 小时前 · ${r.assessment.verdict}`;
+                })
+                .join('\n');
+              researchCache.set(traderId, { text, at: Date.now(), refreshing: false });
+              return text;
+            }
+            /*
+             * 全部被规则剔除（都过期或都未确认）—— 这也是**有效结论**：
+             * "本轮没有可用的新鲜情报"。明说，而不是给一段旧消息。
+             */
+            const note = '（本轮没有可用的新鲜情报：查到的不够新，或只有单一来源未经确认）';
+            researchCache.set(traderId, { text: note, at: Date.now(), refreshing: false });
+            return note;
+          }
+
+          /* 解析不出结构化情报 → **退回原文**（格式没对上，但原文仍可能有信息）。 */
           runtimeLogs.write(
-            traderId,
-            'info',
-            'team',
-            `[调研] agent 自己查到了资料（${Math.round(agentResult.latencyMs / 1000)}s，${agentResult.text.length} 字）`,
+            traderId, 'warn', 'team',
+            `[调研] agent 的产出不是结构化格式（${parsed.dropped[0]?.reason ?? '未知'}）—— 退回原文使用`,
           );
-          /* 存进缓存 —— 下一次决策就不必再等这 3 分钟。 */
           researchCache.set(traderId, { text: agentResult.text, at: Date.now(), refreshing: false });
           return agentResult.text;
         }
