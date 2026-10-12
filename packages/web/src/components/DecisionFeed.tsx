@@ -153,7 +153,7 @@ import { DebateView } from './DebateView';
  * 而 `TeamBoard` 替换的是**实时工作流区**与**决策行**这两个主视图。
  *
  * 为什么另起一套而不是继续改旧组件：旧那三个用了一整批**本项目 Tailwind
- * 配置里根本不存在**的类（`border-line` / `bg-surface-2` / `bg-ok`…），
+ * 配置里根本不存在**的类（`border-base-700` / `bg-base-850` / `bg-up`…），
  * 实测渲染出来没有边框、没有底色、状态灯没有颜色 —— 见 `TeamBoard/roster.ts`
  * 文件头的完整对照表。那是"改不动"的，只能重写。
  */

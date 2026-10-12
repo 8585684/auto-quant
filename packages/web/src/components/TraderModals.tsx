@@ -596,7 +596,7 @@ export function NewTraderModal({
             所以这里要说清它**不**用上面那个列表。
           */}
           {mode === 'ai_team' && (
-            <div className="rounded-md border border-line bg-surface-2 px-3 py-2 text-base text-ink-soft">
+            <div className="rounded-md border border-base-700 bg-base-850 px-3 py-2 text-base text-ink-soft">
               <span className="font-medium">模型由系统 magpie 网关统一调度</span>
               <span className="block text-xs text-ink-faint">
                 团队模式不使用「AI 模型」列表里的任何记录 —— 它的模型出口是独立的 magpie 网关

@@ -135,10 +135,10 @@ export function groupByRole(
 /** 角色状态灯。 */
 function StatusDot({ state }: { state: RoleLiveState }): React.ReactElement {
   if (state.failed) {
-    return <span className="inline-block h-2 w-2 rounded-full bg-danger" title="失败" />;
+    return <span className="inline-block h-2 w-2 rounded-full bg-down" title="失败" />;
   }
   if (state.done) {
-    return <span className="inline-block h-2 w-2 rounded-full bg-ok" title="已完成" />;
+    return <span className="inline-block h-2 w-2 rounded-full bg-up" title="已完成" />;
   }
   return (
     <span
@@ -183,15 +183,15 @@ export function TeamRoster({
 
   if (states.length === 0) {
     return (
-      <div className="rounded-md border border-line bg-surface-2 px-3 py-3 text-base text-ink-faint">
+      <div className="rounded-md border border-base-700 bg-base-850 px-3 py-3 text-base text-ink-faint">
         团队正在组建 —— 还没有角色开始工作。
       </div>
     );
   }
 
   return (
-    <div className="rounded-md border border-line">
-      <div className="flex items-center justify-between border-b border-line px-3 py-2">
+    <div className="rounded-md border border-base-700">
+      <div className="flex items-center justify-between border-b border-base-700 px-3 py-2">
         <span className="text-base font-medium">交易台 · 第 {cycleNumber} 轮</span>
         <span className={`text-base ${elapsedSec >= 120 ? 'text-accent' : 'text-ink-faint'}`}>
           {mmss}
@@ -199,7 +199,7 @@ export function TeamRoster({
       </div>
       <table className="w-full text-base">
         <thead>
-          <tr className="border-b border-line text-left text-xs text-ink-faint">
+          <tr className="border-b border-base-700 text-left text-xs text-ink-faint">
             <th className="px-3 py-1.5 font-normal">智能体</th>
             <th className="px-3 py-1.5 font-normal">分工</th>
             <th className="px-3 py-1.5 font-normal">最近动作</th>
@@ -211,7 +211,7 @@ export function TeamRoster({
             const meta = DESK_ROLES.find((m) => m.id === s.role);
             const last = s.steps[s.steps.length - 1];
             return (
-              <tr key={s.role} className="border-b border-line/50 last:border-0">
+              <tr key={s.role} className="border-b border-base-700/50 last:border-0">
                 <td className="px-3 py-2 whitespace-nowrap">
                   <span className="mr-2">
                     <StatusDot state={s} />
@@ -224,9 +224,9 @@ export function TeamRoster({
                 <td className="px-3 py-2 text-ink-soft">{meta?.duty ?? '（未登记分工）'}</td>
                 <td className="px-3 py-2 text-ink-soft">
                   {last ? (
-                    <span className={last.level === 'error' ? 'text-danger' : undefined}>
+                    <span className={last.level === 'error' ? 'text-down' : undefined}>
                       {last.phase !== null && PHASE_LABEL[last.phase] !== undefined && (
-                        <span className="mr-1.5 rounded bg-surface-3 px-1 text-xs text-ink-faint">
+                        <span className="mr-1.5 rounded bg-base-800 px-1 text-xs text-ink-faint">
                           {PHASE_LABEL[last.phase]}
                         </span>
                       )}
@@ -260,13 +260,13 @@ export function ModeBadge({ mode }: { mode: TraderRow['mode'] }): React.ReactEle
   }
   if (mode === 'ai_managed') {
     return (
-      <span className="rounded bg-surface-3 px-1.5 py-0.5 text-xs font-medium text-ink-soft">
+      <span className="rounded bg-base-800 px-1.5 py-0.5 text-xs font-medium text-ink-soft">
         智能托管
       </span>
     );
   }
   return (
-    <span className="rounded bg-surface-3 px-1.5 py-0.5 text-xs font-medium text-ink-faint">
+    <span className="rounded bg-base-800 px-1.5 py-0.5 text-xs font-medium text-ink-faint">
       固定策略
     </span>
   );

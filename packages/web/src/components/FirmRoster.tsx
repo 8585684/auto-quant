@@ -68,11 +68,11 @@ export function FirmRoster({ activeRoles }: { activeRoles: ReadonlySet<string> }
   const activeCount = [...activeRoles].filter((id) => firmRoleOf(id)?.status === 'staffed').length;
 
   return (
-    <div className="overflow-hidden rounded-md border border-line">
+    <div className="overflow-hidden rounded-md border border-base-700">
       <button
         type="button"
         onClick={() => setOpen((v) => !v)}
-        className="flex w-full items-center gap-2 bg-surface-2 px-2.5 py-1.5 text-left"
+        className="flex w-full items-center gap-2 bg-base-850 px-2.5 py-1.5 text-left"
       >
         <span className="shrink-0 text-xs font-medium text-ink-hi">组织架构</span>
         <span className="num shrink-0 text-xs text-ink-faint">{FIRM_ROLES.length} 个岗位</span>
@@ -94,8 +94,8 @@ export function FirmRoster({ activeRoles }: { activeRoles: ReadonlySet<string> }
             const roles = FIRM_ROLES.filter((r) => r.department === dept);
             if (roles.length === 0) return null;
             return (
-              <div key={dept} className="overflow-hidden rounded border border-line/60">
-                <div className="bg-surface-2 px-2 py-1 text-xs font-medium text-ink-hi">{dept}</div>
+              <div key={dept} className="overflow-hidden rounded border border-base-700/60">
+                <div className="bg-base-850 px-2 py-1 text-xs font-medium text-ink-hi">{dept}</div>
                 <ul className="divide-y divide-line/40">
                   {roles.map((r) => (
                     <RoleRow key={r.id} role={r} active={activeRoles.has(r.id)} />
@@ -118,7 +118,7 @@ function RoleRow({ role, active }: { role: FirmRole; active: boolean }): React.R
       {/* 状态点：在岗且本轮参与 → 实心绿；在岗未参与 → 空心；规划中 → 灰 */}
       <span
         className={`mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full ${
-          planned ? 'bg-ink-faint/40' : active ? 'bg-ok' : 'border border-ink-faint'
+          planned ? 'bg-ink-faint/40' : active ? 'bg-up' : 'border border-ink-faint'
         }`}
         title={planned ? '规划中（还没实现）' : active ? '本轮参与了' : '在岗（本轮未参与）'}
       />
@@ -127,7 +127,7 @@ function RoleRow({ role, active }: { role: FirmRole; active: boolean }): React.R
           <span className="text-xs font-medium text-ink-hi">{role.label}</span>
           <span className={`text-[10px] ${TIER_CLASS[role.tier]}`}>{TIER_LABEL[role.tier]}</span>
           {planned && <span className="text-[10px] text-ink-faint">⚪ 规划中</span>}
-          {active && !planned && <span className="text-[10px] text-ok">本轮参与</span>}
+          {active && !planned && <span className="text-[10px] text-up">本轮参与</span>}
         </div>
         <p className="text-[11px] leading-snug text-ink-lo">{role.duty}</p>
       </div>

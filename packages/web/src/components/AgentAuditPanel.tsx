@@ -75,11 +75,11 @@ function Section({
 }): React.ReactElement {
   const [open, setOpen] = useState(false);
   return (
-    <div className="border-t border-line first:border-t-0">
+    <div className="border-t border-base-700 first:border-t-0">
       <button
         type="button"
         onClick={() => setOpen((v) => !v)}
-        className="flex w-full items-center gap-2 px-3 py-2 text-left hover:bg-surface-2"
+        className="flex w-full items-center gap-2 px-3 py-2 text-left hover:bg-base-850"
       >
         <span className="text-base font-medium text-ink-hi">{title}</span>
         <span className="num text-xs text-ink-faint">{count}</span>
@@ -118,7 +118,7 @@ export function AgentAuditPanel({ traderId }: { traderId: number }): React.React
           还没有审计记录。机器人跑过一轮、或 AI 调整过一次参数之后，这里就会有内容。
         </div>
       ) : (
-        <div className="overflow-hidden rounded-md border border-line">
+        <div className="overflow-hidden rounded-md border border-base-700">
           <Section title="运行轨迹" hint="谁跑了、多久、花了多少 token" count={runs.length}>
             {runs.length === 0 ? (
               <p className="text-xs text-ink-faint">还没有运行记录。</p>
@@ -136,11 +136,11 @@ export function AgentAuditPanel({ traderId }: { traderId: number }): React.React
                 </thead>
                 <tbody>
                   {runs.map((r) => (
-                    <tr key={r.id} className="border-t border-line/40">
+                    <tr key={r.id} className="border-t border-base-700/40">
                       <td className="num py-1 whitespace-nowrap text-ink-faint">{stamp(r.createdAt)}</td>
                       <td className="py-1 text-ink-soft">{r.kind}</td>
                       <td className="py-1 text-ink-soft">{r.trigger}</td>
-                      <td className={`py-1 ${r.outcome === 'ok' ? 'text-ok' : 'text-warn'}`} title={r.detail}>
+                      <td className={`py-1 ${r.outcome === 'ok' ? 'text-up' : 'text-warn'}`} title={r.detail}>
                         {r.outcome}
                       </td>
                       <td className="num py-1 text-right text-ink-faint">
@@ -164,7 +164,7 @@ export function AgentAuditPanel({ traderId }: { traderId: number }): React.React
             ) : (
               <ul className="space-y-2">
                 {experiments.map((e) => (
-                  <li key={e.id} className="rounded border border-line/50 px-2 py-1.5">
+                  <li key={e.id} className="rounded border border-base-700/50 px-2 py-1.5">
                     <div className="flex flex-wrap items-baseline gap-x-3 text-xs">
                       <span className="num text-ink-faint">{stamp(e.createdAt)}</span>
                       <span className="text-ink-soft">{e.trigger}</span>
@@ -176,7 +176,7 @@ export function AgentAuditPanel({ traderId }: { traderId: number }): React.React
                       {e.outcomeTrades === null ? (
                         <span className="text-ink-faint">等结果中</span>
                       ) : (
-                        <span className={e.outcomeNetPnl !== null && e.outcomeNetPnl >= 0 ? 'text-ok' : 'text-danger'}>
+                        <span className={e.outcomeNetPnl !== null && e.outcomeNetPnl >= 0 ? 'text-up' : 'text-down'}>
                           {e.outcomeTrades} 笔 · 净 {e.outcomeNetPnl?.toFixed(2) ?? '—'}
                         </span>
                       )}
@@ -199,7 +199,7 @@ export function AgentAuditPanel({ traderId }: { traderId: number }): React.React
                     <span className="w-24 shrink-0 truncate font-medium text-ink-soft" title={m.symbol}>
                       {m.symbol}
                     </span>
-                    <span className={m.netPnl >= 0 ? 'num w-16 shrink-0 text-ok' : 'num w-16 shrink-0 text-danger'}>
+                    <span className={m.netPnl >= 0 ? 'num w-16 shrink-0 text-up' : 'num w-16 shrink-0 text-down'}>
                       {m.netPnl >= 0 ? '+' : ''}
                       {m.netPnl.toFixed(2)}
                     </span>

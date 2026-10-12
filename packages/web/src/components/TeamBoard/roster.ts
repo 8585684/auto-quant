@@ -17,10 +17,10 @@
  *
  * | 用到的类 | `tailwind.config.js` 里的真相 |
  * |---|---|
- * | `border-line` / `divide-line` | ❌ 不存在（有 `base-700`/`750`/`800`，**没有 `line`**） |
- * | `bg-surface-1` / `-2` / `-3` | ❌ 不存在（层级色叫 `base-*`） |
+ * | `border-base-700` / `divide-line` | ❌ 不存在（有 `base-700`/`750`/`800`，**没有 `line`**） |
+ * | `bg-base-900` / `-2` / `-3` | ❌ 不存在（层级色叫 `base-*`） |
  * | `text-ink-soft` | ❌ 不存在（文字四级是 `ink-hi/mid/lo/faint`） |
- * | `bg-ok` / `text-ok` / `bg-danger` / `text-danger` | ❌ 不存在（语义色是 `up` / `down` / `warn`） |
+ * | `bg-up` / `text-up` / `bg-down` / `text-down` | ❌ 不存在（语义色是 `up` / `down` / `warn`） |
  *
  * **Tailwind 对不存在的类不报错、不告警，只是不生成样式** —— 于是那三个组件
  * 渲染出来是"**一堆没有边框、没有底色、状态灯根本没有颜色**"的裸文字。
@@ -77,7 +77,7 @@ export const SURFACE = {
  * 状态色。
  *
  * ⚠️ 语义色只有 `up` / `down` / `warn` / `accent` 四个 —— **没有 `ok` / `danger`**。
- * 写成 `bg-ok` 会得到一个没有背景色的 span（那个"状态灯"于是从来不存在）。
+ * 写成 `bg-up` 会得到一个没有背景色的 span（那个"状态灯"于是从来不存在）。
  */
 export const TONE = {
   active: 'bg-accent',

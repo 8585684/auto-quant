@@ -59,11 +59,11 @@ export function DebateView({ members }: { members: readonly TeamMemberOutput[] }
   const bothPresent = bull !== undefined && bear !== undefined;
 
   return (
-    <div className="mt-1 overflow-hidden rounded-md border border-line">
+    <div className="mt-1 overflow-hidden rounded-md border border-base-700">
       <button
         type="button"
         onClick={() => setOpen((v) => !v)}
-        className="flex w-full items-center gap-2 bg-surface-2 px-2.5 py-1.5 text-left"
+        className="flex w-full items-center gap-2 bg-base-850 px-2.5 py-1.5 text-left"
       >
         <span className="shrink-0 text-xs font-medium text-ink-hi">多空辩论</span>
         <span className="min-w-0 flex-1 truncate text-xs text-ink-faint">
@@ -81,7 +81,7 @@ export function DebateView({ members }: { members: readonly TeamMemberOutput[] }
           {/* 多头 */}
           <DebateColumn
             title="多头研究员"
-            accent="text-ok"
+            accent="text-up"
             model={bull?.modelId ?? null}
             text={bull?.text ?? null}
             emptyHint="这一轮没有多头论证（可能调用失败）"
@@ -89,7 +89,7 @@ export function DebateView({ members }: { members: readonly TeamMemberOutput[] }
           {/* 空头 */}
           <DebateColumn
             title="空头研究员"
-            accent="text-danger"
+            accent="text-down"
             model={bear?.modelId ?? null}
             text={bear?.text ?? null}
             emptyHint="这一轮没有空头论证（可能调用失败）"
@@ -123,7 +123,7 @@ function DebateColumn({
   emptyHint: string;
 }): React.ReactElement {
   return (
-    <div className="min-w-0 rounded border border-line/60 bg-surface-1 p-2">
+    <div className="min-w-0 rounded border border-base-700/60 bg-base-900 p-2">
       <div className="mb-1 flex items-baseline gap-1.5">
         <span className={`text-xs font-medium ${accent}`}>{title}</span>
         {model !== null && model.length > 0 && (

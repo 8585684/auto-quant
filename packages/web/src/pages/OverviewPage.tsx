@@ -736,7 +736,7 @@ function ModeBreakdown({
               <div className="flex items-baseline gap-2">
                 <span className="text-base font-medium text-ink-hi">{g.label}</span>
                 <span className="num text-sm text-ink-soft">{mine.length}</span>
-                {running.length > 0 && <span className="text-xs text-ok">运行中 {running.length}</span>}
+                {running.length > 0 && <span className="text-xs text-up">运行中 {running.length}</span>}
               </div>
               <p className="mt-0.5 text-xs text-ink-faint">{g.hint}</p>
               {mine.length === 0 ? (
@@ -752,7 +752,7 @@ function ModeBreakdown({
                       >
                         <span
                           className={`h-1.5 w-1.5 shrink-0 rounded-full ${
-                            t.status === 'running' ? 'bg-ok' : 'bg-ink-faint/50'
+                            t.status === 'running' ? 'bg-up' : 'bg-ink-faint/50'
                           }`}
                         />
                         <span className="min-w-0 flex-1 truncate text-ink-lo">{t.name}</span>
