@@ -311,6 +311,15 @@ interface TeamModelBuild {
  * partially-open state is left for the next start to reconcile.
  */
 
+/**
+ * 自检的 AI 层单次请求超时（秒）。
+ *
+ * 比团队决策（`TEAM_GATEWAY_TIMEOUT_SECONDS`）短得多：自检是**后台任务**，
+ * 它卡住不该拖过一个检查间隔（默认 30 分钟）——
+ * 一次自检的 AI 层没出结果，确定性层的结果仍然有效。
+ */
+const SELF_CHECK_TIMEOUT_SECONDS = 120;
+
 export class TraderManager {
   private readonly running = new Map<number, AutoTrader>();
   /**
@@ -2482,6 +2491,89 @@ export class TraderManager {
    * 不调模型 —— 于是它**不花额度、不依赖网关**，可以无条件常开。
    * AI 层将来会挂在这个循环上（见 `runSelfCheck` 的 `ask` 参数）。
    */
+  /**
+   * **构造自检的 AI 层**（用户需求 #6 里"AI 自检"的那一半）。
+   *
+   * ## 确定性层与 AI 层的分工
+   *
+   * | 层 | 抓什么 | 需要模型吗 |
+   * |---|---|---|
+   * | 确定性 | 裸奔仓位、连续失败、错误刷屏、实验积压 | **不需要** |
+   * | **AI（本方法）** | **把线索连起来** | 需要 |
+   *
+   * 确定性层只能发现"某一项越过了阈值"。而真实故障往往是**几条线索合起来**
+   * 才成立的，例如：
+   *
+   *   · 降级次数高 **+** 延迟升高 **+** 某个 provider 的错误集中
+   *     → **首选额度可能耗尽了**；
+   *   · 新闻材料为空 **+** 搜索端点 401
+   *     → **搜索密钥过期了**（而不是"市场没消息"）；
+   *   · 团队调用数少于角色数 **+** 某个阶段没有日志
+   *     → **某个角色静默失败了**。
+   *
+   * 这三条都是**我在过去几轮里人工发现的** —— 而用户明确要求
+   * 「不要老让我来测试和发现问题，**你要自己发现问题自己解决**」。
+   *
+   * ## 用 `system_engineer` 这个角色
+   *
+   * 它就是用户理想组织里的「**维护系统的程序员**」——
+   * 组织架构表里此前标着"规划中"，这个方法让它**真的在岗**。
+   *
+   * ## 用 T3（最强档）
+   *
+   * 自检要读日志与数字，而"把几条线索连起来"正是最需要判断力的活。
+   * 它每 30 分钟才跑一次 —— 成本可忽略（用户也说了不用考虑费用）。
+   *
+   * ## 拿不到网关时返回 `undefined`
+   *
+   * 于是自检**退回确定性层**（而不是整体失败）。这是刻意的：
+   * **网关挂掉的时候恰恰最需要自检**，那时更不该因为"AI 层不可用"而什么都不做。
+   */
+  private buildSelfCheckAsk(): ((prompt: string) => Promise<string>) | undefined {
+    let gateway;
+    try {
+      gateway = resolveTeamGateway(process.env);
+    } catch {
+      return undefined;
+    }
+    if (gateway === null) return undefined;
+
+    const router = new ModelRouter({
+      call: createMagpieCallFactory({
+        baseUrl: gateway.baseUrl,
+        apiKey: gateway.apiKey,
+        /*
+         * 自检用**比团队决策更短**的超时与更低的温度：
+         *   · 超时 120 秒 —— 它是后台任务，卡住不该拖过一个间隔；
+         *   · 温度 0.1 —— 这是"读证据下判断"，不是创意写作。
+         */
+        timeoutSeconds: SELF_CHECK_TIMEOUT_SECONDS,
+        maxRetries: 1,
+        temperature: 0.1,
+        pluginProvidersPath: process.env.MAGPIE_PLUGIN_PROVIDERS_PATH ?? null,
+      }),
+    });
+
+    return async (prompt: string): Promise<string> => {
+      const result = await router.callByTier(
+        tierForRole('system_engineer'),
+        [
+          {
+            role: 'system',
+            content:
+              '你是这套自动交易系统的「系统工程师」，负责**从运行证据里发现缺陷**。' +
+              '你的价值在于**把几条线索连起来**看出单一指标看不出的问题。' +
+              '⚠️ 只依据给出的证据，**不要猜测证据里没有的东西** —— ' +
+              '编造出的问题会让人去查一个不存在的地方，那比不报更糟。',
+          },
+          { role: 'user', content: prompt },
+        ],
+        { baseMaxTokens: 2_048 },
+      );
+      return result.text;
+    };
+  }
+
   private startSelfCheckLoop(): void {
     if (this.selfCheckTimer) return;
     /*
@@ -2524,9 +2616,24 @@ export class TraderManager {
        *  那里保证即使被调用也不会误报。）
        */
       const ids = [...this.running.keys()];
+      /*
+       * AI 层**只构造一次**（懒加载）—— 每次扫都新建一个路由器会丢掉
+       * `createMagpieCallFactory` 里的客户端缓存。
+       *
+       * 构造失败（网关读不到）时保持 `undefined`，于是自检退回确定性层 ——
+       * 见 `buildSelfCheckAsk()` 的说明。
+       */
+      if (this.selfCheckAsk === undefined && !this.selfCheckAskTried) {
+        this.selfCheckAskTried = true;
+        this.selfCheckAsk = this.buildSelfCheckAsk();
+        if (this.selfCheckAsk !== undefined) {
+          log.info('自检的 AI 层已就绪（system_engineer 角色）。');
+        }
+      }
+
       for (const id of ids) {
         try {
-          const result = await runSelfCheck(id);
+          const result = await runSelfCheck(id, this.selfCheckAsk === undefined ? {} : { ask: this.selfCheckAsk });
           /*
            * 只在**有非 info 的发现**时写一条汇总 —— 否则每 30 分钟一条
            * "未发现异常"会把日志刷满。
@@ -2561,6 +2668,22 @@ export class TraderManager {
    * 一个间隔（例如机器人很多、日志表很大）。叠起来只会让负载雪上加霜。
    */
   private selfCheckSweepRunning = false;
+
+  /**
+   * 自检的 AI 层（懒构造一次，见 `buildSelfCheckAsk()`）。
+   *
+   * `undefined` = 网关不可用 → 自检只用确定性层。
+   */
+  private selfCheckAsk: ((prompt: string) => Promise<string>) | undefined;
+
+  /**
+   * 是否已经**尝试过**构造 AI 层。
+   *
+   * ⚠️ 必须与 `selfCheckAsk` 分开记 —— 否则"构造失败"（`undefined`）
+   * 会让下一次扫描再试一遍，形成"每 30 分钟重试一次"的隐性循环。
+   * 而网关不可用是**持续性**状态，重试没有意义（它自己恢复时会重启进程）。
+   */
+  private selfCheckAskTried = false;
 
   /**
    * 处于 `error` 且**没有**在运行的机器人 —— 也就是"自动恢复已经放弃"的那一批。

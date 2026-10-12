@@ -61,6 +61,18 @@ export const ROLE_TIERS: Readonly<Record<string, ModelTier>> = {
   bear: 'T3_deep',
   portfolio_manager: 'T3_deep',
   red_team: 'T3_deep',
+  /*
+   * **系统工程师** —— 用户理想组织里点名要的「维护系统的程序员」。
+   *
+   * 由**自检的 AI 层**承担（每 30 分钟读一次运行证据、把线索连起来找缺陷）。
+   * 用 T3 是因为"从日志与数字里看出问题"正是最需要判断力的活。
+   *
+   * ⚠️ 这一条是**被测试逼出来的**：我先把 `FIRM_ROLES` 里的 `system_engineer`
+   * 标成 `staffed`，而路由表里没有它 —— 于是 `tierForRole()` 会静默回退到
+   * T2（能跑，但"在岗"是虚的，且我写的 T3 假设不成立）。
+   * `routedModel.test.ts` 里那条一致性断言当场抓住了它。
+   */
+  system_engineer: 'T3_deep',
 
   /* --- 主要分析工作（T2）--- */
   market_analyst: 'T2_mid',

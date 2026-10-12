@@ -245,10 +245,20 @@ export const FIRM_ROLES: readonly FirmRole[] = [
   {
     id: 'system_engineer',
     label: '系统工程师',
-    duty: '维护程序自身：发现缺陷、提改进（用户需求 #5 的"维护系统的程序员"）',
+    duty: '每 30 分钟读一次运行证据（日志、失败轮次、持仓保护、实验积压），把线索连起来找缺陷',
     department: '技术',
     tier: 'T3_deep',
-    status: 'planned',
+    /*
+     * ⚠️ **2026-10-12 从 `planned` 改为 `staffed`** —— 它真的在岗了。
+     *
+     * 用户理想组织里点名要的「维护系统的程序员」。在此之前这个岗位
+     * 一直标着"规划中"（诚实标注：没有人干这件事）。
+     *
+     * 现在由自检的 AI 层承担：每 30 分钟自动跑一次，用 `system_engineer`
+     * 角色（T3 档）读证据、下判断、留痕。
+     * 见 `trader/selfcheckRunner.ts` 与 `manager.buildSelfCheckAsk()`。
+     */
+    status: 'staffed',
   },
 ];
 
