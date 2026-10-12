@@ -57,6 +57,7 @@ const ROUTES = [
   ['/exchanges', '交易所'],
   ['/account', '账户'],
   ['/data', '数据'],
+  ['/appearance', '外观'],
   ['/faq', 'FAQ'],
 ];
 
