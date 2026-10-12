@@ -378,6 +378,16 @@ export function NewTraderModal({
          *
          * 用 `SectionLabel`（页面里同一个区块标题组件）：标题 + 延伸线，
          * 两套模板下都成立，不是这里临时画的样式。
+         *
+         * ⚠️ 光有标题还不够。用户第二次看的时候说的是「该有的分割线得有」：
+         * 三组之间只有 16px 空白，滚到中间时上一组的最后一个字段和下一组的
+         * 标题在视觉上仍然是一个段落 —— 延伸线只画在标题右侧，管不到组的
+         * 边界。所以第 2、3 组各加一条 `border-t`，让组的起止一眼可辨。
+         *
+         * 颜色必须是 `base-750` 而不是 `base-800`：弹窗底色就是 `base-900`，
+         * 控制台主题下 800 (#1e242c) 和 900 (#1d232b) 只差 1 个色阶，
+         * 实测那条线在屏幕上根本看不见（采样出来就是底色）。750 (#2a323b)
+         * 在主题里的语义正是「弱分隔线」，两套模板下都够看。
          */
         <div className="space-y-4">
           <section className="space-y-3">
@@ -510,7 +520,7 @@ export function NewTraderModal({
             AI 托管**不是一个策略** —— 策略是"一组固定参数"，而 AI 模式的意思是
             "没有固定参数"。所以它是机器人自己的一个属性，在创建时选。
           */}
-          <section className="space-y-3">
+          <section className="space-y-3 border-t border-base-750 pt-4">
             <SectionLabel title="运行方式" className="mb-0" />
           <Field
             label="运行模式"
@@ -573,7 +583,7 @@ export function NewTraderModal({
           </Field>
           </section>
 
-          <section className="space-y-3">
+          <section className="space-y-3 border-t border-base-750 pt-4">
             <SectionLabel title="节奏与本金" className="mb-0" />
           <Field label="周期间隔（分钟）" hint="多久向模型请求一次决策。">
             <NumberInput value={cycleIntervalMinutes} onValueChange={setCycleIntervalMinutes} step={1} />
