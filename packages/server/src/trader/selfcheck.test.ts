@@ -29,6 +29,7 @@ import {
 function healthy(over: Partial<SelfCheckEvidence> = {}): SelfCheckEvidence {
   return {
     windowHours: 6,
+    status: 'running',
     failedCycles: [],
     errorLogsByScope: [],
     warnLogsByScope: [],
@@ -225,4 +226,49 @@ test('★ 解析结果有长度上限（防止把整篇塞进数据库）', () =
   const { findings } = parseAiFindings(long);
   assert.ok((findings[0]?.title.length ?? 0) <= 200, '标题要截断');
   assert.ok((findings[0]?.detail.length ?? 0) <= 600, '证据要截断');
+});
+
+test('★★ 停止的机器人【不能】被报"卡住"（生产实测的误报）', () => {
+  /*
+   * ## 这是真实发生的误报
+   *
+   * 2026-10-12 首次在生产上跑自检，输出是：
+   *
+   * ```
+   *   #9（已停止）: [critical] 已 12873 分钟没有成功决策（643.7 个周期）
+   *   #11（已停止）: [critical] 已 70 分钟没有成功决策（4.7 个周期）
+   * ```
+   *
+   * **停止的机器人当然不会成功决策** —— 那不是故障，是操作员把它关了。
+   * 而这条误报恰好落在最显眼的 critical 上。
+   *
+   * 判据本身没错（"几个周期没成功 = 卡住"），错在**没先看前提**。
+   * 这正是本模块注释里写的风险："误报比漏报更糟 —— 用户开始忽略自检"。
+   */
+  const findings = findDeterministicProblems(
+    healthy({
+      status: 'stopped',
+      cycleIntervalMinutes: 15,
+      minutesSinceLastSuccess: 12_873,
+    }),
+  );
+  assert.equal(
+    findings.filter((f) => f.severity === 'critical').length,
+    0,
+    '★ 停止的机器人不该报 critical',
+  );
+  assert.ok(
+    findings.some((f) => f.title.includes('stopped')),
+    '★ 但要说明"因为不在运行所以不检查"—— 沉默会让人以为检查过了',
+  );
+});
+
+test('★ 运行中的机器人照常检查（修复不能把真问题一起挡掉）', () => {
+  const findings = findDeterministicProblems(
+    healthy({ status: 'running', cycleIntervalMinutes: 15, minutesSinceLastSuccess: 200 }),
+  );
+  assert.ok(
+    findings.some((f) => f.severity === 'critical' && f.title.includes('没有成功决策')),
+    '★ 运行中的机器人卡住必须报',
+  );
 });

@@ -36,6 +36,23 @@
 export interface SelfCheckEvidence {
   /** 统计窗口（小时）。 */
   windowHours: number;
+  /**
+   * 机器人当前状态（`running` / `stopped` / `error` / …）。
+   *
+   * ⚠️ **必须带上它** —— 2026-10-12 生产实测踩到：
+   *
+   * ```
+   *   #9（已停止）: [critical] 已 12873 分钟没有成功决策（643.7 个周期）
+   *   #11（已停止）: [critical] 已 70 分钟没有成功决策（4.7 个周期）
+   * ```
+   *
+   * **停止的机器人当然不会成功决策** —— 那不是故障，是操作员把它关了。
+   * 而这条误报恰好落在最显眼的 critical 上。
+   *
+   * 这是本模块自己在注释里写的那个风险（"误报比漏报更糟 —— 用户开始忽略自检"）
+   * 的**真实实例**：判据本身没错，错在**没先看前提**。
+   */
+  status: string;
   /** 窗口内的失败决策轮次（含错误摘要）。 */
   failedCycles: Array<{ cycleNumber: number; error: string; at: string }>;
   /** 窗口内的错误级日志（按 scope 归类后的计数）。 */
@@ -101,7 +118,22 @@ export function findDeterministicProblems(e: SelfCheckEvidence): DeterministicFi
   }
 
   /* ② 长时间没有成功决策 —— 用**周期倍数**判断，避免长周期机器人被误报。 */
-  if (e.minutesSinceLastSuccess !== null && e.cycleIntervalMinutes > 0) {
+  /*
+   * ⚠️ **先看前提：机器人得在跑**（生产实测踩到的误报）。
+   *
+   * 停止的机器人当然不会成功决策 —— 那不是故障，是操作员把它关了。
+   * 第一版没加这个前提，于是两个已停止的机器人各报了一条 critical。
+   */
+  const isRunning = e.status === 'running';
+  if (!isRunning && e.minutesSinceLastSuccess !== null) {
+    out.push({
+      severity: 'info',
+      title: `机器人当前是「${e.status}」—— 不检查"是否卡住"`,
+      detail: `距上次成功 ${Math.round(e.minutesSinceLastSuccess)} 分钟，但机器人不在运行，那不算异常。`,
+      nextStep: '无需处理（要让它干活就启动它）',
+    });
+  }
+  if (isRunning && e.minutesSinceLastSuccess !== null && e.cycleIntervalMinutes > 0) {
     const ratio = e.minutesSinceLastSuccess / e.cycleIntervalMinutes;
     if (ratio >= 3) {
       out.push({

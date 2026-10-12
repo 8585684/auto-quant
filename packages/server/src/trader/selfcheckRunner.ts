@@ -119,6 +119,7 @@ export function collectEvidenceFromDb(traderId: number, windowHours = DEFAULT_WI
 
   return {
     windowHours,
+    status: trader?.status ?? 'unknown',
     failedCycles,
     errorLogsByScope,
     warnLogsByScope,
