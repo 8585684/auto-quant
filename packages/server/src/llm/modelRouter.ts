@@ -278,6 +278,19 @@ export class ModelRouter {
             continue;
           }
 
+          /*
+           * ⚠️ **`endpoint_down` 是【供应商级】事实，要熔断整个供应商**
+           *（2026-10-12 实测：T1 前 5 位全是同一家已耗尽额度的供应商，
+           *  各失败 1 次都不到冷却阈值 → 每轮白烧 4 次调用）。
+           *
+           * 判据：`endpoint is unavailable` / `insufficient` / `credits exhausted`
+           * 说的都是**那家供应商的账或端点**，不是某个模型坏了。
+           *
+           * 详见 `ModelHealthRegistry.recordProviderFailure`。
+           */
+          if (verdict.kind === 'endpoint_down') {
+            this.health.recordProviderFailure(modelId, verdict.reason, ladder);
+          }
           this.health.recordFailure(modelId, verdict.reason);
           previousModel = modelId;
           continue;

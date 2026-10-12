@@ -596,3 +596,42 @@ test('★ 模型没报上限时，重试预算原样使用（不猜）', () => {
   } as ModelProfile;
   assert.equal(retryBudgetFor(noMeta, 8_192, 4_096), 8_192, '没上限就别夹');
 });
+test('★★★ 一家供应商额度耗尽 → 熔断它的【全部】模型（实测 T1 试 4 个全撞同一家）', () => {
+  /*
+   * ## 实测缺陷（2026-10-12）
+   *
+   * `T1_fast` 档试了 **4 个模型全失败**：
+   *
+   * ```
+   *   [analysis] sentiment：失败：档位 T1_fast 试了 4 个模型都失败：
+   *              workbuddy-ai/deepseek-v4.1-flash-…
+   * ```
+   *
+   * 根因：T1 候选链前 5 位**全是 `workbuddy-ai`** —— 而那家**额度已耗尽**
+   *（自检早先报过 `WorkBuddy AI: Credits exhausted`）。
+   *
+   * 为什么原来的 `recordFailure` 拦不住：它要**连续失败**达到阈值才冷却，
+   * 而这 5 个模型**各失败 1 次**就换下一个 —— 谁都没到阈值 →
+   * **永远不冷却**，每轮都把那 4 次调用浪费在同一家死掉的供应商上。
+   *
+   * ## 判据
+   *
+   * "credits exhausted" 说的是**那家供应商的账**，不是某个模型坏了 ——
+   * 所以同前缀的模型应当**一起**进入冷却。
+   */
+  const registry = new ModelHealthRegistry();
+  /* 先让这几个模型被登记（`pickAvailable` 会创建条目）。 */
+  const ladder = ['workbuddy-ai/a', 'workbuddy-ai/b', 'workbuddy-ai/c', 'other-ai/d'];
+
+  /* 一家额度耗尽。 */
+  const affected = registry.recordProviderFailure('workbuddy-ai/a', 'Credits exhausted', ladder);
+
+  assert.ok(affected >= 3, `★ 应当熔断该供应商的至少 3 个模型（实际 ${affected}）`);
+
+  /* 同供应商的都被熔断。 */
+  for (const id of ['workbuddy-ai/a', 'workbuddy-ai/b', 'workbuddy-ai/c']) {
+    assert.equal(registry.isAvailable(id), false, `★ ${id} 应当已被熔断`);
+  }
+  /* 别家不受影响 —— 否则一次额度耗尽会把整个路由掐死。 */
+  assert.equal(registry.isAvailable('other-ai/d'), true, '★ 别家供应商不该被牵连');
+});

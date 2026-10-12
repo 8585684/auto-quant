@@ -287,6 +287,70 @@ export class ModelHealthRegistry {
   }
 
   /**
+   * **按供应商记一次失败**（2026-10-12 实测补上）。
+   *
+   * ## 为什么必须区分"供应商级"与"模型级"
+   *
+   * 实测（`#11` 团队模式）：`T1_fast` 档试了 **4 个模型全失败**：
+   *
+   * ```
+   *   [analysis] sentiment：失败：档位 T1_fast 试了 4 个模型都失败：
+   *              workbuddy-ai/deepseek-v4.1-flash-…
+   * ```
+   *
+   * 根因：T1 候选链前 5 位**全是 `workbuddy-ai`** —— 而那家**额度已耗尽**
+   *（自检早先报过 `WorkBuddy AI: Credits exhausted`）。
+   *
+   * 为什么 `recordFailure` 拦不住：它要**连续失败**达到 `failureThreshold`
+   * 才冷却，而这 5 个模型**各失败 1 次**就换下一个 —— 谁都没到阈值，
+   * 于是**永远不冷却**，每一轮都把那 4 次调用浪费在同一家死掉的供应商上。
+   *
+   * ## 判据：额度/配额是**供应商级**事实
+   *
+   * "credits exhausted" 说的是**那家供应商的账**，不是某个模型坏了 ——
+   * 所以同前缀的模型应当**一起**进入冷却。
+   *
+   * ⚠️ 前缀只取第一个 `/` 之前（`workbuddy-ai/deepseek-v4.1-flash` →
+   * `workbuddy-ai`）—— 那是本项目里供应商的标识方式。
+   *
+   * @returns 被一起冷却的模型数（含自己）
+   */
+  recordProviderFailure(
+    modelId: string,
+    reason: string,
+    /**
+     * **该档位的完整候选链**（调用方给）。
+     *
+     * ⚠️ 必须传它 —— 实测踩到：注册表里的条目是**按需创建**的
+     *（`isAvailable` 是纯读、不创建），所以一家供应商的其它模型
+     * **可能根本不在 `entries` 里**，只遍历 `entries` 会**一个都找不到**。
+     */
+    candidates: readonly string[] = [],
+  ): number {
+    const slash = modelId.indexOf('/');
+    if (slash <= 0) return 0;
+    const provider = modelId.slice(0, slash);
+
+    /* 候选链 ∪ 已登记的条目 —— 两处都要看，缺一个都会漏。 */
+    const ids = new Set<string>([...candidates, ...this.entries.keys()]);
+
+    let affected = 0;
+    for (const id of ids) {
+      if (!id.startsWith(`${provider}/`)) continue;
+      const e = this.entry(id);
+      /*
+       * **直接跳到冷却**，不走 `failureThreshold` ——
+       * 因为这是"账上没钱了"，不是"这个模型抖动了一下"。
+       */
+      e.consecutiveFailures = Math.max(e.consecutiveFailures, this.failureThreshold);
+      e.cooldownUntil = this.now() + this.cooldownMs;
+      e.lastFailure = reason;
+      affected += 1;
+    }
+    return affected;
+  }
+
+  /**
    * 现在能不能用它。
    *
    * ⚠️ **纯读，无副作用** —— 这一点很重要：`pickAvailable` 会在**每次失败之间**
