@@ -321,34 +321,68 @@ export async function runTradingDesk(input: {
   let bear: DeskRoleOutput | null = null;
 
   for (let round = 0; round < limits.maxDebateRounds; round += 1) {
-    if (!canAsk()) {
+    /*
+     * ⚠️ **bull 与 bear 【并行】**（2026-10-12 实测：原来串行白白多花一份时间）。
+     *
+     * ## 为什么可以并行（这是有前提的，不是随手改）
+     *
+     * 两者拿到的是**同一份 `debateMaterial`** —— 它在上面的循环之外算好，
+     * **不包含** bull 或 bear 自己的产出。也就是说：
+     *
+     * ```
+     *   bull 的输入 ──┐
+     *                 ├── 都只依赖 debateMaterial（互不依赖）
+     *   bear 的输入 ──┘
+     * ```
+     *
+     * 既然谁都不需要等谁，串行执行就只是**白等一份时间**。
+     *
+     * ## 实测动机
+     *
+     * 整轮耗时在 **341–817 秒**之间波动（5.7–13.6 分钟），而辩论段是
+     * **两个 T3 调用串行** —— T3 是最慢的档位。并行后这一段从
+     * `t_bull + t_bear` 变成 `max(t_bull, t_bear)`。
+     *
+     * ## 预算的记账方式（改了但语义不变）
+     *
+     * 原来每问一个角色就 `callsUsed += 1` 并检查一次 `canAsk()`。
+     * 并行时**先检查"两个都问得起吗"**，再一起问 —— 于是
+     * `callsUsed` 的最终值与原来完全一致（都是 +2），只是**检查点提前**了。
+     *
+     * 边界：预算只剩 1 次时，原来会问 bull、然后 `canAsk()` 失败而跳过 bear；
+     * 现在**两个都不问**并标记 `truncatedByBudget`。这个差别是刻意的 ——
+     * 只有 bull 一份论证会让裁决官**只听到一方**，
+     * 而调研明确指出"单边论证"是谄媚与偏见最典型的入口（arXiv:2509.23055）。
+     * **宁愿不带论证下去裁决，也不要只带一方的。**
+     */
+    if (callsUsed + 2 > limits.maxCalls) {
       truncatedByBudget = true;
-      note('supervisor', 'debate', '预算用尽，提前结束辩论');
+      note('supervisor', 'debate', '预算不足以同时问多空双方 —— 跳过辩论（不制造单边论证）');
       break;
     }
-    callsUsed += 1;
-    note('bull', 'debate', `第 ${round + 1} 轮：构建做多论证`);
-    bull = await safeAsk(input.ask, {
-      role: 'bull',
-      tier: 'T3_deep',
-      context: debateMaterial,
-      task: '为做多构建**最强**论证，并明确写出你的失效条件（什么情况下这个论证不成立）。',
-    });
 
-    if (!canAsk()) {
-      truncatedByBudget = true;
-      break;
-    }
-    callsUsed += 1;
+    callsUsed += 2;
+    note('bull', 'debate', `第 ${round + 1} 轮：构建做多论证`);
     note('bear', 'debate', `第 ${round + 1} 轮：构建做空/不行动论证`);
-    bear = await safeAsk(input.ask, {
-      role: 'bear',
-      tier: 'T3_deep',
-      context: debateMaterial,
-      task:
-        '为做空或**不行动**构建**最强**论证，并明确写出失效条件。' +
-        '注意：**"现在不交易"是一个合法的结论**，不要为了给出观点而硬找理由。',
-    });
+
+    const [bullOut, bearOut] = await Promise.all([
+      safeAsk(input.ask, {
+        role: 'bull',
+        tier: 'T3_deep',
+        context: debateMaterial,
+        task: '为做多构建**最强**论证，并明确写出你的失效条件（什么情况下这个论证不成立）。',
+      }),
+      safeAsk(input.ask, {
+        role: 'bear',
+        tier: 'T3_deep',
+        context: debateMaterial,
+        task:
+          '为做空或**不行动**构建**最强**论证，并明确写出失效条件。' +
+          '注意：**"现在不交易"是一个合法的结论**，不要为了给出观点而硬找理由。',
+      }),
+    ]);
+    bull = bullOut;
+    bear = bearOut;
   }
 
   /* ── ③ 裁决：唯一裁决者（P1）──────────────────────────────────────── */
