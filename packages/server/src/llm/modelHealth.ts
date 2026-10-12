@@ -107,7 +107,31 @@ export function classifyFailure(input: {
   }
 
   /* ③ 端点不可用 / 额度尽 —— 实测 magpie 用 429 表达它。 */
-  if (/endpoint is unavailable|not an available free model|insufficient|quota|allowance|余额|额度/i.test(lower)) {
+  /*
+   * ⚠️ **`credit` / `exhaust` 是 2026-10-12 补的** —— 实测漏判过。
+   *
+   * 自检的 AI 层（每 30 分钟跑一次）报出：
+   *
+   * ```
+   *   [自检/ai] AI 层调用失败：WorkBuddy AI: Credits exhausted.
+   *   Please visit the link below to purchase add-on packs and get more credits
+   * ```
+   *
+   * 这句话里**没有** `quota` / `insufficient` / `额度` 任何一个词 ——
+   * 于是判据把它归到"不认识"的一类，**没有触发换模型**，
+   * 整个调用就这么失败了。
+   *
+   * 后果比"一次调用失败"更大：那个供应商的模型会**一直**被选中、
+   * **一直**失败，直到有人去看日志。而这正是 `ModelRouter` 的降级链
+   * 本该解决的问题（`maxFallbacks: 3`）。
+   *
+   * 补上 `credit` 与 `exhaust` 之后，这句话会被正确识别成"额度尽" → 换下一个候选。
+   */
+  if (
+    /endpoint is unavailable|not an available free model|insufficient|quota|allowance|余额|额度|credit|exhaust/i.test(
+      lower,
+    )
+  ) {
     return {
       kind: 'endpoint_down',
       shouldFallback: true,

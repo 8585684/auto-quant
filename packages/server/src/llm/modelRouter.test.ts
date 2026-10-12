@@ -470,3 +470,38 @@ test('★ 空的发现结果不覆盖静态档案（空数组不等于"没有可
   const r = await router.callByTier('T1_fast', [{ role: 'user', content: 'x' }], { baseMaxTokens: 128 });
   assert.ok(r.modelId.length > 0, '空发现结果应回退档案');
 });
+test('★★ "Credits exhausted" 必须触发降级（自检 AI 层报出的实测缺陷）', () => {
+  /*
+   * ## 这是自检的 AI 层报出来的真实缺陷（2026-10-12）
+   *
+   * 自检每 30 分钟跑一次，它的 AI 层报：
+   *
+   * ```
+   *   [自检/ai] AI 层调用失败：WorkBuddy AI: Credits exhausted.
+   *   Please visit the link below to purchase add-on packs and get more credits
+   * ```
+   *
+   * 这句话里**没有** `quota` / `insufficient` / `额度` 任何一个词 ——
+   * 于是判据没认出来，**没有换模型**，调用就这么失败了。
+   *
+   * 后果比"一次失败"更大：那个供应商的模型会**一直**被选中、**一直**失败，
+   * 直到有人去看日志 —— 而这正是降级链本该解决的问题。
+   */
+  const v = classifyFailure({
+    status: 200,
+    message:
+      'WorkBuddy AI: Credits exhausted. Please visit the link below to purchase add-on packs and get more credits',
+  });
+  assert.equal(v.shouldFallback, true, '★ 额度耗尽必须换下一个候选');
+  assert.equal(v.shouldRetry, false, '重试同一个模型没用（额度不会自己回来）');
+});
+
+test('★ "exhausted" 单独出现也要能识别', () => {
+  assert.equal(classifyFailure({ status: 429, message: 'monthly allowance exhausted' }).shouldFallback, true);
+});
+
+test('★ 已有的额度判据没被破坏（回归）', () => {
+  for (const msg of ['insufficient balance', 'quota exceeded', '额度已尽', 'endpoint is unavailable']) {
+    assert.equal(classifyFailure({ status: 429, message: msg }).shouldFallback, true, `「${msg}」应当触发降级`);
+  }
+});
