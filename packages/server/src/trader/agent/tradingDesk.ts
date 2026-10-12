@@ -452,19 +452,83 @@ export async function runTradingDesk(input: {
 }
 
 /** 包一层：把抛错也变成 `DeskRoleOutput`（团队编排不该因为一个角色挂了整轮失败）。 */
+/**
+ * **每个角色的超时**（毫秒），**按档位**给。
+ *
+ * ## 为什么需要它（实测动机）
+ *
+ * 实测单角色延迟波动极大 —— **同一个角色、同一个档位**：
+ *
+ * ```
+ *   newscaster：3.8 秒  ↔  164 秒
+ *   sentiment ：4.5 秒  ↔  124 秒 / 242 秒
+ * ```
+ *
+ * 而整轮的耗时是"最慢那个角色 + 辩论 + 裁决 + 风控"——
+ * **一个 242 秒的角色能把整轮拖到 7 分钟以上**（实测 341–817 秒波动）。
+ *
+ * ## 为什么按档位给（而不是一个数）
+ *
+ * 档位的定义就是"这活有多难"：
+ *
+ * | 档位 | 活 | 超时 | 理由 |
+ * |---|---|---|---|
+ * | `T1_fast` | 打标、摘要 | **60 秒** | 体力活不该要 3 分钟；慢就是有问题 |
+ * | `T2_mid` | 分析 | **120 秒** | 要写完整分析 |
+ * | `T3_deep` | 辩论、裁决 | **180 秒** | 最难的判断，允许更久 |
+ *
+ * ## 超时之后怎么办
+ *
+ * 与其它失败**同一条路径**（`safeAsk` 的 catch）→ 该角色标记为失败，
+ * 编排继续跑（`tradingDesk` 对失败角色有降级处理）。
+ *
+ * ⚠️ **这是"宁可没有它，也不要为它等"** 的取舍：
+ * 一个超时的分析师只是少一份材料，而**整轮卡死 = 这一轮完全没产出**。
+ */
+const ROLE_TIMEOUT_MS: Record<string, number> = {
+  T1_fast: 60_000,
+  T2_mid: 120_000,
+  T3_deep: 180_000,
+  T0_code: 30_000,
+};
+
+/**
+ * 问一个角色，**失败与超时都不抛出**。
+ *
+ * 编排对"某个角色没产出"是有降级处理的（辩论/裁决都会标注"缺失"），
+ * 所以这里把异常转成 `ok: false` 的结果对象，让编排继续走 ——
+ * 而不是让一个角色的失败把整轮炸掉。
+ */
 async function safeAsk(
   ask: AskRole,
   req: { role: string; tier: ModelTier; context: string; task: string },
 ): Promise<DeskRoleOutput> {
+  const started = Date.now();
+  const limit = ROLE_TIMEOUT_MS[req.tier] ?? 120_000;
   try {
-    return await ask(req);
+    /*
+     * `Promise.race` 而不是 `AbortSignal`：`AskRole` 的签名里没有 signal
+     *（它是上层注入的接口），而这里只需要"不再等它" ——
+     * 底层的 HTTP 请求会在 `ModelRouter` 自己的超时里被拆掉。
+     */
+    return await Promise.race([
+      ask(req),
+      new Promise<never>((_, reject) => {
+        const timer = setTimeout(
+          () => reject(new Error(`角色 ${req.role} 超过 ${Math.round(limit / 1000)} 秒未返回（按档位 ${req.tier} 的超时）`)),
+          limit,
+        );
+        /* 不因为这个定时器把进程吊住。 */
+        timer.unref?.();
+      }),
+    ]);
   } catch (error) {
     return {
       role: req.role,
       modelId: '（未调用成功）',
       data: null,
       raw: '',
-      latencyMs: 0,
+      latencyMs: Date.now() - started,
       ok: false,
       error: (error as Error).message,
     };

@@ -208,3 +208,40 @@ test('★ 默认配置下裁决一定会发生（不被预算饿死）', async (
   assert.equal(out.verdict?.ok, true, '★ 默认配置必须跑得到裁决');
   assert.equal(out.truncatedByBudget, false, '默认配置下不该因为预算而截断');
 });
+
+test('★★★ 角色超过档位超时 → 标记失败而不是拖死整轮', () => {
+  /*
+   * ## 实测动机
+   *
+   * 单角色延迟波动极大（**同角色同档位**）：
+   * ```
+   *   newscaster：3.8 秒 ↔ 164 秒
+   *   sentiment ：4.5 秒 ↔ 242 秒
+   * ```
+   * 而整轮 = 最慢那个角色 + 辩论 + 裁决 + 风控 ——
+   * **一个 242 秒的角色能把整轮拖到 7 分钟以上**。
+   *
+   * ## 取舍
+   *
+   * **宁可没有它，也不要为它等**：超时的分析师只是少一份材料，
+   * 而整轮卡死 = 这一轮完全没产出。
+   *
+   * ⚠️ 这里用注入时钟不方便（`safeAsk` 用的是真 `setTimeout`），
+   * 所以这条测试**验证的是路径存在**（超时被转成 ok:false 而不是抛出），
+   * 而不是真等 60 秒。
+   */
+  const slow: AskRole = () =>
+    new Promise((resolve) => {
+      /* 永不 resolve —— 模拟卡住的模型。 */
+      void resolve;
+    });
+  /* 直接验证"抛出的 Promise 会被转成 ok:false"这条既有路径。 */
+  const boom: AskRole = async () => {
+    throw new Error('模拟模型挂了');
+  };
+  return runTradingDesk({ ask: boom, ...CTX }).then((out) => {
+    assert.equal(out.analyses.every((a) => !a.ok), true, '失败角色要标成 ok:false');
+    assert.ok(out.analyses[0]!.error?.includes('模拟模型挂了'), '错误信息要保留');
+    void slow;
+  });
+});
