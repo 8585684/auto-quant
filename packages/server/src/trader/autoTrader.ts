@@ -2562,6 +2562,32 @@ export class AutoTrader {
       preferred: [...consensusSymbols, ...watched],
       /* 候选池的大小直接由它决定 —— 见构造函数里 `promptBudget` 的说明。 */
       budgetTokens: this.promptBudget,
+      /*
+       * ── **漏斗每层的淘汰写进日志**（2026-10-12 接线）──────────────────────
+       *
+       * 用户的要求：
+       * > 「交易所有 500 个可以交易的币……**层层筛选**」
+       *
+       * 而"层层筛选"要真的有用，操作员必须能回答一个问题：
+       * **「我的币为什么没被看到？」**
+       *
+       * 若不写日志，漏斗就是一个**黑盒** —— 用户看到候选池里只有 8 个标的，
+       * 却不知道那 8 个是怎么从 500 个里选出来的、更不知道自己关心的那个
+       * 死在哪一层。那正是"感觉不是给人看的"。
+       *
+       * 只在 `funnel` 模式下会触发（另两种模式走 `coinpool`，不传这个回调）。
+       */
+      onFunnelReport: (stages, survivors) => {
+        const detail = stages
+          .map((s) => `${s.name}: ${s.input}→${s.output}（淘汰 ${s.dropped}）`)
+          .join(' · ');
+        /*
+         * ⚠️ 用 `this.emit()` 而不是 `runtimeLogs.write()` —— 见 `emit()` 的说明：
+         * **只走 logger 这一条路径**，否则一条日志会变成两条库记录加两个前端事件
+         *（界面上同一句话出现两遍），而且归属还对不上。
+         */
+        this.emit('info', `[漏斗] ${detail} · 最终 ${survivors} 个候选`);
+      },
     });
 
     let snapshots = await this.deps.marketData.buildSnapshots(
