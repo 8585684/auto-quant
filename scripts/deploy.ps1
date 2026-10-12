@@ -370,6 +370,55 @@ LOGCONF
 fi
 
 #
+# ⚠️ **给"跑完在途那一轮"留够时间**（用户要求的"两全其美"）。
+#
+# ## 问题
+#
+# 用户的原话：
+#
+# > 「你改代码的时候（提交更新部署代码到服务器后，服务器会重启对吧，
+# >  这时候运行中的机器人会被停止-启动……**这个你得自己看着修**……
+# >  应该是**两全其美**」
+#
+# 实测证据（生产日志）：
+#
+# ```
+#   01:08:33  停止时上一轮决策未在时限内结束，可能留下未挂保护单的仓位
+#   01:08:41  机器人已启动（实盘）      ← 部署在 01:08 打断了一轮决策
+# ```
+#
+# 一轮跑到"入场已成交、保护单还没挂"时被掐掉 → 循环也停了 →
+# **没有任何人会去补那张保护单**，直到下次启动对账。中间就是**裸奔窗口**。
+#
+# ## 修法（两侧都要改，缺一不可）
+#
+# | 侧 | 改动 |
+# |---|---|
+# | 应用 | `stop(persist=false)` **不掐断**在途轮次，最多等 `SHUTDOWN_DRAIN_TIMEOUT_MS`（3 分钟）|
+# | systemd | `TimeoutStopSec` 从默认 **90 秒** 提到 **210 秒** |
+#
+# ⚠️ **只改应用是没用的**：systemd 在 90 秒就 SIGKILL，
+# 那 3 分钟的等待**永远等不到**（实测 `TimeoutStopUSec=1min 30s`）。
+#
+# 210 秒 = 应用的 3 分钟 + 30 秒余量（留给进程收尾）。
+#
+# 为什么可以这么长：部署时**没人在等**（不像操作员点停止）。
+# 而"操作员点停止"那条路径仍然是 60 秒 + 立刻掐断 —— 快的那条没变。
+TIMEOUTUNIT=/etc/systemd/system/autoquant.service.d/timeout.conf
+if ! grep -q "TimeoutStopSec=210" "`$TIMEOUTUNIT" 2>/dev/null; then
+    mkdir -p /etc/systemd/system/autoquant.service.d
+    cat > "`$TIMEOUTUNIT" <<'TIMECONF'
+[Service]
+# 见 deploy.ps1 的说明：让部署重启时"跑完在途那一轮"，
+# 避免掐断在"入场已成交、保护单未挂"的窗口里（裸奔仓位）。
+# 应用侧上限是 3 分钟，这里给 210 秒（3 分钟 + 30 秒收尾余量）。
+TimeoutStopSec=210
+TIMECONF
+    systemctl daemon-reload
+    echo "    已配置停机超时 210 秒（drop-in）"
+fi
+
+#
 # ⚠️ **强制 Node 用 IPv4 —— 这台服务器的 IPv6 没有路由。**
 #
 # 2026-10-07 实测事故：机器人连续多轮 `Cannot reach opencode: fetch failed`，
