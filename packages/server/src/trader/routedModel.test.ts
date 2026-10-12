@@ -12,6 +12,7 @@ import test from 'node:test';
 import { ModelRouter, type CallModel } from '../llm/modelRouter.js';
 import { ROLE_TIERS, createRoutedDecisionModel, tierForRole } from './routedModel.js';
 import { looksLikeMagpieGateway } from './magpieGateway.js';
+import { FIRM_ROLES, firmRoleOf } from '@aq/shared';
 
 /* -------------------------------------------------------------------------- */
 /*  角色 → 档位映射（"每个智能体用什么模型"的机器表达）                          */
@@ -162,4 +163,48 @@ test('★ 能识别 magpie 网关（判据是 baseUrl，不需要用户多勾一
   assert.equal(looksLikeMagpieGateway('http://127.0.0.1:3425/mcp/magpie/web-search'), true);
   assert.equal(looksLikeMagpieGateway('https://api.deepseek.com'), false);
   assert.equal(looksLikeMagpieGateway(''), false);
+});
+
+/* -------------------------------------------------------------------------- */
+/*  组织架构与路由表的一致性（防"看不见的角色"）                                 */
+/* -------------------------------------------------------------------------- */
+
+test('★★ 路由表里的每个角色都必须在组织架构里有定义（否则界面上看不见它）', () => {
+  /*
+   * ## 为什么这条测试重要
+   *
+   * 两张表分别在两个包里：
+   *   · `ROLE_TIERS`（本包）—— 决定"每个角色用哪个档位的模型"；
+   *   · `FIRM_ROLES`（`@aq/shared`）—— 决定"界面上有哪些角色、各自负责什么"。
+   *
+   * 服务端加了新角色、界面不显示 → **操作员看不见有人在干活**。
+   * 那正是用户反复要求的"看得见系统在做什么"的反面，而且很难被发现
+   * （毕竟系统功能是好的，只是没显示）。
+   */
+  const missing = Object.keys(ROLE_TIERS).filter((id) => firmRoleOf(id) === undefined);
+  assert.deepEqual(missing, [], `★ 这些角色在路由表里但组织架构里没有：${missing.join(', ')}`);
+});
+
+test('★ 组织架构里标 `staffed` 的角色都应当在路由表里有档位', () => {
+  /*
+   * 反方向的漂移：界面上写着"在岗"，而路由表不知道该给它什么档位 ——
+   * 那会让 `tierForRole()` 回退到 T2（能跑，但"在岗"是虚的）。
+   */
+  const unrouteable = FIRM_ROLES
+    .filter((r) => r.status === 'staffed')
+    .filter((r) => !(r.id in ROLE_TIERS))
+    .map((r) => r.id);
+  assert.deepEqual(unrouteable, [], `★ 这些角色标了在岗但路由表里没有：${unrouteable.join(', ')}`);
+});
+
+test('★ 组织架构的每个角色都有中文名与职责说明（界面要显示）', () => {
+  for (const r of FIRM_ROLES) {
+    assert.ok(r.label.length > 0, `★ 角色 ${r.id} 没有中文名`);
+    assert.ok(r.duty.length > 8, `★ 角色 ${r.id} 的职责说明太短（界面要显示"它在做什么"）`);
+  }
+});
+
+test('★ 组织架构里没有重复的角色 id', () => {
+  const ids = FIRM_ROLES.map((r) => r.id);
+  assert.equal(new Set(ids).size, ids.length, '有重复的角色 id');
 });

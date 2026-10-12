@@ -142,6 +142,7 @@ import { exchangeErrorLabel, type DecisionRecord, type Decision, type ExecutionL
 import { api, type MarketSymbol } from '../lib/api';
 import { useLiveCycle, useEvents, type LiveCycle } from '../lib/store';
 import { TeamRoster } from './TeamRoster';
+import { FirmRoster } from './FirmRoster';
 import { FeedErrorBoundary } from './FeedErrorBoundary';
 import { parseTeamTrace } from '../lib/teamTrace';
 import { DebateView } from './DebateView';
@@ -927,6 +928,37 @@ export function DecisionFeed({
               steps={liveCycle.steps}
               cycleNumber={liveCycle.cycleNumber}
               startedAt={liveCycle.startedAt}
+            />
+          )}
+          {/*
+            **组织架构**（用户 2026-10-12 要求「看板应该直观显示**有哪些智能体、
+            都是什么分工**」）。
+
+            与 `TeamRoster` 的分工：
+              · `TeamRoster`  —— **这一轮**谁在干什么（实时）；
+              · `FirmRoster`  —— **这家公司有哪些岗位**（参考材料，默认收起）。
+
+            两者都需要，因为只看实时看不出"还有哪些岗位没人干"——
+            而那正是用户列理想组织时的关切（社区监控、系统工程师等）。
+
+            ⚠️ **只在团队模式渲染**：另两种模式没有"团队编制"这个概念，
+            给它们显示组织架构是**语义错误**（用户要求三种模式的看板分开）。
+          */}
+          {mode === 'ai_team' && (
+            <FirmRoster
+              activeRoles={
+                new Set(
+                  /*
+                   * ⚠️ 显式取值而不是直接 `.role`：`liveCycle.steps` 的**声明类型**
+                   * 只有 `{ at, level, message }` —— `role`/`phase` 是团队模式才推的
+                   * 字段（见 `store.ts` 的 `cycle_step` 摄入分支）。
+                   * 直接访问过不了类型检查，而运行时它们确实存在。
+                   */
+                  (liveCycle?.steps ?? [])
+                    .map((s) => (s as { role?: string | null }).role)
+                    .filter((r): r is string => typeof r === 'string'),
+                )
+              }
             />
           )}
           {showLive && liveCycle && mode !== 'ai_team' && (
