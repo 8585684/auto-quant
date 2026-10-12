@@ -306,7 +306,18 @@ export function createTeamDecisionModel(options: {
    * 用户 2026-10-12 的要求：「总管委派子代理去做市场调研（查新闻、各大交易所社区、
    * 社交媒体、新闻源等等）根据资料反馈给相应的智能体做处理」。
    */
-  research?: (symbols: readonly string[]) => Promise<string>;
+  /**
+   * 调研：**可以只返回文本，也可以返回文本 + 可选情报键**。
+   *
+   * ⚠️ 为什么要返回 `keys`（而不是让调用方从文本里抽）：
+   * 裁决官要"标注这条决策依据了哪几条情报"，而**校验它没编造**
+   * 需要"这次真的给过它哪些键"。若调用方从文本里正则抽，
+   * **抽错了是静默的** —— 于是归因链会记下错的键（见 `attribution.ts`）。
+   *
+   * 返回 `string` 仍然支持（旧行为）—— 那时没有可选键，
+   * 裁决官**不标注**，而不是猜。
+   */
+  research?: (symbols: readonly string[]) => Promise<string | { text: string; keys: string[] }>;
 }): DecisionModel {
   const { router, onStep, baseMaxTokens, limits, research } = options;
 
@@ -396,11 +407,33 @@ export function createTeamDecisionModel(options: {
        *（角色需要知道输出格式与纪律，见下面 `marketContext` 的拼装）。
        */
       let newsContext = '';
+      /*
+       * **本次调研给出的"可选情报键"**（2026-10-12）——
+       * 裁决官只能从这里面标注依据，`filterKnownIntelKeys` 也用它做校验。
+       *
+       * ⚠️ 为什么必须是"这次真的给过它的"：模型可能编一个不存在的键，
+       * 而编造的键**永远只有 1 个样本** → 失效检测对它永不生效，
+       * 且会让归因数据看起来比实际更丰富（见 `attribution.ts` 的说明）。
+       */
+      let availableIntelKeys: string[] = [];
       if (research !== undefined) {
         try {
           onStep?.({ role: 'supervisor', phase: 'dispatch', note: '派出调研员联网搜索新闻与情绪' });
-          const researchText = await research(symbolsFromPrompt(userPrompt));
-          newsContext = researchText;
+          const r = await research(symbolsFromPrompt(userPrompt));
+          /*
+           * 兼容两种返回形状：
+           * · `string` —— 旧行为（纯文本），此时没有可用键（**不标注**，不猜）；
+           * · `{ text, keys }` —— 新行为，带上"可选键"。
+           *
+           * ⚠️ **不能用"从文本里正则抽键"来兼容旧形状** ——
+           * 那等于让调用方猜，而猜错的后果是静默的（见上）。
+           */
+          if (typeof r === 'string') {
+            newsContext = r;
+          } else {
+            newsContext = r.text;
+            availableIntelKeys = r.keys;
+          }
         } catch (error) {
           /* 调研这一层失败不该让整轮失败 —— 行情数据仍是好的。 */
           onStep?.({ role: 'supervisor', phase: 'dispatch', note: `调研失败：${(error as Error).message}` });
@@ -417,6 +450,8 @@ export function createTeamDecisionModel(options: {
          */
         marketContext: `${userPrompt}\n\n---\n\n## 团队需要遵守的规则（来自交易循环）\n${systemPrompt}`,
         newsContext,
+        /* 本次调研给出的可选情报键 —— 裁决官只能从这里面标注（见 esearch 的说明）。 */
+        availableIntelKeys,
         positionContext: '',
         ...(onStep ? { onStep } : {}),
         ...(limits ? { limits } : {}),

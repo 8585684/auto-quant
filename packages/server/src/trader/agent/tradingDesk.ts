@@ -184,6 +184,14 @@ export async function runTradingDesk(input: {
   ask: AskRole;
   marketContext: string;
   newsContext: string;
+  /**
+   * **本次调研给出的"可选情报键"** —— 裁决官只能从这里面标注依据。
+   *
+   * 见 `routedModel.ts` 的 `research` 与 `intel/attribution.ts`：
+   * 校验"模型没编造情报来源"需要**这次真的给过它哪些键**。
+   * 为空数组时裁决官**不标注**（而不是猜）。
+   */
+  availableIntelKeys?: string[];
   positionContext: string;
   limits?: { maxCalls: number; maxDebateRounds: number };
   onStep?: (step: { role: string; phase: string; note: string }) => void;
@@ -474,6 +482,37 @@ export async function runTradingDesk(input: {
         '· 如果双方都有道理，说明你**依据什么做了取舍**（哪个证据权重更高、为什么）；' +
         '· 不要写"综合来看""两者都有道理"这类**不表态**的句子 —— 那等于没有裁决。' +
         '\n\n' +
+        /*
+         * ── **要求标注"依据了哪几条情报"**（2026-10-12，打通归因链第二段）──
+         *
+         * ## 为什么必须让模型标注（而不是代码猜）
+         *
+         * `intel/signalHealth.ts` 的失效检测（胜率崩塌 / 连续亏损 / **反应衰减**）
+         * 需要"**由某个信号驱动的成交**"。而实测核查发现：
+         * ```
+         *   trades.source   → 只有 bot / reconciled
+         *   open_reasoning  → 技术面理由
+         *   Decision        → 没有情报来源字段
+         * ```
+         * **这条信息系统从未记录过** —— 所以失效检测一直是空转。
+         *
+         * ⚠️ 我**明确拒绝**了"用时间接近度猜"：归因一旦是猜的，
+         * 失效检测会**基于假数据下结论** ——
+         * 「"coindesk 利多"看起来在亏 → 判为失效」，而那些亏损其实与它无关。
+         * **那比不接线更糟：它会自信地关掉一个好信号。**
+         *
+         * ## ⚠️ 只能从给定列表里选（防编造）
+         *
+         * 下面列出**这次真的给过它的键**，并明确"不许编"。
+         * 校验在 `filterKnownIntelKeys()`：编造的键会被剔除并记日志 ——
+         * 因为编造的键**永远只有 1 个样本**，会让归因数据**看起来比实际更丰富**。
+         */
+        ((input.availableIntelKeys ?? []).length > 0
+          ? '**另外：每条决策必须标注它依据了哪几条情报。** 可选的键如下（**只能从这里选**）：\n' +
+            (input.availableIntelKeys ?? []).map((k) => `  · ${k}`).join('\n') +
+            '\n在 JSON 里用 `"intel_keys":["…"]` 标注（**空数组 = 这条决策是纯技术面的**）。\n' +
+            '⚠️ **不要写不在上面列表里的键** —— 编造的情报来源会被剔除，而且它会让统计失真。\n\n'
+          : '') +
         /*
          * ⚠️ **必须要求 JSON 数组**（2026-10-12 实测踩到）。
          *

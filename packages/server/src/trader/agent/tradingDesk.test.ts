@@ -341,3 +341,52 @@ test('★ 分析师顺序必须与角色表一致（闸门不能打乱顺序）'
     '★ 产出的顺序必须与角色表一致',
   );
 });
+test('★★★ 给了情报键 → 裁决官提示词必须要求标注依据（归因链的入口）', async () => {
+  /*
+   * ## 为什么必须有这一条
+   *
+   * `intel/signalHealth.ts` 的失效检测需要"由某个信号驱动的成交"，
+   * 而实测核查发现**这条信息系统从未记录过**（`trades.source` 只有
+   * `bot`/`reconciled`，`open_reasoning` 是技术面理由）。
+   *
+   * 所以失效检测一直是**空转**。打通它的第一步就是：
+   * **把可选的情报键给裁决官，并要求它标注依据。**
+   *
+   * ⚠️ 若这条要求被删掉，整条链会**静默断掉**（决策记录里没有 intel_keys
+   * → 归因没数据 → 失效检测永远"样本不足"）。
+   */
+  const seen: Array<{ role: string; task: string }> = [];
+  const ask: AskRole = async ({ role, task }) => {
+    seen.push({ role, task });
+    return { role, modelId: `stub/${role}`, data: null, raw: '[]', latencyMs: 1, ok: true };
+  };
+  await runTradingDesk({
+    ask,
+    ...CTX,
+    availableIntelKeys: ['coindesk.com|bullish|BTCUSDT', 'theblock.com|bearish|ETHUSDT'],
+  });
+  const judge = seen.find((s) => s.role === 'judge');
+  assert.ok(judge !== undefined);
+  assert.ok(judge!.task.includes('intel_keys'), '★ 必须告诉它用哪个字段标注');
+  assert.ok(judge!.task.includes('coindesk.com|bullish|BTCUSDT'), '★ 必须把可选键列给它');
+  assert.ok(judge!.task.includes('只能从这里选'), '★ 必须明确禁止编造');
+});
+
+test('★★★ 没给情报键 → 【不要求】标注（不猜，也不让它编）', async () => {
+  /*
+   * ⚠️ 这一条是上一条的**安全对照**。
+   *
+   * 若没有可选键却仍要求标注，模型**只能编** ——
+   * 而编造的键永远只有 1 个样本，会让归因数据**看起来比实际更丰富**。
+   * 所以"没有键"时应当**不要求**（而不是要求它凭空写）。
+   */
+  const seen: Array<{ role: string; task: string }> = [];
+  const ask: AskRole = async ({ role, task }) => {
+    seen.push({ role, task });
+    return { role, modelId: `stub/${role}`, data: null, raw: '[]', latencyMs: 1, ok: true };
+  };
+  await runTradingDesk({ ask, ...CTX });
+  const judge = seen.find((s) => s.role === 'judge');
+  assert.ok(judge !== undefined);
+  assert.ok(!judge!.task.includes('intel_keys'), '★ 没有可选键时不该要求标注');
+});
