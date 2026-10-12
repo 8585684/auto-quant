@@ -38,6 +38,8 @@ function healthy(over: Partial<SelfCheckEvidence> = {}): SelfCheckEvidence {
     cycleIntervalMinutes: 15,
     pendingExperiments: 0,
     totalRuns: 100,
+    openPositions: 0,
+    nakedPositions: [],
     ...over,
   };
 }
@@ -271,4 +273,72 @@ test('★ 运行中的机器人照常检查（修复不能把真问题一起挡�
     findings.some((f) => f.severity === 'critical' && f.title.includes('没有成功决策')),
     '★ 运行中的机器人卡住必须报',
   );
+});
+/* -------------------------------------------------------------------------- */
+/*  裸奔仓位（唯一会直接亏钱的一项）                                             */
+/* -------------------------------------------------------------------------- */
+
+test('★★★ 有裸奔仓位 → critical，且**排在最前面**', () => {
+  /*
+   * 杠杆仓位没有保护单意味着：价格反向走时**没有任何自动止损** ——
+   * 亏损上限是"爆仓"而不是"止损价"。
+   *
+   * 它必须排在最前面，因为自检的输出是给人看的，而人从第一条开始读。
+   */
+  const findings = findDeterministicProblems(
+    healthy({
+      openPositions: 2,
+      nakedPositions: [{ symbol: 'BTCUSDT', side: 'long', quantity: 0.5 }],
+      /* 同时有别的严重问题，验证排序。 */
+      consecutiveFailures: 5,
+    }),
+  );
+  assert.equal(findings[0]!.severity, 'critical');
+  assert.ok(findings[0]!.title.includes('裸奔'), `★ 第一条应当是裸奔，实际是「${findings[0]!.title}」`);
+  assert.ok(findings[0]!.detail.includes('BTCUSDT'), '证据里要有具体标的');
+});
+
+test('★★ 裸奔检查不能漏 —— 这是持续观察的核心价值', () => {
+  /*
+   * 这个状态**只会在特定窗口里出现**（部署打断在途轮次、保护单被撤/过期、
+   * 手动开的仓），正常运行时界面上"看起来正常"。
+   *
+   * 2026-10-12 我是**人工**去查的（#10 两个持仓都有保护）。
+   * 人工查一次不算"持续观察" —— 而用户要的正是持续观察。
+   */
+  const findings = findDeterministicProblems(
+    healthy({ openPositions: 3, nakedPositions: [{ symbol: 'X', side: 'short', quantity: 1 }] }),
+  );
+  assert.ok(findings.some((f) => f.severity === 'critical' && f.title.includes('裸奔')));
+});
+
+test('★ 没有裸奔仓位时不报这一条（避免噪音）', () => {
+  const findings = findDeterministicProblems(healthy({ openPositions: 5, nakedPositions: [] }));
+  assert.equal(findings.filter((f) => f.title.includes('裸奔')).length, 0);
+});
+
+test('★ 多个裸奔仓位只报一条，但列出具体标的（不刷屏）', () => {
+  const findings = findDeterministicProblems(
+    healthy({
+      openPositions: 3,
+      nakedPositions: [
+        { symbol: 'AUSDT', side: 'long', quantity: 1 },
+        { symbol: 'BUSDT', side: 'long', quantity: 2 },
+        { symbol: 'CUSDT', side: 'short', quantity: 3 },
+      ],
+    }),
+  );
+  const naked = findings.filter((f) => f.title.includes('裸奔'));
+  assert.equal(naked.length, 1, '★ 只报一条');
+  assert.ok(naked[0]!.title.includes('3'), '标题要带总数');
+  assert.ok(naked[0]!.detail.includes('AUSDT') && naked[0]!.detail.includes('CUSDT'), '证据要列出标的');
+});
+
+test('★ 材料里要写明持仓保护状况（AI 层也需要这个事实）', () => {
+  const text = renderEvidenceForModel(
+    healthy({ openPositions: 2, nakedPositions: [{ symbol: 'ZECUSDT', side: 'short', quantity: 0.07 }] }),
+  );
+  assert.ok(text.includes('持仓保护'), '要有这一节');
+  assert.ok(text.includes('没有保护单'), '要标出问题');
+  assert.ok(text.includes('ZECUSDT'), '要列出具体标的');
 });

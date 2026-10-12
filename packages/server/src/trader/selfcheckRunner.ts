@@ -20,7 +20,7 @@
  * AI 层（把线索连起来）建在这一层之上，见 `runSelfCheck` 的 `ask` 参数。
  */
 
-import { decisions, runtimeLogs, traders } from '../store/repositories.js';
+import { decisions, positions, runtimeLogs, traders } from '../store/repositories.js';
 /*
  * ⚠️ 智能体那三张表在 `agentStore.js`，**不在** `repositories.js` ——
  * 它们有自己的生命周期（写入时按上限裁剪），所以单独一个模块。
@@ -117,6 +117,35 @@ export function collectEvidenceFromDb(traderId: number, windowHours = DEFAULT_WI
     /* 用 0 */
   }
 
+  /* ── 持仓保护（裸奔检查）── */
+  let openPositions = 0;
+  const nakedPositions: SelfCheckEvidence['nakedPositions'] = [];
+  try {
+    const rows = positions.open(traderId);
+    openPositions = rows.length;
+    for (const p of rows) {
+      /*
+       * 判据：**止损价与止损单都没有**才算裸奔。
+       *
+       * 只有其一也算"有保护"：
+       *   · 有止损价、没挂单 → 本地会在下一轮补挂（`ensureStopsOnOpenPositions`）；
+       *   · 有挂单、没止损价 → 交易所侧真的挡着，那是有效保护。
+       *
+       * 反过来说：**两个都没有**时，交易所侧与本地都拦不住 —— 那才是裸奔。
+       */
+      const hasStopPrice = p.stop_loss !== null && Number.isFinite(p.stop_loss);
+      const hasStopOrder = p.stop_order_id !== null && String(p.stop_order_id).length > 0;
+      if (!hasStopPrice && !hasStopOrder) {
+        nakedPositions.push({ symbol: p.symbol, side: p.side, quantity: p.quantity });
+      }
+    }
+  } catch {
+    /*
+     * 读不到持仓时**不报裸奔** —— 宁可漏报也不要误报。
+     * 误报会让操作员开始忽略自检，那比漏一项更糟（见 `selfcheck.ts` 的说明）。
+     */
+  }
+
   return {
     windowHours,
     status: trader?.status ?? 'unknown',
@@ -128,6 +157,8 @@ export function collectEvidenceFromDb(traderId: number, windowHours = DEFAULT_WI
     cycleIntervalMinutes,
     pendingExperiments,
     totalRuns,
+    openPositions,
+    nakedPositions,
   };
 }
 

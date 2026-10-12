@@ -69,6 +69,22 @@ export interface SelfCheckEvidence {
   pendingExperiments: number;
   /** 累计角色运行次数（判断"这个机器人到底跑过没有"）。 */
   totalRuns: number;
+  /** 当前开仓总数。 */
+  openPositions: number;
+  /**
+   * **没有保护单的开仓**（止损价与止损单都没有）。
+   *
+   * ⚠️ 这是**最该被持续监控的一项** —— 它意味着杠杆仓位在裸奔。
+   *
+   * 2026-10-12 的生产实测：部署重启会打断在途轮次，而打断点可能正好落在
+   * "入场已成交、保护单还没挂"的窗口里。当时是我**人工**去查的
+   *（`#10` 有两个持仓，都有保护）。人工查一次不算"持续观察" ——
+   * 而用户要的正是持续观察：
+   *
+   * > 「你迭代更新系统得搞智能体团队**持续观察、测试**……
+   * >  不要有任何 BUG，也不要老让我来测试和发现问题」
+   */
+  nakedPositions: Array<{ symbol: string; side: string; quantity: number }>;
 }
 
 /**
@@ -105,8 +121,30 @@ export interface DeterministicFinding {
 export function findDeterministicProblems(e: SelfCheckEvidence): DeterministicFinding[] {
   const out: DeterministicFinding[] = [];
 
-  /* ① 连续失败 —— 最严重的（决策循环已经熔断了）。 */
-  if (e.consecutiveFailures >= 3) {
+  /*
+   * ⓪ **裸奔仓位 —— 永远排在最前面，因为它是唯一会直接亏钱的一项。**
+   *
+   * 杠杆仓位没有保护单意味着：价格反向走时**没有任何自动止损** ——
+   * 亏损上限是"爆仓"，而不是"止损价"。
+   *
+   * 为什么它必须由自检持续盯着：这个状态**只会在特定窗口里出现**
+   *（部署打断在途轮次、保护单被交易所撤掉/过期、手动开的仓），
+   * 而正常运行时看不出来（界面上仓位"看起来正常"）。
+   */
+  if (e.nakedPositions.length > 0) {
+    out.push({
+      severity: 'critical',
+      title: `${e.nakedPositions.length} 个仓位没有保护单（裸奔）`,
+      detail: e.nakedPositions
+        .slice(0, 5)
+        .map((p) => `${p.symbol} ${p.side} 数量=${p.quantity}`)
+        .join('；'),
+      nextStep:
+        '立刻核对交易所挂单；若是部署打断造成的，重启后的启动对账会自动补挂（`ensureStopsOnOpenPositions`）',
+    });
+  }
+
+  /* ① 连续失败 —— 最严重的（决策循环已经熔断了）。 */  if (e.consecutiveFailures >= 3) {
     out.push({
       severity: 'critical',
       title: `决策连续失败 ${e.consecutiveFailures} 次`,
@@ -236,6 +274,17 @@ export function renderEvidenceForModel(e: SelfCheckEvidence): string {
   lines.push('## 智能体运行');
   lines.push(`- 累计运行次数：${e.totalRuns}`);
   lines.push(`- 待结算参数实验：${e.pendingExperiments}`);
+  lines.push('');
+  lines.push('## 持仓保护');
+  lines.push(`- 当前开仓：${e.openPositions} 个`);
+  if (e.nakedPositions.length === 0) {
+    lines.push('- 全部有保护单（止损价或止损单）');
+  } else {
+    lines.push(`- ⚠️ **${e.nakedPositions.length} 个没有保护单**：`);
+    for (const p of e.nakedPositions) {
+      lines.push(`  - ${p.symbol} ${p.side} 数量=${p.quantity}`);
+    }
+  }
   return lines.join('\n');
 }
 
