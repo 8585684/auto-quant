@@ -320,30 +320,31 @@ export function createTeamDecisionModel(options: {
        * 见上面第二段边界说明：不能丢掉它，否则团队不知道要输出什么格式。
        */
       /*
-       * ── **市场调研（联网搜索）** ─────────────────────────────────────────
+       * ⚠️ **`systemPrompt` 与 `userPrompt` 的分工（2026-10-12 实测修正）。**
        *
-       * 用户 2026-10-12 的要求：
-       * 「总管委派子代理去做市场调研（查新闻、各大交易所社区、社交媒体、新闻源等等）
-       *  根据资料反馈给相应的智能体做处理」。
+       * `autoTrader` 传给模型的两段文本是这样分工的：
        *
-       * ## 为什么在开会【之前】做
+       *   · `systemPrompt` —— **规则与角色说明**（输出格式、纪律、风控约束）；
+       *   · `userPrompt`   —— **真正的材料**：候选池、多周期指标序列、持仓、账户状态。
        *
-       * 因为它是**所有分析师共用的素材** —— 新闻分析师与情绪分析师都要看它。
-       * 放在编排里做会让每个角色各搜一次（浪费时间与额度），
-       * 而且两个角色可能拿到**不一致**的搜索结果（同一轮里自相矛盾）。
+       * 第一版我把它们接反了：`marketContext = systemPrompt`（规则当材料）、
+       * 而 `userPrompt` 只当新闻。实测后果 —— 模型明确说：
        *
-       * ## 搜索失败不阻断
+       *   「本轮材料中没有提供任何市场数据，因此无法进行市场结构分析」
+       *   「提示词里没有附带任何行情数据、候选池或持仓信息 —— 我手上是空的」
        *
-       * `research` 内部已经把失败转成"搜索不可用，请如实说明"的材料
-       *（见 `collectMarketResearch`）—— 那一句是给**模型**看的，
-       * 让它别对着空白编造消息面。
+       * 而同一时刻日志显示「list_candidates → 20 个」—— 数据取到了，
+       * **只是没进提示词**。于是团队基于"空材料"讨论，还白白慢了一轮。
+       *
+       * 现在：行情材料用 `userPrompt`，而**规则（systemPrompt）也一并带进去**
+       *（角色需要知道输出格式与纪律，见下面 `marketContext` 的拼装）。
        */
-      let newsContext = userPrompt;
+      let newsContext = '';
       if (research !== undefined) {
         try {
           onStep?.({ role: 'supervisor', phase: 'dispatch', note: '派出调研员联网搜索新闻与情绪' });
           const researchText = await research(symbolsFromPrompt(userPrompt));
-          newsContext = `${userPrompt}\n\n${researchText}`;
+          newsContext = researchText;
         } catch (error) {
           /* 调研这一层失败不该让整轮失败 —— 行情数据仍是好的。 */
           onStep?.({ role: 'supervisor', phase: 'dispatch', note: `调研失败：${(error as Error).message}` });
@@ -352,7 +353,13 @@ export function createTeamDecisionModel(options: {
 
       const outcome = await runTradingDesk({
         ask,
-        marketContext: systemPrompt,
+        /*
+         * 行情材料 = **真正的数据（userPrompt）** + 规则速览（systemPrompt 的末尾一段）。
+         *
+         * 规则要带进去是因为角色需要知道输出格式与纪律；但**不能让它占满材料位**
+         *（第一版就是这个问题）。所以规则放在后面、标明是"规则"。
+         */
+        marketContext: `${userPrompt}\n\n---\n\n## 团队需要遵守的规则（来自交易循环）\n${systemPrompt}`,
         newsContext,
         positionContext: '',
         ...(onStep ? { onStep } : {}),

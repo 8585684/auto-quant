@@ -232,3 +232,59 @@ test('★ 不传 research 时行为与之前一致（既有部署不受影响）
   assert.ok(result.text.includes('<decision>'));
   assert.equal(seen.length, 8, '角色数不变（8 = 7 角色 + 风控官）');
 });
+/* -------------------------------------------------------------------------- */
+/*  材料接线：行情数据必须真的进到角色手里（2026-10-12 实测修正）                 */
+/* -------------------------------------------------------------------------- */
+
+test('★★ 行情数据（userPrompt）必须进到角色的材料里，而不是被规则顶掉', async () => {
+  /*
+   * 实测踩到的严重缺陷：第一版把 `systemPrompt`（**规则**）当成了市场材料，
+   * 而把 `userPrompt`（**真正的候选池与指标序列**）只当新闻。
+   *
+   * 后果 —— 模型明确抱怨：
+   *   「本轮材料中没有提供任何市场数据，因此无法进行市场结构分析」
+   *   「提示词里没有附带任何行情数据、候选池或持仓信息 —— 我手上是空的」
+   *
+   * 而同一时刻日志显示「list_candidates → 20 个」——
+   * **数据取到了，只是没进提示词**。团队于是基于"空材料"讨论了一轮。
+   */
+  const seenContexts: string[] = [];
+  const { call } = roleAwareCall();
+  const wrapped: CallModel = async (m, messages, o) => {
+    seenContexts.push(messages.find((x) => x.role === 'user')?.content ?? '');
+    return call(m, messages, o);
+  };
+
+  const model = createTeamDecisionModel({ router: new ModelRouter({ call: wrapped }), baseMaxTokens: 4096 });
+  await model.complete('【这是规则：必须输出 <decision> 块】', '【这是行情：BTCUSDT 现价 83000，4H EMA20 上行】', {});
+
+  assert.ok(
+    seenContexts.some((c) => c.includes('BTCUSDT 现价 83000')),
+    '★ 行情数据必须出现在角色的材料里（它来自 userPrompt）',
+  );
+  assert.ok(
+    seenContexts.some((c) => c.includes('这是规则')),
+    '★ 规则也要带进去（角色需要知道输出格式），但不能顶掉行情',
+  );
+});
+
+test('★ 角色的 system 提示词明确说"你没有工具"（防假装取数）', async () => {
+  /*
+   * 实测：角色以为它能取数，输出了「我先拉取候选池与指标序列再做客观描述」——
+   * 而那些动作**永远不会发生**，且会让单角色拖到 100 秒以上。
+   */
+  const seenSystems: string[] = [];
+  const { call } = roleAwareCall();
+  const wrapped: CallModel = async (m, messages, o) => {
+    seenSystems.push(messages.find((x) => x.role === 'system')?.content ?? '');
+    return call(m, messages, o);
+  };
+  const model = createTeamDecisionModel({ router: new ModelRouter({ call: wrapped }), baseMaxTokens: 4096 });
+  await model.complete(SYS, USER, {});
+
+  assert.ok(seenSystems.length > 0);
+  assert.ok(
+    seenSystems.every((s) => s.includes('你没有工具') || s.includes('不能调用任何工具')),
+    '★ 每个角色的 system 提示词都要说清"没有工具"',
+  );
+});
