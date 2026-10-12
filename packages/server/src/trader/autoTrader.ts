@@ -633,6 +633,94 @@ const MARKET_DATA_UNAVAILABLE_MESSAGE =
  *   8. execute closes, then opens
  *   9. persist the decision, the orders, the trades and an equity point
  */
+
+/**
+ * **事件驱动唤醒**的目标延迟 —— 收到重要事件后大约多久重新评估。
+ *
+ * 45 秒而不是"立刻"：成交推送会在几秒内来好几帧（部分成交、保护单触发、
+ * 仓位更新），而**账本要先对齐**（`manager.scheduleFillReconcile` 有 5 秒防抖）。
+ * 给一点时间让状态稳定，再让团队看 —— 否则它会基于"半更新的账本"做判断。
+ */
+const EARLY_WAKE_DELAY_MS = 45_000;
+
+/**
+ * 两次事件驱动唤醒之间的**最小间隔**。
+ *
+ * ⚠️ 这是防死循环的闸门，不是性能优化。
+ *
+ * 调研里 MAST 分类法的实测数据：**步骤重复占 15.7%**。
+ * 而"成交 → 唤醒 → 决策 → 又成交 → 又唤醒"正是最典型的重复形状。
+ * 3 分钟意味着：即使行情剧烈到连续成交，团队最多每 3 分钟重新评估一次，
+ * 而**不会**陷入"刚决策完又被唤醒"的紧循环。
+ */
+const EARLY_WAKE_MIN_GAP_MS = 3 * 60_000;
+
+/**
+ * **该不该因为一个事件提前唤醒** —— 纯函数，四条闸门都在这里。
+ *
+ * ## 为什么抽成纯函数
+ *
+ * 这四条闸门全是**防死循环**的（MAST 实测：步骤重复占 15.7%），
+ * 而它们嵌在一个需要真实数据库、交易所、模型的类里**几乎没法测**。
+ * 抽出来之后每一条都能被单独钉住 —— 而"少一条闸门"的后果是
+ * **机器人自己把自己唤醒到死循环**，那是灾难性的。
+ *
+ * @param input.mode          机器人模式（只有 `ai_team` 开启）
+ * @param input.running       是否在跑
+ * @param input.cycleInFlight 是否有一轮正在执行
+ * @param input.nextCycleAt   原定下一次的时刻（`null` = 没有排期）
+ * @param input.lastEarlyWakeAt 上次唤醒生效的时刻（`null` = 从未）
+ * @param input.now           当前时刻（注入，便于测试）
+ */
+export function shouldEarlyWake(input: {
+  mode: string;
+  running: boolean;
+  cycleInFlight: boolean;
+  nextCycleAt: number | null;
+  lastEarlyWakeAt: number | null;
+  now: number;
+}): { wake: boolean; reason: string } {
+  /* 闸门 0：没在跑 → 什么都不做。 */
+  if (!input.running) return { wake: false, reason: '机器人未在运行' };
+
+  /*
+   * 闸门 1：**只对 AI 团队模式**。
+   *
+   * 用户硬约束：「你现在的更新迭代**不要影响我现在实盘跑的机器人**：赚大钱」
+   *（`#10` 是 `ai_managed`）。对它在成交后插一次额外决策会**改变它的行为** ——
+   * 那正是用户说不要的。
+   */
+  if (input.mode !== 'ai_team') return { wake: false, reason: '只有 AI 团队模式使用事件驱动唤醒' };
+
+  /* 闸门 2：正在跑一轮 → 让它跑完（它本来就会重新评估）。 */
+  if (input.cycleInFlight) return { wake: false, reason: '上一轮仍在执行' };
+
+  /* 闸门 3：**最小间隔** —— 防"成交 → 唤醒 → 决策 → 成交"的紧循环。 */
+  if (
+    input.lastEarlyWakeAt !== null &&
+    input.now - input.lastEarlyWakeAt < EARLY_WAKE_MIN_GAP_MS
+  ) {
+    return { wake: false, reason: '距上次唤醒太近（防死循环）' };
+  }
+
+  /*
+   * 闸门 4：**只提前不推后** —— 已经排在更早的时刻就不动它。
+   *
+   * ⚠️ `nextCycleAt === null` 是**唤醒**而不是挡下（实测时被这条测试抓到）。
+   *
+   * `null` 的含义是"**当前没有下一次排期**"（`scheduleNextCycle` 排出定时器时写它，
+   * 定时器触发时清它）。而"没有排期"意味着**没有任何人会来看这个账户** ——
+   * 那时候收到成交事件，最该做的是**叫醒它**，而不是按"快到了"挡掉。
+   *
+   * 第一版写成 `null → remaining = 0 → 挡下`，方向正好反了。
+   */
+  if (input.nextCycleAt !== null && input.nextCycleAt - input.now <= EARLY_WAKE_DELAY_MS) {
+    return { wake: false, reason: '原定周期本来就快到了' };
+  }
+
+  return { wake: true, reason: 'ok' };
+}
+
 export class AutoTrader {
   private timer: NodeJS.Timeout | null = null;
   private running = false;
@@ -647,6 +735,16 @@ export class AutoTrader {
    */
   private requestedNextCheckMinutes: number | undefined;
   private cycleInFlight = false;
+  /**
+   * 上一次**事件驱动唤醒**真的生效的时刻。
+   *
+   * ⚠️ 只在"真的重排了"时才更新 —— 否则被忽略的请求会不断刷新这个时间戳，
+   * 把后续真正的唤醒也一起挡掉（那会表现为"偶尔不唤醒"，很难查）。
+   *
+   * 作用见 `requestEarlyCycle()` 的第一道闸：防"成交 → 唤醒 → 决策 → 成交"
+   * 这种紧循环（MAST 实测：步骤重复占 15.7%）。
+   */
+  private lastEarlyWakeAt: number | null = null;
   /**
    * 当前那一轮的 `AbortController`。
    *
@@ -1048,6 +1146,86 @@ export class AutoTrader {
       void this.tick();
     }, delayMs);
   }
+
+  /**
+   * **事件驱动的提前唤醒** —— 让"不等定时"这件事真正落地。
+   *
+   * ## 用户的要求（这是本方法存在的理由）
+   *
+   * > 「系统**不再是像现在这样定时去工作**，而是持续、并发的工作，增加盈利的可能」
+   * > 「举例子：总管委派子代理去做市场调研……然后做相应的动作
+   * >  （**开仓、平仓、调仓**等等）」
+   *
+   * ## 缺的到底是哪一块
+   *
+   * 系统已经有两者：
+   *   · **AI 可以要求"下次什么时候再看"**（1–120 分钟，见 `cycleSchedule.ts`）；
+   *   · **成交后立刻对齐账本**（`manager.scheduleFillReconcile`）。
+   *
+   * 但没有的是：**成交（尤其是止损被打掉）之后，决策循环并不知道**。
+   * 账本已经对了，而团队要等到下一个周期（最长 120 分钟）才重新评估。
+   * 那意味着：**仓位已经没了，团队还在按"持有"思考。**
+   *
+   * ## 为什么只对 `ai_team` 开启（刻意的边界）
+   *
+   * 用户有一条硬约束：
+   *
+   * > 「你现在的更新迭代**不要影响我现在实盘跑的机器人**：赚大钱」
+   *
+   * `#10 赚大钱` 是 `ai_managed`。对它在成交后插一次额外决策**会改变它的行为**
+   *（多一次模型调用、可能多一次调仓判断）—— 而那正是用户说不要的。
+   *
+   * 所以门开在**新模式**上：`ai_team` 拿到事件驱动，现有模式的行为**逐字节不变**。
+   * 等新模式的这套机制在真实盘上验证够了，再考虑是否推广。
+   *
+   * ## 防死循环（这是必须的，不是可选的）
+   *
+   * 调研里 MAST 分类法的实测数据：**步骤重复占 15.7%**。
+   * 而"成交 → 唤醒 → 决策 → 又成交 → 又唤醒"正是最典型的重复形状。
+   * 三道闸：
+   *
+   *   ① **最小间隔** `EARLY_WAKE_MIN_GAP_MS` —— 上一次唤醒太近就不理；
+   *   ② **只提前不推后** —— 已经排在更早的时刻时什么都不做；
+   *   ③ **在飞轮次不打断** —— `cycleInFlight` 时不重排（否则会把正在跑的轮次切碎）。
+   */
+  requestEarlyCycle(reason: string): void {
+    /*
+     * 读数据库而不是内存里的快照 —— **模式是可以被操作员改的**，
+     * 而"改完模式之后事件驱动还按旧模式跑"会是一个很难查的偏差。
+     */
+    let mode: string = this.deps.trader.mode;
+    try {
+      const fresh = traderStore.get(this.deps.trader.id);
+      if (fresh) mode = fresh.mode;
+    } catch {
+      /* 读失败就用启动时那份 */
+    }
+
+    const verdict = shouldEarlyWake({
+      mode,
+      running: this.running,
+      cycleInFlight: this.cycleInFlight,
+      nextCycleAt: this.nextCycleAt,
+      lastEarlyWakeAt: this.lastEarlyWakeAt,
+      now: Date.now(),
+    });
+    if (!verdict.wake) {
+      /*
+       * 被挡下时**不写日志** —— 这条路径在行情剧烈时会被频繁触发，
+       * 每次都写会把自己的日志刷掉（而"闸门挡下了"本身不是异常）。
+       */
+      return;
+    }
+
+    this.lastEarlyWakeAt = Date.now();
+    this.emit('info', `收到重要事件（${reason}）—— 提前重新评估，不等原定周期`);
+    /*
+     * `requestedMinutes` 传 1（`MIN_NEXT_CHECK_MINUTES` 的下界）——
+     * 走同一个调度入口，于是"界面倒计时""AI 请求优先"这些行为都一致。
+     */
+    this.scheduleNextCycle(false, 1);
+  }
+
   /**
    * Stop the loop and **wait for the cycle already running** to finish.
    *

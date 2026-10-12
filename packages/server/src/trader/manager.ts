@@ -470,11 +470,41 @@ export class TraderManager {
       this.fillReconcileTimers.delete(traderId);
       const autoTrader = this.running.get(traderId);
       if (!autoTrader) return;
-      void autoTrader.applyExchangeFill().catch((error) => {
-        log.warn(
-          `机器人 #${traderId} 成交后即时对账失败（下一个周期仍会补上）：${(error as Error).message}`,
-        );
-      });
+      void autoTrader
+        .applyExchangeFill()
+        /*
+         * ── **成交之后：唤醒决策循环**（事件驱动的核心一步）──────────────
+         *
+         * ## 为什么必须排在 `applyExchangeFill()` **之后**
+         *
+         * 顺序反了会让团队基于**半更新的账本**做判断（"我以为还持有，
+         * 其实止损已经打掉了"）—— 那正是调研里"错误级联"的入口。
+         * 先对齐状态，再叫它来看。
+         *
+         * ## 为什么这里需要它
+         *
+         * 系统原来两者都有、但中间缺一环：
+         *   · 成交 → **账本**立刻对齐（本函数）；
+         *   · AI 可以要求"下次什么时候再看"（1–120 分钟）。
+         *
+         * 缺的是：**成交之后决策循环并不知道**。账本已经对了，而团队要等到
+         * 下一个周期（最长 120 分钟）才重新评估 —— 那意味着
+         * **仓位已经没了，团队还在按"持有"思考**。
+         *
+         * 用户的要求正是这件事：
+         * > 「系统**不再是像现在这样定时去工作**，而是持续、并发的工作」
+         *
+         * ⚠️ `requestEarlyCycle` 内部只对 `ai_team` 生效（见那里的说明）——
+         * 用户明确要求不要改变现有实盘机器人（`#10 赚大钱` 是 `ai_managed`）的行为。
+         */
+        .then(() => {
+          autoTrader.requestEarlyCycle('有成交');
+        })
+        .catch((error) => {
+          log.warn(
+            `机器人 #${traderId} 成交后即时对账失败（下一个周期仍会补上）：${(error as Error).message}`,
+          );
+        });
     }, FILL_RECONCILE_DEBOUNCE_MS);
 
     /*
