@@ -218,6 +218,38 @@ export type ModelCallFactory = (modelId: string) => CallModel;
  *   前者操作员看得懂，后者只会在日志里留一条栈。
  */
 /**
+ * 剥掉模型输出里的 `<tool>…</tool>` 块。
+ *
+ * ## 为什么团队模式必须剥（实测：这是"一轮跑 4 次交易台"的根因）
+ *
+ * `autoTrader` 有一个**按需取数循环**（`MAX_DATA_ROUNDS = 3`）：
+ * 只要模型输出里有 `<tool>` 块，它就会执行工具并**再问一次模型**。
+ *
+ * 对**单模型**这是廉价的（多问 1 次）。而对**团队模式**，
+ * "再问一次模型"意味着**把整个交易台重跑一遍**（8 个角色）——
+ * 于是"一次决策"变成最多 **4 次交易台 = 32 次角色调用**。
+ *
+ * 实测（`#11` 模拟盘，9 分钟）：**派出分析师 8 次、零产出、64 次模型调用**。
+ *
+ * ## 为什么是"剥掉"而不是"改提示词"
+ *
+ * 我在角色 system 提示词里已经写明「**你没有工具**」，但模型仍会按训练习惯
+ * 假装调工具（实测输出 `<tool>{"tool":"list_candidates",…}`）。
+ * 提示词能降低概率，**不能保证** —— 而代价是整台重跑。
+ *
+ * 既然团队**真的没有工具**，它输出里的任何 `<tool>` 块都是**幻觉**。
+ *
+ * 顺带的好处：审计块里不再混着那段假 JSON（此前实测 `<team>` 块里
+ * 出现 `{"tool":"l…`，读起来很困惑）。
+ *
+ * ⚠️ **只在团队模式剥**（本文件是团队专用的 `createTeamDecisionModel`）——
+ * 另两种模式**真的有工具**（`decisionTools.ts`），剥掉会让它们失去取数能力。
+ */
+export function stripToolBlocks(text: string): string {
+  return text.replace(/<tool>[\s\S]*?<\/tool>/g, '').replace(/\n{3,}/g, '\n\n');
+}
+
+/**
  * 从交易循环给的提示词里**尽力**找出候选标的。
  *
  * ## 为什么要找，而不是让调用方传
@@ -399,7 +431,47 @@ export function createTeamDecisionModel(options: {
       const risk = await askRiskOfficer(ask, outcome, onStep);
 
       return {
-        text: renderDeskOutcome(outcome, risk),
+        /*
+         * ⚠️ **剥掉 `<tool>` 块**（2026-10-12 实测：这是"一轮跑 4 次交易台"的根因）。
+         *
+         * ## 为什么必须剥
+         *
+         * `autoTrader` 有一个**按需取数循环**（`MAX_DATA_ROUNDS = 3`）：
+         *
+         * ```ts
+         * for (let dataRound = 1; dataRound <= MAX_DATA_ROUNDS; dataRound += 1) {
+         *   const calls = extractToolCalls(finalResponse.text);
+         *   if (calls.length === 0) break;
+         *   ... 执行工具 ...
+         *   const followUp = await askAgain(...);   // ← 再问一次模型
+         * }
+         * ```
+         *
+         * 对**单模型**这是廉价的（多问 1 次）。而对**团队模式**，
+         * "再问一次模型"意味着**把整个交易台重跑一遍**（8 个角色）——
+         * 于是"一次决策"变成最多 **4 次交易台 = 32 次角色调用**。
+         *
+         * 实测证据（#11 模拟盘，9 分钟窗口）：
+         * ```
+         *   派出分析师 2 → 4 → 5 → 6 → 7 → 8 次
+         *   新决策记录：0 条
+         * ```
+         * **64 次模型调用，零产出。**
+         *
+         * ## 为什么模型会输出 `<tool>`
+         *
+         * 团队角色**没有工具**（我在 system 提示词里已经写明"你没有工具"），
+         * 但模型仍会按训练里的习惯**假装调工具**（实测输出
+         * `<tool>{"tool":"list_candidates",...}`）。
+         * 提示词能降低概率，**不能保证** —— 而代价是整台重跑。
+         *
+         * 所以这里做**兜底**：既然团队真的没有工具，那它的输出里
+         * **任何 `<tool>` 块都是幻觉**，剥掉即可。
+         *
+         * 顺带的好处：审计块里不再出现那段假的工具 JSON
+         *（此前实测 `<team>` 块里混着 `{"tool":"l...`，读起来很困惑）。
+         */
+        text: stripToolBlocks(renderDeskOutcome(outcome, risk)),
         latencyMs: Date.now() - started,
         usage: { promptTokens: null, completionTokens: null },
       };

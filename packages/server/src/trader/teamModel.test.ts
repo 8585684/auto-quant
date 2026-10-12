@@ -288,3 +288,57 @@ test('★ 角色的 system 提示词明确说"你没有工具"（防假装取数
     '★ 每个角色的 system 提示词都要说清"没有工具"',
   );
 });
+/* -------------------------------------------------------------------------- */
+/*  ⚠️ 团队输出不能含 <tool> 块（否则一轮会跑 4 次交易台）                        */
+/* -------------------------------------------------------------------------- */
+
+test('★★★ 团队输出里的 <tool> 块必须被剥掉（否则整台会被重跑 4 次）', async () => {
+  /*
+   * ## 实测证据（#11 模拟盘，9 分钟窗口）
+   *
+   * ```
+   *   派出分析师 2 → 4 → 5 → 6 → 7 → 8 次
+   *   新决策记录：0 条
+   * ```
+   * **8 次交易台 × 8 角色 = 64 次模型调用，零产出。**
+   *
+   * ## 根因
+   *
+   * `autoTrader` 的按需取数循环（`MAX_DATA_ROUNDS = 3`）：
+   * 只要模型输出里有 `<tool>` 块，它就执行工具并**再问一次模型**。
+   *
+   * 对单模型这是多问 1 次；对团队模式，**"再问一次模型" = 重跑整个交易台**。
+   * 于是"一次决策"变成最多 **4 次交易台 = 32 次角色调用**。
+   *
+   * ## 为什么模型会输出 <tool>
+   *
+   * 团队角色**没有工具**（system 提示词里已写明），但模型仍会按训练习惯
+   * 假装调工具。提示词降低概率，**不能保证** —— 而代价是整台重跑。
+   *
+   * 所以做兜底：团队**真的没有工具**，任何 `<tool>` 块都是幻觉，剥掉。
+   */
+  const { call } = roleAwareCall();
+  const withTool: CallModel = async (m, messages, o) => {
+    const r = await call(m, messages, o);
+    /* 每个角色的输出都带上假工具块 —— 模拟实测里的行为。 */
+    return { ...r, text: `${r.text}\n<tool>{"tool":"list_candidates"}</tool>` };
+  };
+
+  const model = createTeamDecisionModel({ router: new ModelRouter({ call: withTool }), baseMaxTokens: 4096 });
+  const result = await model.complete(SYS, USER, {});
+
+  assert.ok(!result.text.includes('<tool>'), '★ 团队输出里不能残留 <tool> 块');
+  assert.ok(!result.text.includes('list_candidates'), '★ 假工具内容也要一起消失');
+  /* 决策块仍要完好 —— 剥工具不能伤到正常输出。 */
+  assert.ok(result.text.includes('<decision>'), '决策块必须还在');
+  const extracted = extractFirstJsonArray(result.text.slice(result.text.indexOf('<decision>')));
+  assert.equal(extracted.status, 'ok', '剥完之后仍要是合法 JSON');
+});
+
+test('★ 剥工具不影响不含工具块的输出（回归）', async () => {
+  const { call } = roleAwareCall();
+  const model = createTeamDecisionModel({ router: new ModelRouter({ call }), baseMaxTokens: 4096 });
+  const result = await model.complete(SYS, USER, {});
+  assert.ok(result.text.includes('<decision>'));
+  assert.ok(result.text.includes('<team>'), '审计块要在');
+});
