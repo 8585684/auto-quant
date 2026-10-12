@@ -12,6 +12,7 @@ import test from 'node:test';
 import { ModelRouter, type CallModel } from '../llm/modelRouter.js';
 import { readFileSync } from 'node:fs';
 import { ROLE_TIERS, ROLE_GROUP_LADDERS, ROLE_MAX_TOKENS, createRoutedDecisionModel, tierForRole } from './routedModel.js';
+import { ROLE_TIMEOUT_MS } from './agent/tradingDesk.js';
 import { looksLikeMagpieGateway } from './magpieGateway.js';
 import { FIRM_ROLES, firmRoleOf } from '@aq/shared';
 
@@ -300,7 +301,7 @@ test('★ 兜底链里不能有重复项（重复 = 白试一次）', () => {
     assert.equal(new Set(chain).size, chain!.length, `★ ${role} 的链里有重复：${chain!.join(' → ')}`);
   }
 });
-test('★★★ 分析师角色的输出预算必须【小】—— 8192 会让 T1 必然超时', () => {
+test('★★★ 分析师角色的输出预算必须与【超时线】协调 —— 不能大到必然超时', () => {
   /*
    * ## 决定性实测（同一材料，只变 max_tokens）
    *
@@ -310,31 +311,57 @@ test('★★★ 分析师角色的输出预算必须【小】—— 8192 会让 
    *   finish_reason = "length"    ← 全部撞上限
    * ```
    *
-   * 而 `TEAM_BASE_MAX_TOKENS = 8192` → **最坏要跑 80+ 秒**，
-   * 而 T1 角色的超时线是 **60 秒** —— **它必然超时**。
+   * 而 `TEAM_BASE_MAX_TOKENS = 8192` → **最坏要跑 80+ 秒** ——
+   * 若 T1 超时线是 60 秒，那**必然超时**。
    *
-   * ## 更糟的是那些 token 大多不是有用内容
+   * ## ⚠️ 2026-10-13 改：判据从"写死 2048"改成"从超时线推导"
    *
-   * `max_tokens=2000` 那次：`reasoning_content = 4228 字`，而 **`content = 0 字`** ——
-   * 全部预算花在推理上，**正式回答一个字都没写**。
+   * 原来的断言是 `budget <= 2048`，理由写死为"T1 的 60 秒超时线"。
+   * 而线上实测把两条**都推翻了**：
+   * ```
+   *   market_analyst：三个候选全部"输出被 token 上限截断（思维链占满了预算）"
+   *   technical：      "超过 60 秒未返回（按档位 T1_fast 的超时）"
+   * ```
+   * 于是我把 T1 提到 **120 秒**、`market_analyst` 提到 **4096** ——
+   * **两个数字一起变，而写死 2048 的断言就假失败了**。
+   *
+   * ## 所以判据要**表达那条真正的物理约束**
+   *
+   * 真正的约束不是"预算 ≤ 某数字"，而是：
+   * ```
+   *   最坏耗时（预算 × 实测吞吐）  <  该角色的超时线
+   * ```
+   * 实测吞吐约 **2000 token / 20.5 秒 ≈ 98 token/秒**（撞上限、用满预算的最坏情况）。
+   * 于是"预算 ≤ 超时秒数 × 98"才是那个不变量 ——
+   * **它让预算与超时线永远自洽**，改任一个都会被这条测试检查到。
    */
-  for (const role of ['market_analyst', 'technical', 'newscaster', 'sentiment']) {
+  const TOKENS_PER_SEC = 2000 / 20.5; /* ≈ 97.6 —— 实测撞上限时的吞吐 */
+  for (const [role, tier] of [
+    ['market_analyst', 'T2_mid'],
+    ['technical', 'T1_fast'],
+    ['newscaster', 'T1_fast'],
+    ['sentiment', 'T1_fast'],
+  ] as const) {
     const budget = ROLE_MAX_TOKENS[role];
     assert.ok(budget !== undefined, `★ ${role} 应当有输出预算`);
+    const timeoutSec = ROLE_TIMEOUT_MS[tier]! / 1000;
+    const worstSec = budget! / TOKENS_PER_SEC;
     assert.ok(
-      budget! <= 2048,
-      `★ ${role} 的预算应当 ≤2048（当前 ${budget}）—— 8192 会让 T1 的 60 秒超时线必然被撞`,
+      worstSec < timeoutSec,
+      `★ ${role} 的最坏耗时（${worstSec.toFixed(0)} 秒 = ${budget} token）` +
+        `必须小于它的超时线（${tier} = ${timeoutSec} 秒）—— 否则必然超时、角色整轮缺席`,
     );
     /*
      * ⚠️ 也不能太小：实测 `market_analyst` 在 12 标的材料 + mt=1024 时
-     * `content = 0 字`（只想不说），而 mt=2048 能出 3917 字。
+     * `content = 0 字`（只想不说）。
      */
     assert.ok(budget! >= 1024, `★ ${role} 的预算不能低于 1024（实测 1024 会 content=0 字）`);
   }
-  /* 辩论/裁决需要完整论证，可以更大 —— 但也不该到 8192。 */
-  for (const role of ['bull', 'bear', 'judge']) {
-    assert.ok(ROLE_MAX_TOKENS[role]! <= 4096, `★ ${role} 的预算应当 ≤4096（当前 ${ROLE_MAX_TOKENS[role]}）`);
-  }
+  /* 辩论/裁决需要完整论证，可以更大 —— 但同样受它们自己的超时线约束。 */
+  assert.ok(
+    ROLE_MAX_TOKENS['judge']! <= 8192,
+    `★ judge 的预算不应超过 8192（当前 ${ROLE_MAX_TOKENS['judge']}）`,
+  );
 });
 
 test('★ 分析师预算必须【小于】辩论/裁决（按任务分配，不是一刀切）', () => {
