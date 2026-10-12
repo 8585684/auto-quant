@@ -144,6 +144,7 @@ import { useLiveCycle, useEvents, type LiveCycle } from '../lib/store';
 import { TeamRoster } from './TeamRoster';
 import { FeedErrorBoundary } from './FeedErrorBoundary';
 import { parseTeamTrace } from '../lib/teamTrace';
+import { DebateView } from './DebateView';
 import { usePolled } from '../lib/hooks';
 import { Badge, Empty, Panel, Spinner3, cn } from './ui';
 import { ActionBadge, STATUS_LABELS, actionLabel, isOpenAction } from './DecisionAudit';
@@ -1245,6 +1246,22 @@ export function CycleBlock({ record, symbols }: { record: DecisionRecord; symbol
         **另两种模式的界面逐字节不变**。
       */}
       <TeamTraceBlock rawResponse={record.rawResponse} />
+
+      {/*
+        **多空辩论视图**（团队模式）。
+
+        用户要求看板「**很大区别于前两种模式**」，而辩论是这个架构里
+        **最该被看住的一环** —— 调研有硬证据：
+
+          · 谄媚（sycophancy）会让辩论的准确率**低于**单智能体基线
+            （arXiv:2509.23055）：两边说着说着就附和了；
+          · agent 是**低方差**的，一个犯错的很可能许多个都错。
+
+        角色列表只显示"已完成"，看不出**多空两边是不是真的对立** ——
+        所以辩论单独一块视图。与 `TeamTraceBlock` 同一个数据源（`<team>` 块），
+        **不需要新增数据库列**，另两种模式不渲染。
+      */}
+      <DebateView members={parseTeamTrace(record.rawResponse)?.members ?? []} />
 
       {/*
         决策盒子：**一轮只有这一个**边框。每条决策只是里面的一段，没有自己的边框。
