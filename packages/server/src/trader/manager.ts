@@ -473,7 +473,36 @@ function ensureResearchRefresher(
     const controller = new AbortController();
     researchAborts.set(traderId, controller);
     void refreshResearch(traderId, symbols, apiKey, controller.signal)
-      .catch(() => undefined)
+      /*
+       * ⚠️⚠️ **不能写成 `.catch(() => undefined)`**（2026-10-13 实测抓到）。
+       *
+       * ## 事故现象
+       *
+       * 线上日志停在最后一句"4 个来源全部有产出。"，**之后再无任何调研日志** ——
+       * 既没有"可用情报 N 条"，也没有"退回原文"，也没有任何错误。
+       * 看起来像"后台调研跑完了但什么都没查到"，而**真相是它抛异常了**。
+       *
+       * 排查时我完全无从下手：`refreshResearch` 里每一个分支都会写日志，
+       * 唯独"抛异常"这条路径**一个字都不留**。
+       *
+       * ## 为什么这条特别危险
+       *
+       * 它是**后台任务**：没人 await 它，异常不会冒泡到任何地方 ——
+       * 如果这里吞掉，那个异常就**永远消失了**。
+       * 而"团队没有新闻材料"这个现象，既可能来自"真的没查到"，
+       * 也可能来自"代码炸了" —— **两者在界面上长得一模一样**。
+       *
+       * 所以这里必须**写日志**。这也是本项目反复强调的那条：
+       * **"知道它失败"与"知道它为什么失败"是两件事。**
+       */
+      .catch((error: unknown) => {
+        const message = error instanceof Error ? error.message : String(error);
+        runtimeLogs.write(traderId, 'error', 'team', `[调研] 后台刷新异常：${message.slice(0, 300)}`);
+        /* 堆栈也留下 —— 只有 message 往往指不到行号。 */
+        if (error instanceof Error && error.stack !== undefined) {
+          runtimeLogs.write(traderId, 'error', 'team', `[调研] 堆栈：${error.stack.slice(0, 500)}`);
+        }
+      })
       .finally(() => {
         const cur = researchCache.get(traderId);
         if (cur !== undefined) cur.refreshing = false;
@@ -617,25 +646,98 @@ async function refreshResearch(
   const merged = mergeHunterReports(reports);
   const parsed = parseIntelReport(merged, Date.now(), 'news_hunter');
   if (parsed.intel.length > 0) {
-    const ranked = rankIntel(parsed.intel, Date.now());
+    /*
+     * ⚠️⚠️ **`requireConfirmed: false`**（2026-10-13 实测后改）。
+     *
+     * ## 为什么改（实测数据）
+     *
+     * 线上真实一次调研的 3 条情报：
+     * ```
+     *   · coinstats.app · 72.0h前 · weight=0.00 · 独立来源=1 · confirmed=false
+     *   · www.forbes.com · 72.0h前 · weight=0.00 · 独立来源=1 · confirmed=false
+     *   · pluang.com    · 24.0h前 · weight=0.33 · 独立来源=1 · confirmed=false
+     *
+     *   rankIntel(默认)         → 0 条   ← 全部剔除
+     *   rankIntel(不要求确认)   → 1 条   ← pluang 那条本可用
+     * ```
+     *
+     * `independentSources` 的算法是"**同一个事件**被几个不同域名报道"。
+     * 而三家媒体**报道的是三件不同的事** —— 所以这个数**在实践中几乎永远是 1**，
+     * 于是 `confirmed` 永远为 `false`、**新闻永远进不了决策**。
+     * 这正是"零决策"链条的最后一环。
+     *
+     * ## 更重要的：这条规则与用户的明确要求冲突
+     *
+     * > 「系统**不再设置内置风控**（我的想法是既然都要做这么智能了，
+     * >  那么风格也应该由一个智能体来负责，而不是系统内置简单风控规则）」
+     *
+     * `requireConfirmed` 正是一个**内置规则替 AI 做决定** ——
+     * 而且它做的是最坏的那种决定：**把情报扔掉**，
+     * 而不是**把情报和它的可信度一起交给 AI**。
+     *
+     * ## 改法：标注，而不是丢弃
+     *
+     * · **过期**（`weight <= 0`）仍然剔除 —— 那是"事实层面的旧"，不是判断问题；
+     * · **未确认**的**保留**，但在文本里**明确标注**"单一来源 · 未确认" ——
+     *   让裁决官看到它、并**自己决定**给多少权重。
+     *
+     * 这样"防幻觉"的目的仍然达到（AI 知道它只有一个来源），
+     * 但**决定权回到了 AI 手里** —— 与需求 ③ 一致。
+     */
+    const ranked = rankIntel(parsed.intel, Date.now(), { requireConfirmed: false });
     if (ranked.length > 0) {
       const text = ranked
         .map((r) => {
           const h = (r.assessment.ageMs / 3_600_000).toFixed(1);
+          /*
+           * ⚠️ **可信度必须写在文本里** —— 否则 `requireConfirmed: false`
+           * 就变成"悄悄放宽了标准"，而 AI 不知道自己拿到的是单来源情报。
+           */
+          const trust = r.assessment.confirmed
+            ? `已确认（${r.assessment.independentSources} 个独立来源）`
+            : `**单一来源 · 未确认**（${r.assessment.independentSources} 个来源）`;
           return `- [${r.intel.direction}] ${r.intel.summary}\n` +
-            `  来源：${r.intel.sourceUrl}（${r.assessment.independentSources} 个独立来源）\n` +
+            `  来源：${r.intel.sourceUrl}（${trust}）\n` +
             `  ${h} 小时前 · ${r.assessment.verdict}`;
         })
         .join('\n');
       researchCache.set(traderId, { text, at: Date.now(), refreshing: false });
+      const unconfirmed = ranked.filter((r) => !r.assessment.confirmed).length;
       runtimeLogs.write(
         traderId, 'info', 'team',
-        `[调研] 可用情报 ${ranked.length} 条（过期/未确认被剔除 ${parsed.intel.length - ranked.length} 条）`,
+        `[调研] 可用情报 ${ranked.length} 条（过期被剔除 ${parsed.intel.length - ranked.length} 条` +
+          (unconfirmed > 0 ? `；其中 ${unconfirmed} 条为单一来源未确认，已标注供裁决官自行权衡` : '') +
+          '）',
       );
       return;
     }
-    const note = '（本轮没有可用的新鲜情报：查到的不够新，或只有单一来源未经确认）';
+    const note = '（本轮没有可用的新鲜情报：查到的都过期了）';
     researchCache.set(traderId, { text: note, at: Date.now(), refreshing: false });
+    /*
+     * ⚠️ **这里必须写日志**（2026-10-13 实测踩到）。
+     *
+     * ## 事故现象
+     *
+     * 线上日志停在"4 个来源全部有产出。"，**之后再无任何调研日志** ——
+     * 既没有"可用情报 N 条"，也没有"退回原文"，也没有异常。
+     * 于是"团队没有新闻材料"这件事**完全没有解释**。
+     *
+     * 而真相是：`parseIntelReport` 解析出 **3 条**情报，
+     * 但 `rankIntel` 把它们**全部剔除**（`hoursAgo` 缺失 → 判为过期）
+     * → 走到这个分支 → **而这个分支一句话都不说**。
+     *
+     * ## 为什么这条日志是必须的
+     *
+     * "查到 3 条但都被时效过滤掉" 与 "什么都没查到" 是**两件不同的事**：
+     * 前者说明**猎手在正常工作、但输出缺字段**（该改提示词）；
+     * 后者说明**信息源本身没有消息**（不该改代码）。
+     * 不写日志就把这两件事混成了一件 —— 而那正是我这次排查花了很久的原因。
+     */
+    runtimeLogs.write(
+      traderId, 'warn', 'team',
+      `[调研] 查到 ${parsed.intel.length} 条情报但**全部被时效/交叉验证剔除** —— ` +
+        '本轮没有可用情报（这通常是猎手输出缺 `hoursAgo`，不是"那边没有消息"）',
+    );
     return;
   }
   /* 解析不出结构化情报 → 退回合并后的原文（格式没对上，但原文仍可能有信息）。 */
@@ -1610,7 +1712,7 @@ export class TraderManager {
              * 全部被规则剔除（都过期或都未确认）—— 这也是**有效结论**：
              * "本轮没有可用的新鲜情报"。明说，而不是给一段旧消息。
              */
-            const note = '（本轮没有可用的新鲜情报：查到的不够新，或只有单一来源未经确认）';
+            const note = '（本轮没有可用的新鲜情报：查到的都过期了）';
             researchCache.set(traderId, { text: note, at: Date.now(), refreshing: false });
             return note;
           }
