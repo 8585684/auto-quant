@@ -95,15 +95,41 @@ test('★ 429 有两种含义，必须靠 message 区分（实测结论）', () 
   assert.equal(limited.shouldRetry, true);
 });
 
-test('★ HTTP 200 但内容为空 + finish=length → 加大预算重试，【不降级】', () => {
+test('★ HTTP 200 + 空内容 + finish=length → 先加预算重试，失败后【换模型】', () => {
   /*
-   * 实测：gpt-6-astra 在 max_tokens=16/128 时 content=null、reasoning=435/475。
-   * 这不是"模型坏了"，是"思维链把预算吃光了" —— 降级会白白丢掉最强模型。
+   * ## 这条判据改过三次，最终依据是实测（2026-10-12）
+   *
+   * ### 原设计：`shouldFallback: false`
+   *
+   * 理由："思维链吃光预算是加预算能修的，换模型会白丢最强模型。"
+   *
+   * ### 实测：**只对小材料成立**
+   *
+   * 真实角色材料 55,014 字符，同一路由组：
+   * ```
+   *   max_tokens=1024 → 15.7s · finish=length · content=   0 字 · reasoning= 2239 字
+   *   max_tokens=2048 → 27.7s · finish=length · content=   0 字 · reasoning= 2649 字
+   *   max_tokens=4096 → 47.5s · finish=length · content=   0 字 · reasoning= 9632 字
+   * ```
+   * **加预算完全无效 —— 它只是"想得更久"，永远不写正式回答。**
+   *
+   * 而同一模型在小输入下完全正常：
+   * ```
+   *   小输入 + 描述任务 → 6.8s · finish=stop · content=126 字   ✅
+   * ```
+   *
+   * ### 所以：`shouldFallback: true`
+   *
+   * 判据里**拿不到"材料多大"**，所以选更安全的行为：
+   * **换模型**（代价：多一次调用；收益：不至于整条链冷却、角色缺席）。
+   *
+   * ⚠️ `shouldRetry: true` 保留 —— 先加预算重试一次仍然值得
+   *（小材料那种情况它能修好），失败后**再换**。两种场景都覆盖。
    */
   const v = classifyFailure({ status: 200, message: '', emptyContent: true, finishReason: 'length' });
   assert.equal(v.kind, 'empty_content');
-  assert.equal(v.shouldFallback, false, '★ 不该降级 —— 加预算重试就行');
-  assert.equal(v.shouldRetry, true);
+  assert.equal(v.shouldFallback, true, '★ 大材料场景下加预算修不了，必须允许换模型');
+  assert.equal(v.shouldRetry, true, '★ 但仍先加预算重试一次（小材料场景它能修）');
 });
 
 test('★ 400 请求错【不降级】—— 降级会掩盖真正的 bug', () => {

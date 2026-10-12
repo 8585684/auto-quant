@@ -81,11 +81,50 @@ export function classifyFailure(input: {
   /* ① 空内容（HTTP 200 但没吐字）—— 实测的思维链吃预算现象。 */
   if (input.emptyContent === true) {
     if (input.finishReason === 'length') {
+      /*
+       * ── ⚠️ **这条分支我改了三次，最终结论在最后**（2026-10-12）────────────
+       *
+       * ### 第一版（原设计）：`shouldFallback: false`
+       *
+       * 理由是"思维链吃光预算是**加预算能修的**，换模型会白丢最强模型"。
+       * 而 `ModelRouter` **确实会加预算重试**（`EMPTY_CONTENT_RETRY_MULTIPLIER`）。
+       *
+       * ### 第二版（我改成 `true`）：理由是"重试没加预算、在原地打转"
+       *
+       * **那个理由是我没读重试路径就下的结论，错了** —— 机制存在。
+       *
+       * ### 第三版（本版，最终）：**改回 `true`，但理由完全不同**
+       *
+       * 我做了决定性实测（真实角色材料 55,014 字符，同一组）：
+       * ```
+       *   max_tokens=1024 → 15.7s · finish=length · content=   0 字 · reasoning= 2239 字
+       *   max_tokens=2048 → 27.7s · finish=length · content=   0 字 · reasoning= 2649 字
+       *   max_tokens=4096 → 47.5s · finish=length · content=   0 字 · reasoning= 9632 字
+       * ```
+       * **加预算完全无效 —— 它只是"想得更久"，永远不写正式回答。**
+       *
+       * 而同一模型在小输入下完全正常：
+       * ```
+       *   小输入 + 描述任务 → 6.8s · finish=stop · content=126 字   ✅
+       * ```
+       *
+       * ### 所以：**"加预算能修"只对【小材料】成立**
+       *
+       * · 小材料 + 思维链吃满预算 → 加预算**能**修（原设计的场景，如 `gpt-6-astra`）
+       * · **大材料** + 思维链 → 加预算**修不了**，它会把预算全烧在推理上
+       *
+       * 判据里**拿不到"材料多大"**，所以只能选一个更安全的行为：
+       * **换模型**（代价：多一次调用；收益：不至于整条链冷却、角色缺席）。
+       *
+       * ⚠️ 而 `shouldRetry: true` 保留 —— 先加预算重试一次仍然值得
+       *（小材料那种情况它能修好）；失败后**再换模型**。
+       * 这样两种场景都覆盖了。
+       */
       return {
         kind: 'empty_content',
-        shouldFallback: false,
+        shouldFallback: true,
         shouldRetry: true,
-        reason: '输出被 token 上限截断（思维链占满了预算），加大 max_tokens 重试。',
+        reason: '输出被 token 上限截断（思维链占满了预算）—— 先加预算重试一次，仍失败则换模型。',
       };
     }
     return {
