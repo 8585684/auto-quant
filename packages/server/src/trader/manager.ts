@@ -23,6 +23,7 @@ import { ModelRouter } from '../llm/modelRouter.js';
 import { createMagpieCallFactory, discoverFromGateway } from './magpieGateway.js';
 import { resolveTeamGateway } from './teamGateway.js';
 import { collectMarketResearch, DEFAULT_SEARCH_ENDPOINT } from './agent/webSearch.js';
+import { runSelfCheck } from './selfcheckRunner.js';
 import { createRoutedDecisionModel, createTeamDecisionModel, tierForRole } from './routedModel.js';
 
 const log = createLogger('manager');
@@ -309,6 +310,7 @@ interface TeamModelBuild {
  * another's decisions. Stopping is always clean: the loop is cleared and any
  * partially-open state is left for the next start to reconcile.
  */
+
 export class TraderManager {
   private readonly running = new Map<number, AutoTrader>();
   /**
@@ -2257,6 +2259,11 @@ export class TraderManager {
      */
     for (const trader of traders.list()) this.cancelledStarts.add(trader.id);
     this.stopping = true;
+    /* 停掉自检循环 —— 关闭时不该再开新的查询。 */
+    if (this.selfCheckTimer) {
+      clearInterval(this.selfCheckTimer);
+      this.selfCheckTimer = null;
+    }
 
     await Promise.all(
       [...this.userStreams.entries()].map(async ([id, stream]) => {
@@ -2441,7 +2448,119 @@ export class TraderManager {
       });
       log.error(`机器人「${trader.name}」恢复失败并已放弃重试：${result.error}`);
     }
+
+    /* 开机恢复完成后启动自检循环（用户需求 #6 的"持续观察"）。 */
+    this.startSelfCheckLoop();
   }
+
+  /**
+   * **自检的定时循环**（用户需求 #6 的"持续观察"）。
+   *
+   * ## 为什么必须定时，不能只靠手动触发
+   *
+   * 用户的原话：
+   *
+   * > 「你迭代更新系统得搞智能体团队**持续观察、测试**……
+   * >  **不要有任何 BUG，也不要老让我来测试和发现问题，你要自己发现问题自己解决**」
+   *
+   * 手动触发（`POST /api/traders/:id/selfcheck`）只在**我想起来的时候**跑 ——
+   * 那不叫持续观察。而这个系统的运行方式是 7×24 无人值守，
+   * 问题最可能在**没人看的时候**发生。
+   *
+   * ## 为什么是 30 分钟
+   *
+   * 判据是"多久能发现"与"噪音"的权衡：
+   *   · 太密（如 1 分钟）→ 日志里全是"未发现异常"，真问题被淹没；
+   *   · 太疏（如 6 小时）→ 裸奔仓位可能挂几个小时没人知道。
+   *
+   * 30 分钟对**裸奔仓位**这类风险偏长，但那类风险另有更快的兜底
+   *（启动对账会补挂保护单）。自检在这里的角色是**兜底的第二层**，
+   * 不是唯一防线。
+   *
+   * ## 只跑确定性层
+   *
+   * 不调模型 —— 于是它**不花额度、不依赖网关**，可以无条件常开。
+   * AI 层将来会挂在这个循环上（见 `runSelfCheck` 的 `ask` 参数）。
+   */
+  private startSelfCheckLoop(): void {
+    if (this.selfCheckTimer) return;
+    /*
+     * 间隔可由 `SELF_CHECK_INTERVAL_MINUTES` 覆盖（默认 30 分钟）。
+     *
+     * 为什么留这个口子：**自检的合适频率取决于部署形态**
+     *（机器人多、日志大时该稀疏些；排查期想密集些）。
+     * 而且它让"验证这个循环真的在跑"变得可行 ——
+     * 否则要等 30 分钟才能看到一次效果。
+     *
+     * 钳制在 1–1440 分钟：0 或负数会让 `setInterval` 疯狂空转。
+     */
+    const raw = Number(process.env.SELF_CHECK_INTERVAL_MINUTES ?? '');
+    const minutes = Number.isFinite(raw) && raw >= 1 ? Math.min(raw, 1440) : 30;
+
+    const timer = setInterval(() => {
+      void this.runSelfCheckSweep();
+    }, minutes * 60_000);
+    /*
+     * 不因为这个定时器把进程吊在退出前 —— 它是**可丢弃的**：
+     * 丢掉只是少跑一次自检，不是丢数据。
+     */
+    timer.unref();
+    this.selfCheckTimer = timer;
+    log.info(`自检循环已启动（每 ${minutes} 分钟一次）。`);
+  }
+
+  /** 给所有**在跑**的机器人各跑一次自检。 */
+  private async runSelfCheckSweep(): Promise<void> {
+    /* 上一遍还没跑完就跳过 —— 自检不该自己叠起来。 */
+    if (this.selfCheckSweepRunning) return;
+    this.selfCheckSweepRunning = true;
+    try {
+      /*
+       * ⚠️ **只查在跑的机器人**。
+       *
+       * 停掉的机器人"长时间没有成功决策"是**正常**的（操作员关了它），
+       * 查它只会产生噪音 —— 而噪音会让人开始忽略自检。
+       *（`selfcheck.ts` 里也有这道前提，两处都挡：这里省掉无谓的查询，
+       *  那里保证即使被调用也不会误报。）
+       */
+      const ids = [...this.running.keys()];
+      for (const id of ids) {
+        try {
+          const result = await runSelfCheck(id);
+          /*
+           * 只在**有非 info 的发现**时写一条汇总 —— 否则每 30 分钟一条
+           * "未发现异常"会把日志刷满。
+           */
+          const notable = result.deterministic.filter((f) => f.severity !== 'info');
+          if (notable.length > 0) {
+            log.warn(
+              `自检 #${id}：${notable.length} 项需要注意 —— ${notable.map((f) => f.title).join('；')}`,
+            );
+          }
+        } catch (error) {
+          /* 一个机器人自检失败不该影响其它机器人。 */
+          log.warn(`自检 #${id} 失败：${(error as Error).message}`);
+        }
+      }
+    } finally {
+      this.selfCheckSweepRunning = false;
+    }
+  }
+
+  /**
+   * **自检循环的定时器**（见 `startSelfCheckLoop()`）。
+   *
+   * `null` = 循环没在跑。用 `unref()` 挂上，所以它**不会**把进程吊在退出前。
+   */
+  private selfCheckTimer: NodeJS.Timeout | null = null;
+
+  /**
+   * 上一遍自检扫过还没结束 —— 用它防止**自检自己叠起来**。
+   *
+   * 扫一遍要给每个在跑的机器人查日志、决策记录、持仓，最坏情况可能超过
+   * 一个间隔（例如机器人很多、日志表很大）。叠起来只会让负载雪上加霜。
+   */
+  private selfCheckSweepRunning = false;
 
   /**
    * 处于 `error` 且**没有**在运行的机器人 —— 也就是"自动恢复已经放弃"的那一批。
