@@ -34,6 +34,7 @@ import {
 import {
   AutoTrader,
   CYCLE_HARD_TIMEOUT_MS,
+  detectSharpMove,
   describeCycleFailure,
   LEDGER_GAP_TOLERANCE_ABS,
   ledgerGapTolerance,
@@ -6447,4 +6448,75 @@ test('★ 从没跑过的机器人（lastCycleAt 为空）重启时【立刻跑�
 
   assert.ok(calls > 0, '★ 首次启动应当立刻分析');
   await trader.stop();
+});
+test('★★★ 持仓剧变检测：超阈值才触发，且报出最极端的那个', () => {
+  /*
+   * ## 为什么需要它（"持续工作"缺的最后一块）
+   *
+   * 已有的提前唤醒只有一个触发源：**成交**（`manager.ts` 里那句
+   * `requestEarlyCycle('有成交')`）。而真正需要"立刻看一眼"的情形里，
+   * **大多数没有成交**：
+   * ```
+   *   · 持仓标的突然拉升 8% —— 该考虑止盈/移动止损，但没成交就不唤醒
+   *   · 大盘急跌 —— 该考虑减仓，但没成交就不唤醒
+   * ```
+   * 于是团队只能等到下一个周期（最长 120 分钟）——
+   * **而止损可能已经被打掉了，团队还在按"持有"思考**。
+   */
+  /* 阈值内 → 不触发（1 分钟的噪音不是"重新评估"的理由）。 */
+  assert.equal(
+    detectSharpMove({ moves: [{ symbol: 'BTCUSDT', changePercent: 0.8 }], threshold: 3 }),
+    null,
+    '★ 阈值内的波动不该唤醒',
+  );
+  /* 超阈值 → 触发，且带方向与幅度。 */
+  const up = detectSharpMove({ moves: [{ symbol: 'ETHUSDT', changePercent: 5.5 }], threshold: 3 });
+  assert.ok(up !== null && up.includes('ETHUSDT') && up.includes('涨') && up.includes('5.50'), `★ 实际：${up}`);
+  const down = detectSharpMove({ moves: [{ symbol: 'SOLUSDT', changePercent: -4.2 }], threshold: 3 });
+  assert.ok(down !== null && down.includes('跌') && down.includes('4.20'), `★ 实际：${down}`);
+});
+
+test('★★★ 多个剧变时报【最极端】的，并说明还有几个', () => {
+  /*
+   * ⚠️ 若只报第一个，操作员会以为是"唯一的一个" ——
+   * 而实际有三个标的在剧变。**省略必须说出来**（本项目的既有纪律）。
+   */
+  const r = detectSharpMove({
+    moves: [
+      { symbol: 'AAAUSDT', changePercent: 3.2 },
+      { symbol: 'BBBUSDT', changePercent: -9.8 },
+      { symbol: 'CCCUSDT', changePercent: 4.0 },
+    ],
+    threshold: 3,
+  });
+  assert.ok(r !== null);
+  assert.ok(r!.includes('BBBUSDT'), '★ 应当报绝对值最大的那个');
+  assert.ok(r!.includes('另有 2 个'), `★ 必须说出还有几个（实际：${r}）`);
+});
+
+test('★ 非有限数不参与判断（NaN 不该被当成"没变化"）', () => {
+  /*
+   * ⚠️ `NaN >= 3` 是 `false` —— 若不显式过滤，一个 NaN 会**静默地**
+   * 让那个标的永远不被检测到（而它不是"没变化"，是"数据坏了"）。
+   */
+  const r = detectSharpMove({
+    moves: [
+      { symbol: 'BADUSDT', changePercent: Number.NaN },
+      { symbol: 'OKUSDT', changePercent: 6 },
+    ],
+    threshold: 3,
+  });
+  assert.ok(r !== null && r!.includes('OKUSDT'), '★ 坏数据不该掩盖好数据');
+  assert.ok(!r!.includes('BADUSDT'), '★ 坏数据不该被报出来');
+});
+
+test('★ 空列表 / 全部在阈值内 → 不触发（这是常态，必须静默）', () => {
+  assert.equal(detectSharpMove({ moves: [], threshold: 3 }), null);
+  assert.equal(
+    detectSharpMove({
+      moves: [{ symbol: 'A', changePercent: 1 }, { symbol: 'B', changePercent: -2 }],
+      threshold: 3,
+    }),
+    null,
+  );
 });

@@ -745,6 +745,68 @@ export function shouldEarlyWake(input: {
 }
 
 /**
+ * **持仓剧变的触发阈值**（百分比，2026-10-13）。
+ *
+ * ## 为什么是 3%
+ *
+ * 它必须同时满足两个约束：
+ * ```
+ *   ① 明显大于正常的分钟级波动 —— 否则震荡市里天天触发（那不是信号）；
+ *   ② 小于"一个值得重新评估"的幅度 —— 否则错过机会。
+ * ```
+ * 3% 是这两个约束的**保守交集**。
+ *
+ * ⚠️ 可由 `AQ_SHARP_MOVE_PERCENT` 覆盖 ——
+ * "多大的波动值得看一眼"取决于标的与周期，硬编码一个值不合适。
+ */
+const SHARP_MOVE_THRESHOLD_PERCENT = 3;
+
+/**
+ * **行情剧变检测**（2026-10-13 加）—— "持续工作"缺的最后一块。
+ *
+ * ## 之前缺的是什么
+ *
+ * 已有的提前唤醒只有**一个**触发源：
+ * ```
+ *   manager.ts   autoTrader.requestEarlyCycle('有成交')
+ * ```
+ * 也就是说：**只有在【成交】之后**团队才会提前醒来。
+ *
+ * 而真正需要"立刻看一眼"的情形里，**大多数没有成交**：
+ * ```
+ *   · 持仓标的突然拉升 8% —— 该考虑止盈/移动止损，但没成交就不唤醒
+ *   · 大盘急跌 —— 该考虑减仓，但没成交就不唤醒
+ *   · 一个候选突破 —— 该考虑开仓，但没成交就不唤醒
+ * ```
+ * 于是团队**只能等到下一个周期**（最长 120 分钟）。
+ *
+ * ## 判据：**相对基准价的变动幅度**
+ *
+ * 用"上次评估时的价格"作基准，而不是"前一分钟价格"——
+ * 后者会在震荡市里疯狂触发（1 分钟的噪音不是信号）。
+ *
+ * ⚠️ **必须配一道冷却期**（调用方负责）：行情单边时价格会**持续**偏离基准，
+ * 若只看幅度，每轮都会触发 —— 而那是"同一件事重复唤醒"。
+ *
+ * @param input.moves     各标的相对基准价的百分比变动
+ * @param input.threshold 触发阈值（百分比，取绝对值）
+ * @returns 触发原因（`null` = 不触发）
+ */
+export function detectSharpMove(input: {
+  moves: ReadonlyArray<{ symbol: string; changePercent: number }>;
+  threshold: number;
+}): string | null {
+  const hits = input.moves
+    .filter((m) => Number.isFinite(m.changePercent) && Math.abs(m.changePercent) >= input.threshold)
+    .sort((a, b) => Math.abs(b.changePercent) - Math.abs(a.changePercent));
+  if (hits.length === 0) return null;
+  const top = hits[0]!;
+  const dir = top.changePercent > 0 ? '涨' : '跌';
+  const more = hits.length > 1 ? `（另有 ${hits.length - 1} 个标的同向剧变）` : '';
+  return `${top.symbol} ${dir} ${Math.abs(top.changePercent).toFixed(2)}%${more}`;
+}
+
+/**
  * **安全解析 `positions.intel_keys`**（2026-10-12）。
  *
  * ## 为什么不能直接 `JSON.parse`
@@ -774,6 +836,31 @@ function parseIntelKeysOf(raw: string | null | undefined): string[] {
 }
 export class AutoTrader {
   private timer: NodeJS.Timeout | null = null;
+  /**
+   * **持仓剧变监控的定时器**（2026-10-13 加）。
+   *
+   * 与 `timer`（决策循环）**完全分开** —— 它的职责只有一个：
+   * 每隔一段时间问一次"我手上的仓位是不是发生了值得重新评估的变化"，
+   * 是就调 `requestEarlyCycle()` 把决策循环提前叫醒。
+   *
+   * ## 为什么必须是独立循环
+   *
+   * 决策循环的间隔**由模型自己定**（1–120 分钟）。而"持仓突然跌了 8%"
+   * 这件事**不等模型排期** —— 它可能发生在刚排完 120 分钟之后。
+   * 若等下一轮才发现，**止损可能已经被打掉了，而团队还在按"持有"思考**。
+   *
+   * ⚠️ 它**只在 `ai_team` 模式启动**（见 `startMoveWatch`）——
+   * 用户硬约束：不能改变现有实盘机器人（`#10 赚大钱` 是 `ai_managed`）。
+   */
+  private moveWatchTimer: NodeJS.Timeout | null = null;
+  /**
+   * **各标的的基准价**（`symbol → 价格`）—— 上次评估时记下的。
+   *
+   * ⚠️ 基准要"跟着评估走"，而不是"跟着时间走"：
+   * 用"1 分钟前的价格"做基准会在震荡市里疯狂触发，
+   * 而**1 分钟的噪音不是要重新评估的理由**。
+   */
+  private moveBaseline = new Map<string, number>();
   private running = false;
   /**
    * 模型这一轮要求的"下次什么时候再看盘"（分钟）。
@@ -1067,6 +1154,12 @@ export class AutoTrader {
     const cycleMs = Math.max(1, this.deps.trader.cycleIntervalMinutes) * 60_000;
     const elapsedMs = lastCycleAtMs === null ? Number.POSITIVE_INFINITY : Date.now() - lastCycleAtMs;
 
+    /*
+     * **持仓剧变监控**（2026-10-13 加）—— 见 `moveWatchTimer` 的说明。
+     * 只对 `ai_team` 启动（用户硬约束：不改现有实盘机器人的行为）。
+     */
+    void this.startMoveWatch();
+
     if (elapsedMs >= cycleMs) {
       /* 从没跑过，或者停机超过一个周期 —— 立刻跑（操作员在等 / 行情已变）。 */
       void this.tick();
@@ -1197,9 +1290,9 @@ export class AutoTrader {
     }, delayMs);
   }
 
+
   /**
    * **事件驱动的提前唤醒** —— 让"不等定时"这件事真正落地。
-   *
    * ## 用户的要求（这是本方法存在的理由）
    *
    * > 「系统**不再是像现在这样定时去工作**，而是持续、并发的工作，增加盈利的可能」
@@ -1277,6 +1370,127 @@ export class AutoTrader {
   }
 
   /**
+   * **启动持仓剧变监控**（2026-10-13 加）—— "持续工作"缺的最后一块。
+   *
+   * ## 为什么需要它（与 `requestEarlyCycle` 的分工）
+   *
+   * 已有的提前唤醒只有一个触发源：**成交**。而真正需要"立刻看一眼"的情形里，
+   * **大多数没有成交**：
+   * ```
+   *   · 持仓标的突然拉升 8% —— 该考虑止盈/移动止损，但没成交就不唤醒
+   *   · 大盘急跌 —— 该考虑减仓，但没成交就不唤醒
+   * ```
+   * 于是团队**只能等到下一个周期**（最长 120 分钟）——
+   * 而**止损可能已经被打掉了，团队还在按"持有"思考**。
+   *
+   * ## 边界（刻意收窄，理由都是实测）
+   *
+   * · **只对 `ai_team`** —— 用户硬约束：不改现有实盘机器人（`#10` 是 `ai_managed`）；
+   * · **只看【已持仓】的标的** —— 请求数有界（持仓数通常 0–3），
+   *   而不是"扫描 500 个候选"（那会变成另一个行情轮询器）；
+   * · **基准价跟着【评估】走，不跟着时间走** —— 见 `moveBaseline` 的说明。
+   *
+   * ⚠️ 间隔可用 `AQ_MOVE_WATCH_SECONDS` 覆盖（默认 60 秒）——
+   * 留这个口子是为了**能验证它真的在跑**（否则要等一分钟才看到一次效果）。
+   */
+  private async startMoveWatch(): Promise<void> {
+    if (this.moveWatchTimer !== null) return;
+    /* 只对 AI 团队模式 —— 见上面"边界"。 */
+    let mode: string = this.deps.trader.mode;
+    try {
+      const fresh = traderStore.get(this.deps.trader.id);
+      if (fresh) mode = fresh.mode;
+    } catch {
+      /* 读失败就用启动时那份 */
+    }
+    if (mode !== 'ai_team') return;
+
+    const raw = Number(process.env.AQ_MOVE_WATCH_SECONDS ?? '');
+    const seconds = Number.isFinite(raw) && raw >= 10 ? Math.min(raw, 3600) : 60;
+
+    const timer = setInterval(() => {
+      void this.checkPositionMoves();
+    }, seconds * 1000);
+    /* 不因为这个定时器把进程吊住 —— 它是可丢弃的。 */
+    timer.unref();
+    this.moveWatchTimer = timer;
+    this.emit('info', `持仓剧变监控已启动（每 ${seconds} 秒检查一次，只在 AI 团队模式）。`);
+  }
+
+  /** 停止监控（`stop()` 时调用）。 */
+  private stopMoveWatch(): void {
+    if (this.moveWatchTimer !== null) {
+      clearInterval(this.moveWatchTimer);
+      this.moveWatchTimer = null;
+    }
+    this.moveBaseline.clear();
+  }
+
+  /**
+   * **检查一次持仓剧变** —— 有的话把决策循环提前叫醒。
+   *
+   * ⚠️ **不抛错**：这是一个后台监控，它失败不该影响任何东西
+   *（下一轮决策仍会照常评估）。
+   */
+  private async checkPositionMoves(): Promise<void> {
+    try {
+      if (!this.running) return;
+      const traderId = this.deps.trader.id;
+      const open = positionStore.open(traderId);
+      if (open.length === 0) {
+        /* 没持仓就没有"持仓剧变"可言 —— 清掉基准，避免拿旧基准比对。 */
+        this.moveBaseline.clear();
+        return;
+      }
+
+      const moves: Array<{ symbol: string; changePercent: number }> = [];
+      for (const p of open) {
+        const price = await this.deps.broker.getMarkPrice(p.symbol).catch(() => 0);
+        if (!(price > 0)) continue;
+        const base = this.moveBaseline.get(p.symbol);
+        /*
+         * 第一次见到这个标的：只记基准，**不判断** ——
+         * 否则"刚开仓"会被误判成"剧变"（因为没有基准可比）。
+         */
+        if (base === undefined || !(base > 0)) {
+          this.moveBaseline.set(p.symbol, price);
+          continue;
+        }
+        moves.push({ symbol: p.symbol, changePercent: ((price - base) / base) * 100 });
+      }
+
+      const threshold = Number(process.env.AQ_SHARP_MOVE_PERCENT ?? '') || SHARP_MOVE_THRESHOLD_PERCENT;
+      const reason = detectSharpMove({ moves, threshold });
+      if (reason === null) return;
+
+      /*
+       * ⚠️ **触发后立刻重置基准** —— 否则价格持续偏离时会**反复触发**
+       *（那是"同一件事重复唤醒"，而 `EARLY_WAKE_MIN_GAP_MS` 只能挡住其中一部分）。
+       */
+      for (const m of moves) {
+        const price = await this.deps.broker.getMarkPrice(m.symbol).catch(() => 0);
+        if (price > 0) this.moveBaseline.set(m.symbol, price);
+      }
+      this.requestEarlyCycle(`持仓剧变：${reason}`);
+    } catch (error) {
+      /* 后台监控失败不该影响任何东西 —— 下一轮决策仍会照常评估。 */
+      this.emit('warn', `持仓剧变监控失败（不影响决策）：${(error as Error).message}`);
+    }
+  }
+
+  /**
+   * **记下这一轮各标的的价格作为剧变基准**（`tick` 成功拿到行情后调用）。
+   *
+   * ⚠️ 基准必须**跟着评估走** —— 那正是"重新评估过了，从现在开始算"的语义。
+   * 若基准不更新，一个持续偏离的价格会让监控每轮都触发。
+   */
+  private rememberMoveBaseline(snapshots: ReadonlyArray<{ symbol: string; price: number }>): void {
+    for (const s of snapshots) {
+      if (Number.isFinite(s.price) && s.price > 0) this.moveBaseline.set(s.symbol, s.price);
+    }
+  }
+
+  /**
    * Stop the loop and **wait for the cycle already running** to finish.
    *
    * Returning while a cycle is mid-flight is what let a shutdown land between
@@ -1307,6 +1521,8 @@ export class AutoTrader {
     this.running = false;
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
+    /* 持仓剧变监控也要停 —— 否则它会对已停止的机器人调用 requestEarlyCycle。 */
+    this.stopMoveWatch();
     /*
      * ⚠️ **先把在途那一轮掐断，再去等它结束（2026-10-10，用户报的卡顿）。**
      *
@@ -2759,6 +2975,13 @@ export class AutoTrader {
     }
 
     const snapshotBySymbol = new Map(snapshots.map((s) => [s.symbol, s]));
+    /*
+     * **把这一轮的价格记成剧变基准**（2026-10-13）。
+     *
+     * ⚠️ 基准必须**跟着评估走** —— 语义是"从现在开始，涨跌多少才值得再看一眼"。
+     * 若不更新，一个持续偏离的价格会让监控每轮都触发（同一件事重复唤醒）。
+     */
+    this.rememberMoveBaseline(snapshots.map((s) => ({ symbol: s.symbol, price: s.price })));
 
     /* --- 7. Ask the model ------------------------------------------------ */
     const promptPositions = this.buildPromptPositions(localPositions, snapshotBySymbol);
