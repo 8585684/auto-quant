@@ -930,8 +930,7 @@ export class AutoTrader {
      * 在这里算一次而不是每轮算：`aiModelId` 是机器人的属性，运行期不会变。
      */
     const modelLimit = aiModels.get(deps.trader.aiModelId)?.inputTokenLimit ?? 0;
-    this.promptBudget = promptTokenBudget(modelLimit);
-  }
+    this.promptBudget = promptTokenBudget(modelLimit);  }
 
   /**
    * 这一轮组装提示词用的 token 预算（见构造函数里的说明）。

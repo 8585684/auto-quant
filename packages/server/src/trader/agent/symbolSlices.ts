@@ -109,3 +109,161 @@ export function splitMarketContext(marketContext: string): SplitResult | null {
 export function composeSliceContext(shared: string, slice: SymbolSlice): string {
   return shared.length > 0 ? `${shared}\n\n${slice.text}` : slice.text;
 }
+
+/**
+ * **把"标签: [一长串数字]"的行裁成只留最后几个点**（2026-10-12）。
+ *
+ * ## 为什么需要它（实测数据）
+ *
+ * 单个标的的材料 **11,983 字符**，而其中绝大部分是原始 K 线数组：
+ * ```
+ *   === 5M 周期（由旧到新）===
+ *   价格: [0.104560, 0.104520, 0.104670, ... 共 30 个]
+ *   成交量: [1, 2, 3, ... 共 30 个]
+ *   （还有 15M / 1H / 4H，各若干序列）
+ * ```
+ * 而**每个标的的 headline 已经给了所有关键指标的最新值**
+ *（`current_ema20` / `current_macd` / `current_rsi7` / `current_atr14` / `24h_change`）。
+ *
+ * ## 为什么是"保留最后 N 个"而不是"整行删掉"
+ *
+ * 形态判断（`technical` 的任务）需要**最近几根的走向** ——
+ * 整行删掉会让它只能看最新值，看不出"正在往上还是往下"。
+ * 而 30 个点里真正被用来判形态的是**最后几根**。
+ *
+ * ## ⚠️ 安全性：只动"短标签 + 数字列表"这一种行
+ *
+ * 正则要求**行首（可缩进）+ 短标签（≤20 字符，不含 `:` 与 `[`）+ `: [` … `]` + 行尾**。
+ * 正文段落、事件卡、表格都不会匹配 —— 所以它**不会误伤散文**。
+ *
+ * ⚠️ 点数不足 `keepLast` 时**原样返回**（不做无意义改写）。
+ *
+ * @param keepLast 每个序列保留最后几个点（默认 5）
+ */
+export function compactSeriesLines(text: string, keepLast = 5): string {
+  return text.replace(
+    /^([ \t]*)([^:[\n]{1,20}): \[([^\]]*)\][ \t]*$/gm,
+    (full: string, indent: string, label: string, body: string) => {
+      const nums = body.split(',').map((s) => s.trim()).filter((s) => s.length > 0);
+      if (nums.length <= keepLast) return full;
+      const omitted = nums.length - keepLast;
+      return `${indent}${label}: […省略前 ${omitted} 个…, ${nums.slice(-keepLast).join(', ')}]`;
+    },
+  );
+}
+
+/**
+ * **把"全市场概览"那一段裁短**（2026-10-12）。
+ *
+ * ## 为什么它值 15k 字符
+ *
+ * 实测共享部分 18,690 字符，其中 **15k 是这一段**：
+ * ```
+ *   全市场概览（币安 525 个 USDT 永续，按 24h 成交额降序）
+ *   **这不是候选池** —— 每条只有符号、价格、24h 涨跌、24h 成交额……
+ *   BTCUSDT 82969.80 -0.07% 10.8B
+ *   ETHUSDT 2533.62 +1.21% 8.8B
+ *   ...（525 行）
+ * ```
+ *
+ * ## 为什么"分析师"不需要它全部
+ *
+ * 它的用途是"**看见整个市场，发现值得深看的标的**" —— 那是**选币阶段**的活。
+ * 而团队模式里，**候选池已经由代码筛好了**（漏斗 → 候选），
+ * 分析师的任务是"分析给它的这些标的"。
+ *
+ * ⚠️ 而**保留前 N 行**是有意义的：成交额降序 → 前 N 行就是"市场头部在动什么"，
+ * 那是分析师判断"大盘状态"（`market_analyst` 的任务）真正需要的部分。
+ *
+ * ⚠️ **必须显式写出"省略了多少行"** —— 否则模型会以为市场只有这 N 个标的，
+ * 那是**制造一个假事实**（本项目明确禁止：宁可说"截断了"，不能让它误以为完整）。
+ *
+ * @param keepRows 保留前多少行（默认 60）
+ */
+export function compactUniverseOverview(text: string, keepRows = 60): string {
+  /*
+   * 概览行的形状：`SYMBOL 价格 涨跌% 成交额`（四段、空格分隔）。
+   *
+   * ⚠️⚠️ **这里连踩两个坑，都值得写下来**（2026-10-12）：
+   *
+   * ### 坑 1：币名最短 1 个字符
+   *
+   * 我第一版写 `[A-Z0-9]{2,20}`，而实测币安有 `WUSDT`（币名 `W`）——
+   * 它不匹配 → **扫描循环在那里 break** → 整个裁剪静默失效（15k 没省）。
+   *
+   * ### 坑 2：**币安有中文币名**
+   *
+   * 改成 `{1,20}` 之后仍然只裁到 90 行（应裁 525）。真凶在这一行：
+   * ```
+   *   币安人生USDT 0.589600 -4.36% 27M
+   * ```
+   * **`币安人生` 是中文** —— 而 `[A-Z0-9]` 永远匹配不到它。
+   *
+   * ### 结论：**不要假设符号是 ASCII**
+   *
+   * 现在用"**以 `USDT` 结尾、且不含空格**的符号段"，配合后面的
+   * "价格 + 涨跌% + 成交额"三段 —— 形状足够特异，不会误伤散文。
+   */
+  const isRow = (line: string): boolean =>
+    /^\S{1,30}USDT\s+\S+\s+[+-]?\d+(?:\.\d+)?%\s+\S+$/.test(line.trim());
+  const lines = text.split('\n');
+  const idx = lines.findIndex((l) => l.includes('全市场概览'));
+  if (idx < 0) return text;
+  /* 从标题往下找连续的数据行。 */
+  let start = -1;
+  let end = -1;
+  for (let i = idx; i < lines.length; i++) {
+    if (isRow(lines[i]!)) {
+      if (start < 0) start = i;
+      end = i;
+    } else if (start >= 0 && lines[i]!.trim().length > 0) {
+      break;
+    }
+  }
+  if (start < 0 || end - start + 1 <= keepRows) return text;
+  const total = end - start + 1;
+  const kept = lines.slice(start, start + keepRows);
+  const omitted = total - keepRows;
+  return [
+    ...lines.slice(0, start),
+    ...kept,
+    `…（省略其余 ${omitted} 个标的 —— 完整的 ${total} 个见"全市场概览"原始列表。` +
+      `需要看某个没列出来的标的，就用它的完整序列去分析。）`,
+    ...lines.slice(end + 1),
+  ].join('\n');
+}
+
+/**
+ * **给"分析师"用的紧凑材料**（2026-10-12）—— 接线用的总入口。
+ *
+ * ## 与 `splitMarketContext` 的分工
+ *
+ * · `splitMarketContext` 回答"**这是哪个标的的材料**"；
+ * · `compactSeriesLines` 回答"**K 线序列怎么变小**"；
+ * · `compactUniverseOverview` 回答"**525 行概览怎么变小**"。
+ *
+ * 这个函数把三者串起来。**先切分再压缩** ——
+ * 顺序很重要：先切分能让"共享部分"只压一次（而不是每个标的各压一遍）。
+ *
+ * ## 实测效果（真实材料）
+ *
+ * ```
+ *   原文              130,917 字符
+ *   切分 + 压缩序列   单片 22,458（小 5.8 倍）
+ *   再压全市场概览    预计再省 ~13k
+ * ```
+ *
+ * ⚠️ **切不出来时返回 `null`** —— 调用方必须退回原文（与 `splitMarketContext` 同一纪律）。
+ */
+export function compactMarketContext(
+  marketContext: string,
+  keepLast = 5,
+  keepUniverseRows = 60,
+): { shared: string; slices: SymbolSlice[] } | null {
+  const split = splitMarketContext(marketContext);
+  if (split === null) return null;
+  return {
+    shared: compactUniverseOverview(compactSeriesLines(split.shared, keepLast), keepUniverseRows),
+    slices: split.slices.map((s) => ({ symbol: s.symbol, text: compactSeriesLines(s.text, keepLast) })),
+  };
+}
