@@ -244,22 +244,25 @@ export async function runTradingDesk(input: {
   callsUsed += affordable.length;
   const analyses = await Promise.all(
     affordable.map(async (a) => {
-      try {
-        const out = await input.ask(a);
-        note(a.role, 'analysis', out.ok ? `完成（${out.latencyMs}ms）` : `失败：${out.error ?? '未知'}`);
-        return out;
-      } catch (error) {
-        note(a.role, 'analysis', `抛错：${(error as Error).message}`);
-        return {
-          role: a.role,
-          modelId: '（未调用成功）',
-          data: null,
-          raw: '',
-          latencyMs: 0,
-          ok: false,
-          error: (error as Error).message,
-        } satisfies DeskRoleOutput;
-      }
+      /*
+       * ⚠️ **必须走 `safeAsk`**（2026-10-12 实测踩到）。
+       *
+       * 原来这里直接 `input.ask(a)` + 自己的 try/catch ——
+       * 于是**角色级超时对它不生效**（超时是在 `safeAsk` 里做的）。
+       *
+       * 后果实测可见：
+       * ```
+       *   [analysis] technical：完成（398758ms）      ← T1 档，超时该是 60 秒
+       *   [analysis] market_analyst：完成（400858ms）
+       * ```
+       * **一个分析师跑了 398 秒**，而整轮就是被它拖到 7 分钟以上的。
+       *
+       * 而 `technical` 是 T1（"体力活"档）—— 它花 398 秒**本身就是异常信号**，
+       * 正是角色超时要拦的那种情况。
+       */
+      const out = await safeAsk(input.ask, a);
+      note(a.role, 'analysis', out.ok ? `完成（${out.latencyMs}ms）` : `失败：${out.error ?? '未知'}`);
+      return out;
     }),
   );
 
