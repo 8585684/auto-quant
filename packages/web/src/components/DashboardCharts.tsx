@@ -171,7 +171,16 @@ export function DashboardEquityChart({
 }: {
   snapshots: EquitySnapshot[];
   range: EquityRange;
-  height?: number;
+  /**
+   * 图表高度。
+   *
+   * 收 `string | number` 而不是只有 `number`：机器人详情页要传
+   * `clamp(120px, 22vh, 260px)` —— 那一页的主栏在 722 高的窗口下只剩
+   * 三百来像素，写死的高度会把页面顶出滚动条（见 `TraderPage` 里
+   * `EQUITY_CHART_HEIGHT` 的说明）。recharts 的 `ResponsiveContainer`
+   * 本来就接受字符串，这里只是别把它挡在类型外面。
+   */
+  height?: string | number;
   baseline?: number;
   /** Settlement unit for the readout. Defaults to USDT, the only one in practice. */
   asset?: string;
