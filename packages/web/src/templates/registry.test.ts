@@ -39,6 +39,30 @@ function stripComments(css: string): string {
   return css.replace(/\/\*[\s\S]*?\*\//g, '');
 }
 
+/**
+ * 把 CSS 拆成一条条 `{ 选择器, 声明体 }`。
+ *
+ * 足够处理本仓库的样式表（没有嵌套规则）：
+ *
+ *   · `@media … { … }` 这种条件块**整体匹配不上**（它内部还有花括号），
+ *     但它里面的规则会被同一个正则单独匹配到，那正是我们要的；
+ *   · `@media … {` 自己那条 prelude 以 `@` 开头，被下面的判断跳过；
+ *   · `@keyframes` 的 `from` / `to` 会被当成选择器收进来，但它们不包含
+ *     `.select` 之类的类名，查询时自然过滤掉。
+ */
+function cssRules(css: string): Array<{ selectors: string[]; body: string }> {
+  const out: Array<{ selectors: string[]; body: string }> = [];
+  for (const match of css.matchAll(/([^{}]*)\{([^{}]*)\}/g)) {
+    const prelude = (match[1] ?? '').trim();
+    if (!prelude || prelude.startsWith('@')) continue;
+    out.push({
+      selectors: prelude.split(',').map((selector) => selector.trim()).filter(Boolean),
+      body: match[2] ?? '',
+    });
+  }
+  return out;
+}
+
 /* -------------------------------------------------------------------------- */
 /*  注册表本身                                                                  */
 /* -------------------------------------------------------------------------- */
@@ -182,6 +206,31 @@ test('★ 每套外壳的内容区都要写成 id={MAIN_SCROLL_ID}（不许手�
   }
 });
 
+test('★ 每套外壳都要在顶栏渲染模板切换器 —— 漏了用户会被困在这一套里', () => {
+  /*
+   * 这是模板系统里唯一一条**会把人困住**的漏项。
+   *
+   * 外观页在侧栏，而侧栏的位置每套模板都不一样。用户切到一套没有切换器的
+   * 模板之后，唯一换回去的办法是猜出「外观」藏在第几行 —— 而界面上不会有
+   * 任何报错，看起来只是"这个软件好像没法换回去"。
+   *
+   * 所以实现放在公共库（`templates/lib/TemplateSwitcher.tsx`），每套外壳
+   * **只写一行**。这条约束对第三方模板同样成立，而它也正是"别人只需专注 UI"
+   * 的一部分：他不必自己实现一遍下拉菜单。
+   */
+  for (const rel of shellFiles()) {
+    const code = src(rel);
+    assert.ok(
+      code.includes('<TemplateSwitcher'),
+      `${rel} 没有渲染 <TemplateSwitcher />：用户切到这套模板后就找不到换回去的入口。`,
+    );
+    assert.ok(
+      code.includes("from '../lib/TemplateSwitcher'"),
+      `${rel} 必须从 templates/lib/TemplateSwitcher 引入切换器，不要各自实现一份。`,
+    );
+  }
+});
+
 test('★ 控制台外壳必须渲染两个工具栏槽，并带 className="contents"', () => {
   const code = src('templates/console/ConsoleShell.tsx');
   /* 同理：比的是常量名，不是它的值（见上一条用例里的说明）。 */
@@ -256,6 +305,72 @@ test('★ 模板样式必须全部挂在根类名下面（不得裸写选择器�
       offenders,
       [],
       `${rel} 里有不带 html.${rootClass} 前缀的选择器，它们会影响到别的模板：\n  ${offenders.join('\n  ')}`,
+    );
+  }
+});
+
+test('★ 下拉框的箭头不能被 `background` 简写打散', () => {
+  /*
+   * 用户报的现象：「**所有下拉框都有 BUG**」—— 截图里每个 `<select>` 内部都是
+   * **一排小箭头**，而且压着选项文字。
+   *
+   * ## 成因（这是"简写重置 longhand"的经典陷阱）
+   *
+   * `index.css` 的 `.select` 用四条 background-* 属性拼出一个自定义箭头：
+   * image、size 12px、position right、no-repeat。而模板里一条
+   * `background: var(--aq-field)` 是**简写** —— 它把没写出来的那三条一起
+   * 重置成初始值，其中 `background-repeat` 的初始值是 **repeat**。
+   * 简写的特异性（0,2,1）又高于 `index.css` 里的单类名（0,1,0），所以
+   * "下面再补一条 background-image" 救不回另外三条：一张 12:8 的箭头
+   * 变成瓷砖，在整个控件里平铺开。
+   *
+   * 读源码时它完全合理，只有真实浏览器里量 computed style 才看得出
+   * （实测 console：`size: auto / repeat / 0% 0%`；classic：`12px auto /
+   * no-repeat / right`）。所以钉成断言。
+   */
+  const rules = cssRules(stripComments(src('templates/console/theme.css')));
+
+  /*
+   * ⚠️ 判"这条规则命中下拉框"用的是**类名的词边界**，不是 `includes('.select')`。
+   *
+   * 第一版写成 `includes('.select')`，于是 `tr.selected`（数据表格的选中行）
+   * 也被算了进来 —— 它里面确实有 `.select` 这七个字符，但那是一个不同的类。
+   * 假阳性在这里的代价是**测试报出一条并不存在的 bug**，而那种红会训练人
+   * 以后忽略这条用例。
+   */
+  const hitsSelect = (selector: string): boolean => /\.select(?![\w-])/.test(selector);
+
+  const shorthand = rules.filter(
+    (rule) =>
+      rule.selectors.some(hitsSelect) &&
+      /(^|[;\s])background\s*:/.test(rule.body),
+  );
+  assert.deepEqual(
+    shorthand.map((rule) => rule.selectors.join(', ')),
+    [],
+    '这些规则用 `background:` 简写命中了下拉框 —— 它会重置 background-size / position / repeat，' +
+      '把自定义箭头平铺成一排。请改用 `background-color`。',
+  );
+
+  /*
+   * 箭头的位置与大小必须**写在模板这一处**，不靠别处继承：
+   * 模板是"这套外观长什么样"的最终说法，而另外三条若来自 `index.css`，
+   * 改那边就会悄悄改掉控制台模板的样子（改坏的表现还是一排箭头，像另一个 bug）。
+   */
+  const arrow = rules.find(
+    (rule) => rule.selectors.length === 1 && rule.selectors[0] === 'html.aq-console .select',
+  );
+  assert.ok(arrow, '找不到 `html.aq-console .select` 这条规则 —— 自定义箭头没有归属。');
+  for (const longhand of [
+    'background-image',
+    'background-repeat',
+    'background-position',
+    'background-size',
+  ]) {
+    assert.match(
+      arrow!.body,
+      new RegExp(`${longhand}\\s*:`),
+      `html.aq-console .select 缺少 ${longhand} —— 四条 background-* 必须写在同一个地方，否则箭头会变形或平铺。`,
     );
   }
 });

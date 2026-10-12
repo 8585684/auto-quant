@@ -24,6 +24,7 @@ import { userRoleLabel } from '@aq/shared';
 import { fmtClockOffset, fmtInt } from '../../lib/format';
 import { Badge, Button, Dot, Tooltip, cn } from '../../components/ui';
 import { useShell } from '../lib/context';
+import { TemplateSwitcher } from '../lib/TemplateSwitcher';
 import { MAIN_SCROLL_ID } from '../ids';
 import type { NavItem } from '../../components/nav';
 
@@ -215,6 +216,14 @@ export function ClassicShell() {
               {shell.socketStatus === 'connecting' ? '连接中 · 轮询兜底' : '推送断开 · 轮询兜底'}
             </span>
           )}
+
+          {/*
+            模板切换器。原版顶栏里没有这一项，加它属于**必要的新增**：
+            没有它，用户切到另一套模板之后就找不到换回来的入口（外观页在侧栏，
+            而每套模板的侧栏位置都不一样）。业务行为一律不变 —— 它只改
+            `<html>` 上的模板类名，不刷新、不重连。
+          */}
+          <TemplateSwitcher size="md" />
 
           {/* 搜索入口。显示 ⌘K 是要让人**发现**快捷键，而不是把快捷键藏在文档里 */}
           <button

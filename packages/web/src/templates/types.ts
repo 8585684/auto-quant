@@ -127,4 +127,27 @@ export interface ShellState extends ShellData {
   /** 命令面板的开关。外壳负责渲染触发按钮，状态由这里给。 */
   paletteOpen: boolean;
   setPaletteOpen: (open: boolean) => void;
+  /**
+   * 模板选择的**运行时视图**：当前是哪一套、有哪些套、怎么换。
+   *
+   * ## 为什么它挂在 context 上，而不是让顶栏直接去 import store
+   *
+   * `templates/store.ts` 在**模块求值时**就要读 localStorage 拿初始值，
+   * 而那条路径要经过 `registry.ts`。于是任何被注册表静态 import 的文件
+   * （也就是每一套外壳）一旦反过来 import store，就形成
+   *
+   *     store → registry → 外壳 → （外壳引用到的东西）→ store
+   *
+   * 的环。它在**模块求值期**闭合时是真的会炸的：`registry.ts` 会撞上
+   * `Cannot access 'BUILT_IN' before initialization`，整个应用白屏 ——
+   * 而不是某一块功能不工作。顶栏上的模板切换器差一点就踩中它。
+   *
+   * 所以外壳**不读全局 store**：数据由 `Layout` 通过 context 递下来。
+   * 这也是 `lib/context.tsx` 本来就写明的分工 ——「模板只管画；需要数据就读
+   * context，需要触发行为就调 context 里的函数」。
+   */
+  templateId: TemplateId;
+  setTemplateId: (id: TemplateId) => void;
+  /** 全部可用模板（内置 + 运行时注册），与「外观」页用的是同一份列表。 */
+  templates: TemplateDefinition[];
 }

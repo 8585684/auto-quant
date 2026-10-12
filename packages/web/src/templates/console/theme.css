@@ -511,17 +511,25 @@ html.aq-console .toolbar {
 /* 工作区：侧边导航 + 内容 */
 html.aq-console .workbench {
   display: grid;
-  grid-template-columns: 208px minmax(0, 1fr);
+  /*
+   * 侧栏 186px（原来 208px）。
+   *
+   * 208 是按"最长的那一项放得下"定的，而实测下来它**多出了约 40px 的空白**：
+   * 最长项「策略工作室」（5 个字）加图标、内边距与计数胶囊一共只用掉约 145px。
+   * 那 40px 是从**每一页的内容区**里拿走的（侧栏常驻，所有页面都付这个钱），
+   * 而它换来的只是更宽的空边。
+   *
+   * 186 是"最长项 + 计数胶囊 + 两侧内边距"再留一点余量的结果；导航标签
+   * **不允许被截断**（用户是照着它记路名的），所以这个值往下调之前，
+   * 必须先在浏览器里量一遍 `scrollWidth > clientWidth`。
+   */
+  grid-template-columns: 186px minmax(0, 1fr);
   min-height: 0;
   background: var(--aq-page);
 }
 
 /*
  * 侧边导航。
- *
- * 208px 是量出来的：最长的项「策略工作室」加上图标、内边距、计数胶囊，
- * 刚好放得下且不挤。再窄就要截断标签 —— 而导航标签被截断是最不该的，
- * 用户是照着它记路名的。
  */
 html.aq-console .sidebar {
   background: linear-gradient(180deg, var(--aq-chrome), var(--aq-chrome-2));
@@ -699,7 +707,23 @@ html.aq-console .select,
 html.aq-console .textarea {
   border-radius: 5px;
   border: 1px solid var(--aq-line-strong);
-  background: var(--aq-field);
+  /*
+   * ⚠️ **`background-color`，不是 `background`。**
+   *
+   * 这两个词之差就是"所有下拉框都坏了"那个 bug：
+   *
+   * `index.css` 的 `.select` 给了下拉框一个**自定义箭头**——它由四条
+   * background-* 属性组成（image / size 12px / position right / no-repeat）。
+   * 而 `background: var(--aq-field)` 是**简写**：它会把没写出来的那几条
+   * 一起重置成初始值（size→auto、position→0% 0%、repeat→repeat）。
+   * 简写的特异性（0,2,1）又高于 `index.css` 里的单类名（0,1,0），
+   * 于是下面那条只补 `background-image` 的规则**补不回**另外三条 ——
+   * 结果就是一张 12:8 的小箭头被当成瓷砖，在整个下拉框里平铺成**一排箭头**。
+   *
+   * 用 `background-color` 就只动底色，四条 longhand 一个都不碰。
+   * 回归断言见 `templates/registry.test.ts`（"下拉框的箭头…"那条）。
+   */
+  background-color: var(--aq-field);
   color: var(--aq-ink);
   font-size: 12.5px;
   height: 28px;
@@ -729,6 +753,17 @@ html.aq-console .textarea:focus {
 html.aq-console .select {
   padding-right: 2rem;
   background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 8'%3E%3Cpath fill='%239fb0c0' d='M1 1l5 5 5-5'/%3E%3C/svg%3E");
+  /*
+   * 箭头的位置与大小**在这里也要写全**，不依赖 `index.css` 那一条：
+   *
+   * 模板的这一段是"这套外观长什么样"的最终说法，它改成 `background-image`
+   * 时如果另外三条从别处继承，那么**改动 `index.css` 就会悄悄改掉控制台模板
+   * 的样子**（而且改坏的样子是一排箭头，看起来像另一个 bug）。四条写在一处，
+   * 谁读这段 CSS 都能一眼看出箭头长什么样、在哪。
+   */
+  background-repeat: no-repeat;
+  background-position: right 0.5rem center;
+  background-size: 12px 8px;
 }
 
 /* 浅色主题下箭头要换一个深色，否则在浅底上几乎看不见 */
@@ -863,7 +898,12 @@ html.aq-console .chip-plain::before {
  */
 html.aq-console .th {
   height: 28px;
-  padding: 0 8px;
+  /*
+   * 6px 而不是 8px：`/market` 左栏那张 4 列表在 340px 的列宽里差的就是这几像素
+   * （每列省 4px，四列 16px）。这一条与 `MarketPage` 那条注释是一件事的两半 ——
+   * 改这里要连着量一遍 `/market`：表格的 `scrollWidth` 不能大于容器的 `clientWidth`。
+   */
+  padding: 0 6px;
   position: sticky;
   top: 0;
   z-index: 5;
@@ -882,7 +922,7 @@ html.aq-console .th {
  */
 html.aq-console .td {
   height: var(--aq-row-h, 26px);
-  padding: 0 8px;
+  padding: 0 6px;
   border-bottom: 1px solid var(--aq-line-soft);
   border-right: 1px solid var(--aq-line-soft);
   overflow: hidden;

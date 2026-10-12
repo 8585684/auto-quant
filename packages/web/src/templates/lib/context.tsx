@@ -42,7 +42,34 @@ export function useShell(): ShellState {
   return value;
 }
 
-export function ShellRuntime({ children }: { children: ReactNode }) {
+/**
+ * 模板选择：**由 `Layout` 传进来，不在这里 import store**。
+ *
+ * ## ⚠️ 为什么这一层必须只收 prop、不 import
+ *
+ * `templates/store.ts` 在模块求值期就要读 localStorage（拿初始模板），
+ * 那条路径要经过 `registry.ts`。而 `registry.ts` 会静态 import 每一套外壳，
+ * 外壳又会 import 本文件 —— 所以本文件一旦 import `store`，就形成
+ *
+ *     store → registry → 外壳 → context → store
+ *
+ * 的环，并且会在**求值期**闭合：`registry.ts` 撞上
+ * `Cannot access 'BUILT_IN' before initialization`，整个应用白屏。
+ * 实测踩过一次（顶栏加模板切换器的时候），所以这条记在这里。
+ */
+export interface TemplateRuntime {
+  id: ShellState['templateId'];
+  set: ShellState['setTemplateId'];
+  list: ShellState['templates'];
+}
+
+export function ShellRuntime({
+  children,
+  template,
+}: {
+  children: ReactNode;
+  template: TemplateRuntime;
+}) {
   const data = useShellData();
 
   const logout = useApp((s) => s.logout);
@@ -101,10 +128,13 @@ export function ShellRuntime({ children }: { children: ReactNode }) {
       },
       paletteOpen,
       setPaletteOpen,
+      templateId: template.id,
+      setTemplateId: template.set,
+      templates: template.list,
     }),
     // `data` 每次渲染都是新对象，但它的字段全都来自 store 订阅 —— 这里逐项列出
     // 反而是维护负担。用整体依赖，代价只是一次浅比较。
-    [data, logout, navigate, paletteOpen],
+    [data, logout, navigate, paletteOpen, template],
   );
 
   return (

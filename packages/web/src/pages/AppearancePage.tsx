@@ -32,13 +32,21 @@
  * 的页面，而那正是模板系统要避免的分叉。
  */
 import { useState } from 'react';
-import { Check, LayoutDashboard, Moon, PanelTop, Sun } from 'lucide-react';
+import { Check, Moon, Sun } from 'lucide-react';
 import { useDocumentTitle } from '../lib/hooks';
 import { SectionHeading } from '../components/Badges';
 import { PageShell, SectionLabel } from '../components/shell';
 import { Panel, cn } from '../components/ui';
 import { listTemplates } from '../templates/registry';
 import { TEMPLATE_KEY, useTemplateStore } from '../templates/store';
+/*
+ * 图标表来自**公共库**，不是本文件里的一份 `Record`。
+ *
+ * 同一个 id 的图标还要出现在顶栏的模板切换器上（`TemplateSwitcher`）；
+ * 两边各写一份的结果不是重复几行，而是**会漂** —— 新模板只登记了一处，
+ * 另一处就悄悄用回兜底图标。
+ */
+import { templateIcon } from '../templates/lib/icons';
 import type { TemplateId } from '../templates/types';
 import {
   DENSITIES,
@@ -52,12 +60,6 @@ import {
   type Density,
   type Skin,
 } from '../templates/lib/appearance';
-
-/** 模板卡上的图标：按 id 挑，挑不到就用一个中性的。 */
-const TEMPLATE_ICON: Record<string, typeof PanelTop> = {
-  classic: PanelTop,
-  console: LayoutDashboard,
-};
 
 export function AppearancePage() {
   useDocumentTitle('外观');
@@ -105,7 +107,7 @@ export function AppearancePage() {
         <div className="grid grid-cols-1 items-start gap-2 sm:grid-cols-2">
           {listTemplates().map((option) => {
             const active = templateId === option.id;
-            const Icon = TEMPLATE_ICON[option.id] ?? PanelTop;
+            const Icon = templateIcon(option.id);
             return (
               <button
                 key={option.id}
@@ -151,7 +153,9 @@ export function AppearancePage() {
             `**不刷新页面**`）。要加粗就用 <strong>，或者像这里一样把该强调的
             词单独包一层。
           */}
-          模板记在浏览器本地（<span className="num">{TEMPLATE_KEY}</span>），切换时
+          <strong className="font-semibold text-ink-lo">顶栏上也有一个切换器</strong>
+          （标题栏里的布局图标）—— 那是日常换着看用的入口，这一页是"设置"意义上的
+          目录。模板记在浏览器本地（<span className="num">{TEMPLATE_KEY}</span>），切换时
           <strong className="font-semibold text-ink-lo">不刷新页面、不重连推送</strong>
           。想自己做一套？见仓库里的 <span className="num">packages/web/TEMPLATES.md</span> ——
           只需要一个外壳组件加一条注册，不必碰任何业务页面。

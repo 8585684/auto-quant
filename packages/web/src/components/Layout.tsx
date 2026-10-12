@@ -24,13 +24,31 @@
  * 它 —— 表现是"切个皮肤，推送断两秒、toast 闪一下"，而且这类抖动很难
  * 被归因到具体的改动上。
  */
-import { useEffect } from 'react';
+import { useEffect, useMemo } from 'react';
 import { ShellRuntime } from '../templates/lib/context';
+import { listTemplates } from '../templates/registry';
 import { applyTemplateClass, applyStoredTemplate, useTemplateStore } from '../templates/store';
 
 export function Layout() {
   const id = useTemplateStore((s) => s.id);
+  const setTemplateId = useTemplateStore((s) => s.setId);
   const Current = useTemplateStore((s) => s.current)();
+
+  /*
+   * 模板选择交给 `ShellRuntime` —— 外壳**不直接读 store**。
+   *
+   * 原因不是风格：`store.ts` 求值期要经过 `registry.ts`，而注册表静态 import
+   * 每一套外壳，外壳再 import 上下文。外壳直接读 store 就是一条环，并且会在
+   * 模块求值期闭合（`Cannot access 'BUILT_IN' before initialization`，整站白屏）。
+   * 完整论证写在 `templates/types.ts` 的 `ShellState.templateId` 上。
+   *
+   * `useMemo` 不是优化：context 的 value 用它做依赖，每次渲染新建一个对象
+   * 等于每次渲染都让全部消费者重渲染。
+   */
+  const template = useMemo(
+    () => ({ id, set: setTemplateId, list: listTemplates() }),
+    [id, setTemplateId],
+  );
 
   /*
    * 启动时把已保存的模板类挂上。
@@ -51,7 +69,7 @@ export function Layout() {
   }, [id]);
 
   return (
-    <ShellRuntime>
+    <ShellRuntime template={template}>
       <Current.Shell />
     </ShellRuntime>
   );

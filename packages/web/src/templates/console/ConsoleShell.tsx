@@ -51,6 +51,7 @@ import type { NavGroup, NavItem } from '../../components/nav';
 import { MAIN_SCROLL_ID, TOOLBAR_END_ID, TOOLBAR_START_ID } from '../ids';
 import { useShell } from '../lib/context';
 import { APPEARANCE_EVENT, getSkin, setSkin, type Skin } from '../lib/appearance';
+import { TemplateSwitcher } from '../lib/TemplateSwitcher';
 
 /**
  * 侧栏／汉堡按钮共用的断点。
@@ -170,6 +171,13 @@ export function ConsoleShell() {
           )}
 
           <SkinToggle />
+
+          {/*
+            模板切换器。它就在标题栏上、永远可见 —— 用户不该为了"换一套看看"
+            先去找「外观」页藏在侧栏的哪一行（理由见 TemplateSwitcher 的注释）。
+            每套外壳都必须渲染它，`registry.test.ts` 逐文件断言。
+          */}
+          <TemplateSwitcher />
 
           {/* 搜索入口。写着 ⌘K 是要让人**发现**快捷键，而不是把它藏进文档 */}
           <button
