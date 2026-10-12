@@ -491,3 +491,51 @@ test('★ 元数据缺失的模型不会被直接剔除（还能当兜底）', (
   const cat = buildCatalog(wirePayload([{ id: 'p/only-one', reasoning: false, ctx: 0, out: 0 }]), null, null);
   assert.ok(cat.byTier.T1_fast.includes('p/only-one'), '★ 唯一候选不该被剔除');
 });
+test('★★★ magpie 路由组必须排在候选链最前（自带跨供应商故障转移）', () => {
+  /*
+   * ## 用户明确提过这件事
+   *
+   * > 「magpie 里面的**智能路由模式很好用，你可以利用起来避免你重复造轮子**」
+   *
+   * ## 实测代价（第 33–35 轮）
+   *
+   * `workbuddy-ai` **整家额度耗尽**，而它占据 T1 候选链**前 5 位**
+   *（我第 28 轮的"元数据降权"把它推上去的）→ 每轮都要先撞 1–4 次
+   * 才能落到活着的模型上，而"撞"本身要等超时 → **一轮 7 分钟、常常跑不完**。
+   *
+   * ## 为什么路由组优先能解决它
+   *
+   * 路由组（`group/auto-*`）**自带跨供应商故障转移** ——
+   * 一家供应商额度耗尽时 magpie 自己换一家，**不需要我们逐个去试**。
+   *
+   * 把"某家死了"交给 magpie 处理，我们的候选链只需处理
+   * "整档都不可用"的降级。**这正是"不重复造轮子"。**
+   */
+  const cat = buildCatalog(
+    wirePayload([
+      { id: 'dead-ai/slow-model', reasoning: false, ctx: 200_000, out: 32_000 },
+      { id: 'group/auto-slow-model', reasoning: false, ctx: 200_000, out: 32_000 },
+    ]),
+    null,
+    null,
+  );
+  const t1 = cat.byTier.T1_fast;
+  assert.ok(t1.includes('group/auto-slow-model'), '路由组该在 T1');
+  assert.ok(t1.includes('dead-ai/slow-model'), '普通模型该在 T1');
+  assert.ok(
+    t1.indexOf('group/auto-slow-model') < t1.indexOf('dead-ai/slow-model'),
+    '★ 路由组必须排在普通模型之前',
+  );
+});
+
+test('★ 没有路由组时排序不受影响（回归）', () => {
+  const cat = buildCatalog(
+    wirePayload([
+      { id: 'p/a', reasoning: false, ctx: 200_000, out: 32_000 },
+      { id: 'p/b', reasoning: false, ctx: 200_000, out: 32_000 },
+    ]),
+    null,
+    null,
+  );
+  assert.equal(cat.byTier.T1_fast.length, 2, '两个都该在 T1');
+});
