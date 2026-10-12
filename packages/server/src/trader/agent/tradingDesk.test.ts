@@ -8,7 +8,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { DESK_LIMITS, assertBudgetConsistent, runTradingDesk, type AskRole, type DeskRoleOutput } from './tradingDesk.js';
+import { DESK_LIMITS, assertBudgetConsistent, roleTimeoutMs, runTradingDesk, type AskRole, type DeskRoleOutput } from './tradingDesk.js';
 
 /** 造一个"总是成功"的 ask 桩，并记录调用顺序。 */
 function okAsk(log: string[], delayMs = 0): AskRole {
@@ -389,4 +389,41 @@ test('★★★ 没给情报键 → 【不要求】标注（不猜，也不让�
   const judge = seen.find((s) => s.role === 'judge');
   assert.ok(judge !== undefined);
   assert.ok(!judge!.task.includes('intel_keys'), '★ 没有可选键时不该要求标注');
+});
+
+test('★★★ 超时按【输入规模】缩放（固定 60 秒砍掉了 13 万字符的输入）', () => {
+  /*
+   * ## 实测数据（`#11`）
+   *
+   * ```
+   *   user_prompt = 130,902 字符 ≈ 37,401 tokens
+   *   team-grunt   小输入 2.2 秒   ← 模型本身不慢
+   *   team-analyst 小输入 5.2 秒   ← 模型本身不慢
+   *   但实际运行：technical 超时 60s · market_analyst 超时 180s
+   * ```
+   *
+   * **模型不慢，慢的是"要读 3.7 万 token"。** 而超时原来是**固定值** ——
+   * 它假设每次输入都差不多大，而实际输入规模随候选池变化。
+   *
+   * ⚠️ **这只是"止血"，不是根治**：根治是把输入变小
+   *（用户建议的"按币并行" —— 每人一个标的，输入从 13 万字符降到几百字符）。
+   * 那时这个缩放会自然回到基准值。
+   */
+  /* 小输入：档位基准说了算。 */
+  assert.equal(roleTimeoutMs('T1_fast', 5_000), 60_000, 'T1 小输入仍是 60 秒基准');
+  assert.equal(roleTimeoutMs('T2_mid', 5_000), 180_000, 'T2 小输入仍是 180 秒基准');
+
+  /* 13 万字符：T1 必须放宽（原来 60 秒会砍掉它）。 */
+  assert.ok(
+    roleTimeoutMs('T1_fast', 130_000) >= 130_000,
+    `★ 13 万字符时 T1 应放宽到 ≥130 秒（实际 ${roleTimeoutMs('T1_fast', 130_000)}）`,
+  );
+  assert.equal(roleTimeoutMs('T1_fast', 130_000), 130_000, '每 1 万字符给 10 秒');
+
+  /* 上限 300 秒 —— 不能让一个角色无限等下去（那会拖死整轮）。 */
+  assert.equal(roleTimeoutMs('T1_fast', 5_000_000), 300_000, '★ 必须有上限');
+
+  /* 档位基准与规模取【大者】—— 大输入不会被小基准压住。 */
+  assert.equal(roleTimeoutMs('T2_mid', 10_000), 180_000, '10 万字符以内 T2 仍用 180 秒基准');
+  assert.equal(roleTimeoutMs('T3_deep', 200_000), 200_000, '20 万字符时 T3 放宽到 200 秒');
 });

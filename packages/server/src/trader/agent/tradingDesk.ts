@@ -640,12 +640,58 @@ const ROLE_TIMEOUT_MS: Record<string, number> = {
  * 所以这里把异常转成 `ok: false` 的结果对象，让编排继续走 ——
  * 而不是让一个角色的失败把整轮炸掉。
  */
+/**
+ * **算一个角色的超时**（按档位基准 + 输入规模缩放）。
+ *
+ * 抽成**纯函数**是为了能直接测它 —— 否则只能写一个"等 65 秒看会不会被砍"
+ * 的测试，那会让门禁慢一分钟（而这条规则本身很简单）。
+ *
+ * 判据见 `safeAsk` 里的说明：**模型不慢，慢的是输入**。
+ */
+export function roleTimeoutMs(tier: string, contextChars: number): number {
+  const base = ROLE_TIMEOUT_MS[tier] ?? 120_000;
+  /* 每 1 万字符给 10 秒（起步基准，与档位基准取大者）。 */
+  const bySize = Math.round(contextChars / 10_000) * 10_000;
+  /* 上限 300 秒：不能让一个角色无限等下去（那会拖死整轮）。 */
+  return Math.min(Math.max(base, bySize), 300_000);
+}
 async function safeAsk(
   ask: AskRole,
   req: { role: string; tier: ModelTier; context: string; task: string },
 ): Promise<DeskRoleOutput> {
   const started = Date.now();
-  const limit = ROLE_TIMEOUT_MS[req.tier] ?? 120_000;
+  /*
+   * ── **超时按输入规模缩放**（2026-10-12 加）────────────────────────────
+   *
+   * ## 为什么固定超时是错的
+   *
+   * 实测（`#11`）：
+   * ```
+   *   user_prompt = 130,902 字符 ≈ 37,401 tokens
+   *   team-grunt   小输入 2.2 秒   ← 模型本身不慢
+   *   team-analyst 小输入 5.2 秒   ← 模型本身不慢
+   *   但实际运行：technical 超时 60s · market_analyst 超时 180s
+   * ```
+   *
+   * **模型不慢，慢的是"要读 3.7 万 token"。**
+   * 而 `ROLE_TIMEOUT_MS` 是**固定值** —— 它假设每次输入都差不多大，
+   * 而实际输入规模取决于候选池与材料量（会变）。
+   *
+   * ## 判据：按字符数线性放宽
+   *
+   * 取"每 1 万字符给 10 秒"作为**起步基准**，与档位基准取大者：
+   * ```
+   *   3 万字符  → 30 秒  → 与档位基准取大 → T1 仍是 60 秒
+   *   13 万字符 → 130 秒 → T1 会放宽到 130 秒（而不是 60 秒被砍）
+   * ```
+   *
+   * ⚠️ **这只是"止血"，不是根治。**
+   * 根治是**把输入变小**（用户建议的"按币并行" —— 每人一个标的，
+   * 输入从 13 万字符降到几百字符）。那时这个缩放会自然回到基准值。
+   *
+   * ⚠️ 上限 300 秒：不能让一个角色无限等下去（那会拖死整轮）。
+   */
+  const limit = roleTimeoutMs(req.tier, req.context.length);
   try {
     /*
      * `Promise.race` 而不是 `AbortSignal`：`AskRole` 的签名里没有 signal
