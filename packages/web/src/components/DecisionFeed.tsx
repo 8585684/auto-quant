@@ -538,6 +538,59 @@ function CycleCountdown({ nextCycleAt }: { nextCycleAt: number | null }) {
   );
 }
 
+/**
+ * **最新一轮的结论**（2026-10-13 加）—— 团队模式左栏。
+ *
+ * ## 用户的要求
+ *
+ * > 「这一块UI展示区域太小了，根本显示不了这么多，直接跳转把这块占用全部页面。
+ * >  **把结论那块移动到左边**」
+ *
+ * ## 为什么单独抽一个组件（而不是复用下面的列表）
+ *
+ * 下面的 `runs.map()` 渲染的是**历史全部轮次**（滚动的决策流水）——
+ * 而这一栏要回答的是**"现在这一轮决定了什么"**，两者职责不同：
+ * ```
+ *   左栏（本组件）：最新一轮的结论 —— 常驻可见，不滚走
+ *   下方滚动区   ：历史轮次        —— 要看过去时才滚
+ * ```
+ *
+ * ⚠️ 用**同一个 `TeamCycleBlock`** 渲染，不另写一套 ——
+ * 那样"结论长什么样"只有一个定义处，不会两处漂移。
+ */
+function LatestConclusion({
+  record,
+  symbols,
+  mode,
+}: {
+  record: DecisionRecord | null;
+  symbols: readonly MarketSymbol[];
+  mode: 'strategy' | 'ai_managed' | 'ai_team';
+}): React.ReactElement {
+  if (record === null) {
+    return (
+      <p className="px-1 py-2 text-xs text-ink-faint">
+        还没有决策记录 —— 跑一轮之后这里会显示它决定了什么。
+      </p>
+    );
+  }
+  return (
+    <div className="min-w-0">
+      {/*
+        ⚠️ 单独包错误边界：与下方列表同一个理由 ——
+        一条字段不全的记录不该让整个看板白屏。
+      */}
+      <FeedErrorBoundary>
+        {mode === 'ai_team' ? (
+          <TeamCycleBlock record={record} symbols={[...symbols]} />
+        ) : (
+          <CycleBlock record={record} symbols={[...symbols]} mode={mode} />
+        )}
+      </FeedErrorBoundary>
+    </div>
+  );
+}
+
 export function DecisionFeed({
   traderId,
   running,
@@ -1039,17 +1092,58 @@ export function DecisionFeed({
              * 面板高度不确定时（`xl` 以下整页流式布局）百分比 max-height 不解析，
              * 等价于没有上限；那种形态下页面本来就整页滚，不会互相挤。
              */
-            <div className="flex max-h-[45%] min-h-0 shrink-0 flex-col border-b border-base-800 p-2.5">
-              <TeamBoard
-                steps={liveCycle?.steps ?? latestTeamSteps}
-                cycleNumber={liveCycle?.cycleNumber ?? records[0]?.cycleNumber ?? 0}
-                /*
-                 * ⚠️ **没有在途轮次时传 `null`**，不传 `Date.now()`：
-                 * 计时器从 0 开始跳会因为拿不到真实起点而显示一个编造的时长，
-                 * 而"这一轮跑了 50000 秒"会把操作员引去查一个不存在的事故。
-                 */
-                startedAt={liveCycle?.startedAt ?? null}
-              />
+            <div
+              /*
+               * ── **团队模式改成左右两栏**（2026-10-13 用户要求）──────────────
+               *
+               * 用户原话：
+               * > 「这一块UI展示区域太小了，根本显示不了这么多，直接跳转把这块占用全部页面。
+               * >  **把结论那块移动到左边**」
+               *
+               * ## 之前是单列纵向：工作流在上、决策在下
+               *
+               * 两者**抢同一份高度**（固定区 `max-h-[45%]`），于是：
+               * ```
+               *   工作流区越高 → 决策区越矮 → 而"最复杂的那一轮"恰好最该看得清
+               * ```
+               * 而它们是**两类不同的信息**：
+               * ```
+               *   左：结论 —— 这一轮决定了什么（人最常看的）
+               *   右：过程 —— 谁在干什么（要细看时才看的）
+               * ```
+               * 横向并排让两者**各自拿到完整高度**，不再互相挤压。
+               *
+               * ⚠️ 窄屏（`lg` 以下）仍然纵向堆叠 —— 两栏在手机上会挤成两条缝。
+               */
+              className="flex max-h-[45%] min-h-0 shrink-0 flex-col gap-2 border-b border-base-800 p-2.5 lg:flex-row"
+            >
+              {/*
+                左栏：**结论**（本轮决定）。窄屏在上、宽屏在左。
+                ⚠️ 它自己也滚 —— 一轮可能有十几条决策。
+              */}
+              <div className="min-h-0 min-w-0 flex-1 overflow-y-auto lg:max-h-full">
+                <LatestConclusion
+                  record={records[0] ?? null}
+                  symbols={symbolsQuery.data ?? []}
+                  mode={mode}
+                />
+              </div>
+              {/*
+                右栏：**工作流**（谁在干什么）。
+                ⚠️ `shrink-0` + 固定比例：让它的宽度稳定，不随结论长短跳动。
+              */}
+              <div className="flex min-h-0 shrink-0 flex-col lg:w-[42%]">
+                <TeamBoard
+                  steps={liveCycle?.steps ?? latestTeamSteps}
+                  cycleNumber={liveCycle?.cycleNumber ?? records[0]?.cycleNumber ?? 0}
+                  /*
+                   * ⚠️ **没有在途轮次时传 `null`**，不传 `Date.now()`：
+                   * 计时器从 0 开始跳会因为拿不到真实起点而显示一个编造的时长，
+                   * 而"这一轮跑了 50000 秒"会把操作员引去查一个不存在的事故。
+                   */
+                  startedAt={liveCycle?.startedAt ?? null}
+                />
+              </div>
             </div>
           )}
 
