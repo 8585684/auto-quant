@@ -177,6 +177,49 @@ export const RiskControlConfigSchema = z.object({
   /** Model confidence floor (0-100). */
   minConfidence: z.number().int().min(0).max(100).default(75),
 
+  /**
+   * **单笔交易的风险预算**（占权益的百分比）。默认 **2**。
+   *
+   * ## ⚠️ 为什么把它从"提示词里的硬编码常量"变成真字段（2026-10-13）
+   *
+   * ### 它原来是一个**死锁**
+   *
+   * `strategy/prompt.ts` 里有这么一段（**它一直对模型这么说**）：
+   * > 「造成"空集"的两个变量 —— **规则、风险参数** —— 都在**你自己的权限里**。
+   * >  （权益不归你管，那是账户所有者的。）」
+   *
+   * 而那个 2% 当时是 `prompt.ts` 里的 `const riskPerTradePercent = 2;` ——
+   * **一个硬编码常量，不在任何 schema 里**。
+   *
+   * 也就是说：
+   * ```
+   *   提示词告诉模型「你可以改风险参数」
+   *   而模型用 set_params 只能改 riskControl 里的字段 → 改不到这个 2%
+   *   → 它「只能一直用 2% 熬着」（decisionTools.ts 里早就写下了这句话）
+   * ```
+   *
+   * ### 死锁的代价（实测）
+   *
+   * ```
+   *   权益 20.75 · 单笔风险 2% = 0.415 USDT
+   *   币安最小名义 50 USDT → 止损上限只能 0.83%
+   *   而 15m ATR 的常态是 2–4%
+   *   → 差 2.4–5 倍 → **没有任何标的能通过** → 40+ 轮零决策
+   * ```
+   * 而 `#10`（ai_managed）的历史里，模型把 `minPositionSize` **连改 5 次**
+   *（12→6→6→5.5→5.1），每次理由都是"账户太小、门槛不可达"，**每次结算都是负的** ——
+   * 它在改一个**不是瓶颈**的参数。
+   *
+   * ### 所以把它做成字段
+   *
+   * 现在模型可以 `set_params({"riskControl":{"riskPerTradePercent":5}})` ——
+   * **提示词那句话从此是真的**。
+   *
+   * ⚠️ **上界 20%**：那已经不是"风险预算"而是"押注"了。
+   * 留出这个上界是为了不让一次误判毁掉账户；但**它不是"系统替你按 2% 走"**。
+   */
+  riskPerTradePercent: z.number().min(0.1).max(20).default(2),
+
   /** Force an exchange-side stop loss on every entry. Strongly recommended. */
   requireStopLoss: z.boolean().default(true),
   /** Force an exchange-side take profit on every entry. */

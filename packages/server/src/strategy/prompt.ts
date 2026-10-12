@@ -2889,8 +2889,26 @@ function renderUserPrompt(
        */
       ...(() => {
         const equity = ctx.account.equity;
-        /* 它规则里的两个系数。写下来源，因为若它改了规则，这两个数就会过时。 */
-        const riskPerTradePercent = 2; // 「单笔亏损 ≤ 权益 2%」
+        /*
+         * 它规则里的两个系数。写下来源，因为若它改了规则，这两个数就会过时。
+         *
+         * ── ⚠️ **`riskPerTradePercent` 从硬编码改成读配置**（2026-10-13）──────
+         *
+         * ## 它原来是一个死锁（见 `strategy.ts` 里那段长注释）
+         *
+         * 这一段代码的上方一直对模型说：
+         * > 「造成"空集"的两个变量 —— **规则、风险参数** —— 都在**你自己的权限里**。」
+         * 而那个 2% 当时是这里的 `const riskPerTradePercent = 2;` ——
+         * **硬编码，不在任何 schema 里** → 模型用 `set_params` 改不到 →
+         * 「只能一直用 2% 熬着」（`decisionTools.ts` 早就写下了这句话）→ **40+ 轮零决策**。
+         *
+         * 现在它是 `riskControl.riskPerTradePercent` 的真字段，模型可以改。
+         * **那句"在你权限里"从此是真的** —— 而不是一句它做不到的承诺。
+         *
+         * ⚠️ 用一个**明确的兜底**：老配置里没有这个字段时取 2
+         *（与字段的默认值一致，所以既有机器人行为不变）。
+         */
+        const riskPerTradePercent = ctx.config.riskControl.riskPerTradePercent;
         const stopToRiskMultiple = 1.5; // 「实际亏损可达止损幅度的 1.5 倍」
         const atrToStopMultiple = 1.5; // 「止损 ≥ 1.5 × ATR14(15m)」
         /*
