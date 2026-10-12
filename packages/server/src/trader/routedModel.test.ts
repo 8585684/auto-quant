@@ -11,7 +11,7 @@ import test from 'node:test';
 
 import { ModelRouter, type CallModel } from '../llm/modelRouter.js';
 import { readFileSync } from 'node:fs';
-import { ROLE_TIERS, ROLE_GROUP_LADDERS, createRoutedDecisionModel, tierForRole } from './routedModel.js';
+import { ROLE_TIERS, ROLE_GROUP_LADDERS, ROLE_MAX_TOKENS, createRoutedDecisionModel, tierForRole } from './routedModel.js';
 import { looksLikeMagpieGateway } from './magpieGateway.js';
 import { FIRM_ROLES, firmRoleOf } from '@aq/shared';
 
@@ -299,4 +299,49 @@ test('★ 兜底链里不能有重复项（重复 = 白试一次）', () => {
   for (const [role, chain] of Object.entries(ROLE_GROUP_LADDERS)) {
     assert.equal(new Set(chain).size, chain!.length, `★ ${role} 的链里有重复：${chain!.join(' → ')}`);
   }
+});
+test('★★★ 分析师角色的输出预算必须【小】—— 8192 会让 T1 必然超时', () => {
+  /*
+   * ## 决定性实测（同一材料，只变 max_tokens）
+   *
+   * ```
+   *   单标的材料 + max_tokens=2000 → 20.5 秒 · completion=2000（【用满】）· content=0 字！
+   *   单标的材料 + max_tokens=800  → 11.8 秒 · completion=800 （【用满】）· content=493 字
+   *   finish_reason = "length"    ← 全部撞上限
+   * ```
+   *
+   * 而 `TEAM_BASE_MAX_TOKENS = 8192` → **最坏要跑 80+ 秒**，
+   * 而 T1 角色的超时线是 **60 秒** —— **它必然超时**。
+   *
+   * ## 更糟的是那些 token 大多不是有用内容
+   *
+   * `max_tokens=2000` 那次：`reasoning_content = 4228 字`，而 **`content = 0 字`** ——
+   * 全部预算花在推理上，**正式回答一个字都没写**。
+   */
+  for (const role of ['market_analyst', 'technical', 'newscaster', 'sentiment']) {
+    const budget = ROLE_MAX_TOKENS[role];
+    assert.ok(budget !== undefined, `★ ${role} 应当有输出预算`);
+    assert.ok(
+      budget! <= 2048,
+      `★ ${role} 的预算应当 ≤2048（当前 ${budget}）—— 8192 会让 T1 的 60 秒超时线必然被撞`,
+    );
+  }
+  /* 辩论/裁决需要完整论证，可以更大 —— 但也不该到 8192。 */
+  for (const role of ['bull', 'bear', 'judge']) {
+    assert.ok(ROLE_MAX_TOKENS[role]! <= 4096, `★ ${role} 的预算应当 ≤4096（当前 ${ROLE_MAX_TOKENS[role]}）`);
+  }
+});
+
+test('★ 分析师预算必须【小于】辩论/裁决（按任务分配，不是一刀切）', () => {
+  /*
+   * ⚠️ 若两者相等，说明"按任务分配"没做 —— 而分析师的任务是"描述"，
+   * 辩论/裁决的任务是"论证"，它们的输出需求本就不同。
+   */
+  const analyst = ROLE_MAX_TOKENS['technical']!;
+  const debate = ROLE_MAX_TOKENS['judge']!;
+  assert.ok(analyst < debate, `★ 分析师（${analyst}）应当小于裁决（${debate}）`);
+});
+
+test('★ 未知角色没有条目（退回调用方基准，不改既有行为）', () => {
+  assert.equal(ROLE_MAX_TOKENS['某个不存在的角色'], undefined);
 });

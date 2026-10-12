@@ -177,6 +177,63 @@ const TIER_GROUP_LADDERS: Readonly<Record<string, readonly string[]>> = {
 };
 
 /**
+ * **按角色的输出 token 预算**（2026-10-12 加）—— 修"超时"的真正根因。
+ *
+ * ## 决定性实测（同一材料，只变 `max_tokens`）
+ *
+ * ```
+ *   极短输入 + max_tokens=10    →  2.9 秒（completion 10）
+ *   极短输入 + max_tokens=4000  →  4.3 秒（completion 161）  ← 它自己停
+ *   单标的材料 + max_tokens=2000 → 20.5 秒 · completion=2000（【用满】）· content=0 字！
+ *   单标的材料 + max_tokens=800  → 11.8 秒 · completion=800 （【用满】）· content=493 字
+ *   finish_reason = "length"    ← 全部撞上限
+ * ```
+ *
+ * ## 结论（推翻我之前的判断）
+ *
+ * 我一度认为"瓶颈是输入太大"。**实测数据否定了它**：
+ * ```
+ *   7,538 输入 token  → 41.3 秒
+ *   45,326 输入 token → 65.2 秒     ← 输入差 6 倍，时间只差 24 秒
+ * ```
+ * **真正的瓶颈是【输出生成】**（约 50–100 token/秒）。
+ * 而 `TEAM_BASE_MAX_TOKENS = 8192` 意味着**最坏要跑 80+ 秒** ——
+ * 而 T1 角色的超时线是 **60 秒**：**它必然超时。**
+ *
+ * ## 更糟的是：这些 token 大多【不是有用内容】
+ *
+ * `max_tokens=2000` 那次：`reasoning_content = 4228 字`，而 **`content = 0 字`** ——
+ * 全部预算花在推理上，**正式回答一个字都没写**。
+ *
+ * ## 分档原则
+ *
+ * | 角色类 | 预算 | 理由 |
+ * |---|---|---|
+ * | 分析师（`market_analyst` / `technical` / `newscaster` / `sentiment`）| **1024** | 任务是"描述与整理"，实测 800 就能给出 493 字有效内容 |
+ * | 辩论与裁决（`bull` / `bear` / `judge`）| **4096** | 需要完整论证，且它们的超时线是 180 秒（更宽）|
+ *
+ * ⚠️ **这是"按任务给预算"，不是"砍能力"**。
+ *
+ * ⚠️ 未知角色退回调用方给的 `baseMaxTokens` —— **不改既有行为**。
+ */
+export const ROLE_MAX_TOKENS: Readonly<Record<string, number>> = {
+  /* 分析师：描述性任务，短输出。 */
+  market_analyst: 1024,
+  technical: 1024,
+  newscaster: 1024,
+  sentiment: 1024,
+  /* 其他"整理类"角色同样短输出。 */
+  clerk: 1024,
+  reporter: 1024,
+  memory_curator: 1024,
+  onchain_analyst: 1024,
+  /* 辩论与裁决：需要完整论证。 */
+  bull: 4096,
+  bear: 4096,
+  judge: 4096,
+  risk_officer: 2048,
+};
+/**
  * 构造一个**多模型**的 `DecisionModel`。
  *
  * @param router 已经配好的模型路由器（含健康记录与降级链）
@@ -197,6 +254,7 @@ export function createRoutedDecisionModel(options: {
     note: string;
     fallbackCount: number;
   }) => void;
+
 }): DecisionModel {
   const { router, request, baseMaxTokens, onAttempt } = options;
 
@@ -396,6 +454,7 @@ export function createTeamDecisionModel(options: {
    * 裁决官**不标注**，而不是猜。
    */
   research?: (symbols: readonly string[]) => Promise<string | { text: string; keys: string[] }>;
+
 }): DecisionModel {
   const { router, onStep, baseMaxTokens, limits, research } = options;
 
@@ -463,7 +522,14 @@ export function createTeamDecisionModel(options: {
           { role: 'user', content: context },
         ],
         {
-          baseMaxTokens,
+          /*
+           * **按角色给输出预算**（见 `ROLE_MAX_TOKENS` 的实测说明）。
+           *
+           * ⚠️ 这是修"超时"的真正根因：`TEAM_BASE_MAX_TOKENS = 8192`
+           * 意味着最坏要跑 80+ 秒，而 T1 的超时线是 60 秒 —— **必然超时**。
+           * 而实测 `max_tokens=2000` 时 `content = 0 字`（全花在推理上）。
+           */
+          baseMaxTokens: ROLE_MAX_TOKENS[role] ?? baseMaxTokens,
           /* 按角色绑定的路由组（`undefined` 时保持发现层的原行为）。 */
           ...(roleLadder !== undefined ? { ladder: roleLadder } : {}),
         },
