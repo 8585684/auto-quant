@@ -704,19 +704,49 @@ export function ExchangeAccountsSection() {
                    * `.panel-head` 就是同一个做法），两套模板下都成立。
                    */
                   <li key={row.id} className="overflow-hidden rounded-lg border border-base-750 bg-base-900 shadow-panel">
-                    {/* 标题条 */}
-                    <div className="flex flex-wrap items-center gap-x-2 gap-y-2 border-b border-base-800 bg-base-850/60 px-3 py-2">
+                    {/*
+                      标题条。
+
+                      ## ⚠️ 宽屏必须**不许换行**，否则它看起来就是"东倒西歪"
+
+                      这里原来是 `flex-wrap`。668px 的条里，身份那一段
+                      （图标 20 + 名称 133 + 三个徽章 287 + 间距）占 472px，
+                      而右侧三个按钮要 184px —— 加起来 656px，只差几十像素。
+                      于是 `flex-wrap` 把**按钮组整个推到第二行**（实测 y 从 240
+                      掉到 269，比徽章低 29px），而它又带着 `ml-auto` 贴右，
+                      结果第一行右端空出 172px、按钮孤零零挂在左下角。
+
+                      用户的原话是「文字\按钮东倒西歪，看着就很别扭不舒服」。
+                      换行在这里是**错的选择**：条子放不下时该被压缩的是**名称**
+                      （它本来就 `truncate`，截断是它的预期状态），而不是把动作
+                      挪到另一行。所以宽屏 `md:flex-nowrap` + 按钮 `shrink-0`。
+
+                      窄屏（`< md`）保留换行：375px 的手机上真的一行放不下，
+                      那时按钮换行是唯一可用的排法。
+
+                      间距也一并收紧（`gap-x-1.5` / 徽章 `gap-1.5` / 按钮 `gap-1`）：
+                      644px 的可用宽度里，身份段 + 按钮合计只差 20px 就放得下，
+                      把这 20px 从间距里省出来，名称就能完整显示而不是被截成
+                      「[DEMO] 模...」。
+                    */}
+                    <div className="flex flex-wrap items-center gap-x-1.5 gap-y-2 border-b border-base-800 bg-base-850/60 px-3 py-2 md:flex-nowrap">
                       <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded border border-base-700 bg-base-800 text-ink-lo">
                         <Landmark aria-hidden className="h-3 w-3" />
                       </span>
-                      <span className="min-w-0 truncate text-lg font-semibold text-ink-hi" title={row.label}>
+                      <span className="min-w-0 truncate text-base font-semibold text-ink-hi" title={row.label}>
                         {row.label}
                       </span>
-                      <Badge tone="accent">{exchangeLabel(row.exchange)}</Badge>
-                      <EnvBadge testnet={row.testnet} />
-                      {row.canTrade ? <Badge tone="up">可下单</Badge> : <Badge tone="warn">只读</Badge>}
+                      {/*
+                        徽章组 `shrink-0`：它们不该为了给按钮腾地方而被压扁。
+                        放不下时该压缩的是名称（见上），徽章是身份的一部分。
+                      */}
+                      <span className="flex shrink-0 items-center gap-1.5">
+                        <Badge tone="accent">{exchangeLabel(row.exchange)}</Badge>
+                        <EnvBadge testnet={row.testnet} />
+                        {row.canTrade ? <Badge tone="up">可下单</Badge> : <Badge tone="warn">只读</Badge>}
+                      </span>
 
-                      <span className="ml-auto flex flex-wrap items-center gap-1.5">
+                      <span className="ml-auto flex shrink-0 items-center gap-1">
                         <Button
                           size="sm"
                           variant="ghost"
