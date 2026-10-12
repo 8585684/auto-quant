@@ -55,6 +55,7 @@ import {
 import { agentExperiments as agentStoreExperiments, agentMemory as agentStoreMemory, agentRuns as agentStoreRuns } from '../store/agentStore.js';
 import type { TraderManager } from '../trader/manager.js';
 import { readLlmHealth, recordLlmHealth } from '../trader/manager.js';
+import { runSelfCheck } from '../trader/selfcheckRunner.js';
 import {
   requireAuth,
   signToken,
@@ -2360,6 +2361,49 @@ export async function buildServer(deps: ApiDependencies): Promise<FastifyInstanc
       pendingExperiments: agentStoreExperiments.pending(traderId).length,
       /** 累计运行次数 —— 判断"这个机器人到底跑过多少次"。 */
       runCount: agentStoreRuns.countSince(traderId, '1970-01-01T00:00:00Z'),
+    };
+  });
+
+  /**
+   * **跑一次自检**（用户需求 #6）。
+   *
+   * ## 用户的原话（这是本端点存在的理由）
+   *
+   * > 「你迭代更新系统得搞智能体团队**持续观察、测试**，然后反馈给你做相应得处理，
+   * >  **不要有任何 BUG，也不要老让我来测试和发现问题，你要自己发现问题自己解决**」
+   *
+   * > 「本地开发 + 服务器运行都要有 **AI 自检、问题留痕**」
+   *
+   * ## 为什么是 POST 而不是 GET
+   *
+   * 它会**写库**（发现落进 `runtime_logs` 的 `selfcheck` scope）——
+   * GET 不该有副作用。而且它是一次真实的检查动作，不是读既有结果。
+   *
+   * ## 为什么既返回结果又写日志
+   *
+   * 两处都要：
+   *   · **返回结果** → 调用方（界面按钮、我的脚本）能立刻看到；
+   *   · **写日志** → 留痕。用户要"下次唤醒时能快速定位"，
+   *     而日志是唯一**跨会话持久**的地方（进程重启也在）。
+   *
+   * ## 目前只跑确定性层
+   *
+   * 不依赖模型 —— 因为**模型挂掉的时候恰恰最需要自检**。
+   * AI 层建在这一层之上，见 `selfcheckRunner.runSelfCheck` 的 `ask` 参数。
+   */
+  app.post('/api/traders/:id/selfcheck', authed, async (request) => {
+    const traderId = traderIdOf(request);
+    const query = request.query as { windowHours?: string };
+    const parsed = Number(query.windowHours ?? 6);
+    /* 钳制而不报错 —— 与其它端点同一原则。 */
+    const windowHours = Number.isFinite(parsed) ? Math.min(Math.max(1, Math.trunc(parsed)), 168) : 6;
+
+    const result = await runSelfCheck(traderId, { windowHours });
+    return {
+      windowHours: result.evidence.windowHours,
+      deterministic: result.deterministic,
+      ai: result.ai,
+      evidence: result.evidence,
     };
   });
 
