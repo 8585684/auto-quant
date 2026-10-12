@@ -99,6 +99,42 @@ export function tierForRole(role: string): ModelTier {
 }
 
 /**
+ * **角色 → magpie 路由组**（2026-10-12 接线）。
+ *
+ * 这些组是第 43 轮按"工种"建的（`magpie group add`），当时**建了却没接线** ——
+ * 于是角色走的是发现层自动排的链，实测 `market_analyst` 撞上
+ * `group/auto-hy3`（思维链）→ 耗时 39s/121s/**>180s** → 超时 → 零决策。
+ *
+ * ⚠️ **只列我验证过的三个**。其余角色保持原样（发现层自动排序）——
+ * 一次全换会让我分不清"哪一处改动导致了什么"。
+ */
+export const ROLE_GROUP_LADDERS: Readonly<Record<string, readonly string[]>> = {
+  /*
+   * 唯一的 T2 分析角色。用 `team-analyst`（我按"分析"挑的
+   * mimo-flash-free / deepseek-flash / nemotron-ultra，优选→兜底）。
+   *
+   * **关键：不用思维链模型** —— 实测 `group/auto-hy3` 的耗时波动太大
+   *（39s / 121s / >180s），而它有 180 秒的硬超时。
+   */
+  market_analyst: ['group/team-analyst'],
+  /* 体力活：要快 + 免费。 */
+  technical: ['group/team-grunt'],
+  newscaster: ['group/team-grunt'],
+  sentiment: ['group/team-grunt'],
+};
+
+/**
+ * **档位 → 路由组**（角色没单独指定时的兜底）。
+ *
+ * ⚠️ T1 只给"体力活"组：那一档本来就该快。
+ * **T3 不在这里绑** —— 辩论/裁决我还没验证过 `team-judge` 的实际表现，
+ * 贸然换掉会让我分不清"是路由组变好了还是模型变好了"。
+ */
+const TIER_GROUP_LADDERS: Readonly<Record<string, readonly string[]>> = {
+  T1_fast: ['group/team-grunt'],
+};
+
+/**
  * 构造一个**多模型**的 `DecisionModel`。
  *
  * @param router 已经配好的模型路由器（含健康记录与降级链）
@@ -325,6 +361,34 @@ export function createTeamDecisionModel(options: {
   const ask: AskRole = async ({ role, tier, context, task }): Promise<DeskRoleOutput> => {
     const started = Date.now();
     try {
+      /*
+       * ── **按角色绑定 magpie 路由组**（2026-10-12 接线）──────────────────
+       *
+       * 用户建议过「按工种建路由组，绑定给对应的智能体」，而我在第 43 轮
+       * **建了 4 个组却一直没接线**。不接线的后果实测（`#2447`）：
+       *
+       * ```
+       *   market_analyst（T2 档）→ 发现层自动排的 group/auto-hy3（思维链）
+       *   → 耗时 39s / 121s / >180s 剧烈波动 → 超时失败
+       *   → 它是"判断有没有机会"的核心角色 → 裁决官无依据 → 零决策
+       * ```
+       *
+       * ## 映射的取舍
+       *
+       * | 角色类 | 组 | 理由 |
+       * |---|---|---|
+       * | `market_analyst`（唯一 T2 分析）| **`team-analyst`** | 我按"分析"挑的 3 模型优选→兜底；**不用思维链模型**（慢且不稳）|
+       * | T1 体力活 | **`team-grunt`** | 要快 + 免费 |
+       * | 辩论/裁决（T3）| **`team-judge`** | 要最强 |
+       *
+       * ⚠️ **只覆盖这三个组，其余角色保持原样**（发现层的自动排序）——
+       * 那是我还没充分验证过的部分，不该一次全换。
+       *
+       * ⚠️ 可用环境变量关掉（`AQ_ROLE_GROUPS=off`）—— 出问题能立刻回到旧行为。
+       */
+      const roleLadder = process.env.AQ_ROLE_GROUPS === 'off'
+        ? undefined
+        : ROLE_GROUP_LADDERS[role] ?? TIER_GROUP_LADDERS[tier];
       const result = await router.callByTier(
         tier,
         [
@@ -356,7 +420,11 @@ export function createTeamDecisionModel(options: {
           },
           { role: 'user', content: context },
         ],
-        { baseMaxTokens },
+        {
+          baseMaxTokens,
+          /* 按角色绑定的路由组（`undefined` 时保持发现层的原行为）。 */
+          ...(roleLadder !== undefined ? { ladder: roleLadder } : {}),
+        },
       );
       return {
         role,

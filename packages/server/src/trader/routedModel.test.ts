@@ -10,7 +10,8 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { ModelRouter, type CallModel } from '../llm/modelRouter.js';
-import { ROLE_TIERS, createRoutedDecisionModel, tierForRole } from './routedModel.js';
+import { readFileSync } from 'node:fs';
+import { ROLE_TIERS, ROLE_GROUP_LADDERS, createRoutedDecisionModel, tierForRole } from './routedModel.js';
 import { looksLikeMagpieGateway } from './magpieGateway.js';
 import { FIRM_ROLES, firmRoleOf } from '@aq/shared';
 
@@ -207,4 +208,57 @@ test('★ 组织架构的每个角色都有中文名与职责说明（界面要�
 test('★ 组织架构里没有重复的角色 id', () => {
   const ids = FIRM_ROLES.map((r) => r.id);
   assert.equal(new Set(ids).size, ids.length, '有重复的角色 id');
+});
+test('★★★ 关键角色必须绑定到【按工种建的路由组】（否则走发现层自动排序会撞上慢模型）', () => {
+  /*
+   * ## 为什么必须钉住
+   *
+   * 用户建议过「按工种建 magpie 路由组，绑定给对应的智能体」，
+   * 而我在第 43 轮**建了 4 个组却一直没接线**。不接线的后果实测（`#2447`）：
+   *
+   * ```
+   *   market_analyst（T2 档）→ 发现层自动排的 group/auto-hy3（思维链模型）
+   *   → 耗时 39s / 121s / >180s 剧烈波动 → 超时失败
+   *   → 它是"判断有没有机会"的核心角色 → 裁决官无依据 → 【零决策】
+   * ```
+   *
+   * 而 `team-analyst` 是我按"分析"挑的 3 个模型（优选→兜底），
+   * **不含思维链模型** —— 那正是为了避开这种耗时波动。
+   */
+  assert.ok(
+    ROLE_GROUP_LADDERS['market_analyst']?.includes('group/team-analyst'),
+    '★ market_analyst 必须绑 team-analyst（它是唯一 T2 分析角色，实测撞慢模型会超时）',
+  );
+  for (const role of ['technical', 'newscaster', 'sentiment']) {
+    assert.ok(
+      ROLE_GROUP_LADDERS[role]?.includes('group/team-grunt'),
+      `★ ${role} 是体力活，应当绑 team-grunt（要快 + 免费）`,
+    );
+  }
+});
+
+test('★ 路由组映射只列【验证过的】角色（不能一次全换）', () => {
+  /*
+   * ⚠️ 一次把所有角色都绑到组上会让我**分不清"哪一处改动导致了什么"**。
+   * 所以只列验证过的；其余保持发现层自动排序。
+   */
+  const bound = Object.keys(ROLE_GROUP_LADDERS);
+  assert.ok(bound.length <= 6, `★ 绑定的角色应当克制（当前 ${bound.length} 个：${bound.join(',')}）`);
+  /* 辩论/裁决（T3）暂时不绑 —— 还没验证过 team-judge 的实际表现。 */
+  for (const t3 of ['judge', 'bull', 'bear']) {
+    assert.equal(ROLE_GROUP_LADDERS[t3], undefined, `★ ${t3} 暂不绑定（未验证 team-judge）`);
+  }
+});
+
+test('★ 可以用环境变量关掉（出问题能立刻回到旧行为）', () => {
+  /*
+   * `AQ_ROLE_GROUPS=off` 时 `ask()` 不传 ladder → 回到发现层排序。
+   * 这条是**运维安全阀**：若路由组引入了新问题，不必改代码就能回退。
+   *
+   * ⚠️ 这里只能断言"这个开关的名字在源码里" ——
+   * 真正验证它需要构造完整调用链（见 `routedModel.ts` 里那行三元）。
+   */
+  const src = readFileSync(new URL('./routedModel.ts', import.meta.url), 'utf8');
+  assert.ok(src.includes("AQ_ROLE_GROUPS"), '★ 必须有这个开关');
+  assert.ok(src.includes("=== 'off'"), '★ 且 off 时真的不传 ladder');
 });

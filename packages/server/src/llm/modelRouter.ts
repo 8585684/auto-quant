@@ -163,20 +163,48 @@ export class ModelRouter {
   async callByTier(
     tier: ModelTier,
     messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>,
-    options: { signal?: AbortSignal; baseMaxTokens: number },
+    options: {
+      signal?: AbortSignal;
+      baseMaxTokens: number;
+      /**
+       * **显式的候选链覆盖**（2026-10-12 加，用于"按角色指定 magpie 路由组"）。
+       *
+       * ## 为什么需要它
+       *
+       * 用户建议过「按工种建 magpie 路由组，绑定给对应的智能体」，
+       * 而我在第 43 轮**建了 4 个组**（`team-grunt` / `team-analyst` /
+       * `team-judge` / `team-news`）—— 但**一直没接线**。
+       *
+       * 不接线的后果实测（`#2447`）：`market_analyst`（T2 档）走的是
+       * 发现层自动排的 `group/auto-hy3`（**思维链模型**），
+       * 耗时在 **39s / 121s / >180s** 之间剧烈波动 → **超时失败** →
+       * 它是"判断有没有机会"的核心角色 → **裁决官无依据 → 零决策**。
+       *
+       * ## 语义
+       *
+       * · 给了它 → **只用它**（不再走发现层的候选链）；
+       * · 没给（默认）→ **行为与改动前完全一致**（这是增量更新的硬要求）。
+       *
+       * ⚠️ 它**不绕过健康检查** —— 链内仍然按 `pickAvailable` 逐个试、
+       * 失败仍然降级与熔断。所以给一个"全是死模型"的链不会卡死，
+       * 而是会走到 `maxFallbacks` 用尽后报错（与原来一致）。
+       */
+      ladder?: readonly string[];
+    },
   ): Promise<RouterCallResult> {
     if (tier === 'T0_code') {
       throw new Error('T0_code 档不需要模型 —— 这类工作应当由代码完成（这是设计约束，不是错误）。');
     }
 
     /*
-     * **候选链来源**：优先用"网关此刻真实存在"的发现结果；
-     * 没有（发现失败/未启用）就回退到静态档案。
-     *
-     * 这样"新上线的模型"下一次装配就会自动进入候选链，
-     * 而"已下线的模型"不会继续被尝试。
+     * **候选链来源（优先级从高到低）**：
+     *   ① 调用方显式给的 `ladder`（按角色绑定路由组）
+     *   ② 网关此刻真实存在的发现结果
+     *   ③ 静态档案（兜底）
      */
-    const discovered = this.options.discoveredLadders?.[tier];
+    const discovered = options.ladder !== undefined && options.ladder.length > 0
+      ? [...options.ladder]
+      : this.options.discoveredLadders?.[tier];
     const ladder = discovered !== undefined && discovered.length > 0
       ? [...discovered]
       : ladderForTier(tier).map((p) => p.id);
