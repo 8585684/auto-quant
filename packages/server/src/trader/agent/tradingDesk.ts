@@ -41,6 +41,7 @@
 
 import type { ModelTier } from '../../llm/modelCatalog.js';
 import { mapConcurrent } from './pool.js';
+import { enterCritical, leaveCritical } from './resourceGate.js';
 import { compactMarketContext } from './symbolSlices.js';
 import {
   buildSupervisorPrompt,
@@ -255,8 +256,43 @@ export function assertBudgetConsistent(
  * @param input.newsContext 新闻/情绪材料（可为空 —— 没配搜索时就是空的）
  * @param input.positionContext 持仓与账户材料
  * @param input.onStep 每一步的回调（**可观测性**：让界面看得见团队在做什么）
+ *
+ * ── ⚠️ **它同时是一个"资源关键区"**（2026-10-13 加）──────────────────────
+ *
+ * ## 为什么（一次实测定位到的真因）
+ *
+ * 服务器是 **2 核 / 1.9GB**（可用常驻内存仅 ~740MB），而线上同时跑着：
+ * ```
+ *   ① 后台调研：每 10 分钟一轮，起 claude code 进程（每个约 95–250MB）
+ *   ② 这次决策：4 个分析师并发
+ * ```
+ * 症状：
+ * ```
+ *   technical：失败 —— 角色 technical 超过 120 秒未返回
+ * ```
+ * **而我在空载时单独实测同一个任务只要 10–13 秒**（4 个并发一起也只要 16 秒）。
+ * 差别只有一个：**线上同时还有后台调研在抢 CPU**。
+ *
+ * ## 所以：决策期间**调研让路**
+ *
+ * `runOutsideCritical()` 会让后台调研等到这里结束（见 `resourceGate.ts`）。
+ * 优先级是**业务定的**：决策是"要花钱/赚钱的那个动作"，
+ * 调研是"下一轮才用到"的准备 —— 它晚 30 秒没有任何损失。
+ *
+ * ⚠️ **`finally` 不能省**：若一次异常就让计数永远 > 0，
+ * 后台调研会**再也不会运行** —— 那是"安静地停掉一个功能"的失败，
+ * 而它不会报错、界面上也看不出来。
  */
-export async function runTradingDesk(input: {
+export async function runTradingDesk(input: Parameters<typeof runTradingDeskInner>[0]): ReturnType<typeof runTradingDeskInner> {
+  enterCritical();
+  try {
+    return await runTradingDeskInner(input);
+  } finally {
+    leaveCritical();
+  }
+}
+
+async function runTradingDeskInner(input: {
   ask: AskRole;
   marketContext: string;
   newsContext: string;

@@ -35,6 +35,7 @@ import {
   type HunterReport,
 } from './intel/hunters.js';
 import { mapConcurrent } from './agent/pool.js';
+import { runOutsideCritical } from './agent/resourceGate.js';
 import { runSelfCheck } from './selfcheckRunner.js';
 import { createRoutedDecisionModel, createTeamDecisionModel, tierForRole } from './routedModel.js';
 
@@ -472,7 +473,9 @@ function ensureResearchRefresher(
      */
     const controller = new AbortController();
     researchAborts.set(traderId, controller);
-    void refreshResearch(traderId, symbols, apiKey, controller.signal)
+    void runOutsideCritical(async () =>
+      refreshResearch(traderId, symbols, apiKey, controller.signal),
+    )
       /*
        * ⚠️⚠️ **不能写成 `.catch(() => undefined)`**（2026-10-13 实测抓到）。
        *
