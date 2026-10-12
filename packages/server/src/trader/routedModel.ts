@@ -245,6 +245,18 @@ export type ModelCallFactory = (modelId: string) => CallModel;
  * ⚠️ **只在团队模式剥**（本文件是团队专用的 `createTeamDecisionModel`）——
  * 另两种模式**真的有工具**（`decisionTools.ts`），剥掉会让它们失去取数能力。
  */
+/**
+ * **不算"动作"的决策** —— 它们不改变任何仓位，风控无需审阅。
+ *
+ * 与 `@aq/shared` 的 `DecisionActionSchema` 保持一致：
+ * `skip` / `hold` / `wait` 都是"什么都不做"的表达（只是语气不同）。
+ *
+ * ⚠️ **不要用 `isOpenAction` 之类的白名单反推** —— 那样每加一个新动作
+ * 都会默认落到"不算动作"里（fail-open）。这里用**黑名单**：
+ * 只有明确属于"不行动"的三个才跳过，其余（含将来新增的动作）
+ * **一律送去风控**（fail-closed）。
+ */
+const NON_ACTION = new Set(['skip', 'hold', 'wait']);
 export function stripToolBlocks(text: string): string {
   return text.replace(/<tool>[\s\S]*?<\/tool>/g, '').replace(/\n{3,}/g, '\n\n');
 }
@@ -509,6 +521,45 @@ async function askRiskOfficer(
 
   /* 没有决策要审（本轮本来就不行动）→ 不必多花一次调用。 */
   if (decisions.length === 0) return null;
+
+  /*
+   * ⚠️ **全是"不行动"时也跳过风控官**（2026-10-12，实测耗时结构定位后补上）。
+   *
+   * ## 为什么
+   *
+   * 风控审的是**要执行的动作** —— 没有动作就没有风险敞口可审。
+   * 而裁决官经常会给出 N 条 `skip`（"每个候选都不做"），
+   * 那时 `decisions.length` **不是 0**（所以上面那条拦不住），
+   * 于是风控官被叫来读 15 万字材料、然后回答"批准"—— **约 120 秒白花**。
+   *
+   * ## 实测背景
+   *
+   * 第 39 轮把耗时结构定位清楚了：
+   *
+   * ```
+   *   4 个分析师（并行）：~50 秒
+   *   辩论 → 裁决 → 风控：~370 秒     ← 瓶颈
+   * ```
+   *
+   * 而这三次串行 T3 调用**不能并行**（P1：唯一裁决者）。
+   * 所以省时间的唯一办法是**少调用一次** —— 而这一条正是安全的省略：
+   * 没有动作时，风控的结论必然是"批准"（没什么可否决的）。
+   *
+   * ## 为什么这是安全的（而不是"跳过检查"）
+   *
+   * 风控官的两层结构里，**代码层的物理底线（`RiskEngine`）不受影响** ——
+   * 它仍然会跑，仍然会拦下保证金不足、数量不可交易、没有止损的动作。
+   * 跳过的只是"**智能体层的策略审阅**"，而那一层对"什么都不做"没有可审的东西。
+   */
+  const hasAction = decisions.some((d) => !NON_ACTION.has(d.action));
+  if (!hasAction) {
+    onStep?.({
+      role: 'risk_officer',
+      phase: 'risk',
+      note: `裁决结果全是"不行动"（${decisions.length} 条）—— 风控官无需审阅，省一次调用`,
+    });
+    return null;
+  }
 
   onStep?.({ role: 'risk_officer', phase: 'risk', note: `审阅 ${decisions.length} 条决策` });
 

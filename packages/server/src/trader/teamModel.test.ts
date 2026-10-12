@@ -342,3 +342,71 @@ test('★ 剥工具不影响不含工具块的输出（回归）', async () => {
   assert.ok(result.text.includes('<decision>'));
   assert.ok(result.text.includes('<team>'), '审计块要在');
 });
+test('★★★ 裁决全是"不行动"时跳过风控官（省一次 T3 调用）', async () => {
+  /*
+   * ## 实测动机（第 39 轮的耗时结构定位）
+   *
+   * ```
+   *   4 个分析师（并行）：~50 秒
+   *   辩论 → 裁决 → 风控：~370 秒     ← 瓶颈
+   * ```
+   *
+   * 三次串行 T3 调用**不能并行**（P1：唯一裁决者）——
+   * 所以省时间的唯一办法是**少调用一次**。
+   *
+   * 而"全是 skip"是最安全的省略：**没有动作就没有风险敞口可审**。
+   */
+  const seen: string[] = [];
+  const { call } = roleAwareCall();
+  const wrapped: CallModel = async (m, messages, o) => {
+    /* 从 system 里认角色（与 roleAwareCall 同一手法）。 */
+    const sys = messages.find((x) => x.role === 'system')?.content ?? '';
+    const r = await call(m, messages, o);
+    const m2 = /「(\w+)」/.exec(sys);
+    if (m2) seen.push(m2[1]!);
+    /* 裁决官给"全都不行动"。 */
+    if (sys.includes('「judge」')) {
+      return { ...r, text: '[{"symbol":"BTCUSDT","action":"skip","confidence":80,"reasoning":"无合格入场"}]' };
+    }
+    return r;
+  };
+
+  const model = createTeamDecisionModel({ router: new ModelRouter({ call: wrapped }), baseMaxTokens: 4096 });
+  const result = await model.complete(SYS, USER, {});
+
+  assert.ok(!seen.includes('risk_officer'), '★ 全是 skip 时不该叫风控官');
+  assert.ok(result.text.includes('<decision>'), '决策块仍要产出');
+});
+
+test('★★★ 有真实动作时【必须】叫风控官（fail-closed，不能误省）', async () => {
+  /*
+   * ⚠️ 这条是上一条的**安全对照**。
+   *
+   * 跳过风控的判据必须是"**明确全是**不行动"——
+   * 如果判据写反了（例如"有任何一个 skip 就跳过"），
+   * 那会出现"有开仓动作却不经风控"的严重后果。
+   *
+   * 用**黑名单**（`skip`/`hold`/`wait`）而不是"非开仓即不行动"：
+   * 将来新增的动作会**默认送去风控**（fail-closed）。
+   */
+  const seen: string[] = [];
+  const { call } = roleAwareCall();
+  const wrapped: CallModel = async (m, messages, o) => {
+    const sys = messages.find((x) => x.role === 'system')?.content ?? '';
+    const r = await call(m, messages, o);
+    const m2 = /「(\w+)」/.exec(sys);
+    if (m2) seen.push(m2[1]!);
+    if (sys.includes('「judge」')) {
+      return {
+        ...r,
+        text: '[{"symbol":"BTCUSDT","action":"open_long","positionSizeUsd":100,"stopLoss":60000,"confidence":80}]',
+      };
+    }
+    return r;
+  };
+
+  const model = createTeamDecisionModel({ router: new ModelRouter({ call: wrapped }), baseMaxTokens: 4096 });
+  await model.complete(SYS, USER, {});
+
+  assert.ok(seen.includes('risk_officer'), '★ 有开仓动作时【必须】叫风控官');
+});
