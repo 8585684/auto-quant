@@ -735,8 +735,8 @@ async function refreshResearch(
      */
     runtimeLogs.write(
       traderId, 'warn', 'team',
-      `[调研] 查到 ${parsed.intel.length} 条情报但**全部被时效/交叉验证剔除** —— ` +
-        '本轮没有可用情报（这通常是猎手输出缺 `hoursAgo`，不是"那边没有消息"）',
+      `[调研] 查到 ${parsed.intel.length} 条情报但**全部过期**（weight=0）—— ` +
+        '本轮没有可用情报。这说明猎手查到了东西、但那些消息太旧了（新闻猎手被要求查"今天"）',
     );
     return;
   }

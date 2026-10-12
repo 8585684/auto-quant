@@ -50,9 +50,31 @@ test('★★★ 猎手提示词要求"发布时刻"（freshness 衰减的输入�
    * 而猜错的代价是静默的（3 天前的消息被当成"现在"进入决策）。
    */
   assert.ok(HUNTERS_SRC.includes('hoursAgo'), '★ 缺了它 → 衰减逻辑会空转（publishedAt 只能填"现在"）');
+  /*
+   * ── 2026-10-13 加强（实测后改）────────────────────────────────────────
+   *
+   * 旧的断言是 `includes('多久之前发布')` —— 一句**散文要求**。
+   * 实测发现它**不够**：
+   * ```
+   *   · coinstats.app · 72.0h前 · weight=0.00 · confirmed=false
+   *   · www.forbes.com · 72.0h前 · weight=0.00 · confirmed=false
+   *   · pluang.com    · 24.0h前 · weight=0.33 · confirmed=false
+   * ```
+   * 猎手**照做了**（给了 `hoursAgo`），但它给的是**几天前的旧闻** ——
+   * 而 `freshness` 的 TTL 把 >48h 的判为 `weight=0` 直接丢弃。
+   * 也就是说：模型不知道"我报的东西会被怎么用"，于是把**不会被采用的**也报了。
+   *
+   * 所以提示词要**说清后果与边界**：
+   *   ① 48 小时之外会被丢弃 → 只报最近 48 小时内的；
+   *   ② `hoursAgo` 必须是**数字**（类型不对整条被丢）。
+   */
   assert.ok(
-    HUNTERS_SRC.includes('多久之前发布'),
-    '★ 必须让模型写明发布时刻（而不是只给 JSON 字段名）',
+    HUNTERS_SRC.includes('48 小时'),
+    '★ 必须告诉模型时效边界（否则它会把几天前的旧闻报上来，然后被静默丢弃）',
+  );
+  assert.ok(
+    HUNTERS_SRC.includes('**`hoursAgo` 必须是数字**'),
+    '★ 必须强调类型（写成字符串会让那一条整条被丢弃）',
   );
 });
 
