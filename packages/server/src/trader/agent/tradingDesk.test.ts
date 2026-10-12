@@ -245,3 +245,45 @@ test('★★★ 角色超过档位超时 → 标记失败而不是拖死整轮',
     void slow;
   });
 });
+test('★★★ 裁决官的提示词必须要求【独立判断、不许复读】（真实调研的失败模式）', () => {
+  /*
+   * ## 来源：真实调研（2026-10-12）
+   *
+   * [Peacemaker or Troublemaker, arXiv:2509.23055](https://arxiv.org/html/2509.23055v1)
+   * 实测出的失败模式之一：
+   *
+   * > 「有裁判时，裁判**"只复读、不做独立推理"**」
+   *
+   * 即：让模型"汇总双方观点"时，它倾向于**把双方的话各抄一半、给个骑墙结论** ——
+   * 看起来像裁决，实际上**没做任何判断**。而这是"多智能体辩论"被质疑的核心原因之一。
+   *
+   * ## 这条测试是"防漂移"的
+   *
+   * 它不测模型行为（那要靠实测），它钉住的是**提示词里那两条可检验的要求**：
+   * 「不同意哪一方」「依据什么取舍」—— 复读的人**写不出**这两样。
+   *
+   * ⚠️ 与 `ROLE_TIERS` 那条防漂移测试同一性质：**要求可以被改，但不能被悄悄删掉。**
+   * 若将来有人认为这两句没用而删了它，这条测试会失败，逼他先读这段理由。
+   */
+  const seen: Array<{ role: string; task: string }> = [];
+  const ask: AskRole = async ({ role, task }) => {
+    seen.push({ role, task });
+    return { role, modelId: `stub/${role}`, data: null, raw: '[]', latencyMs: 1, ok: true };
+  };
+  return runTradingDesk({ ask, ...CTX }).then(() => {
+    const judge = seen.find((s) => s.role === 'judge');
+    assert.ok(judge !== undefined, '应当问过裁决官');
+    assert.ok(
+      judge!.task.includes('不能只复读'),
+      '★ 必须明确禁止"只复读" —— 那是调研实测出的裁判失败模式',
+    );
+    assert.ok(
+      judge!.task.includes('不同意哪一方'),
+      '★ 必须要求它写出"不同意哪一方" —— 复读的人写不出这个',
+    );
+    assert.ok(
+      judge!.task.includes('依据什么做了取舍'),
+      '★ 必须要求它暴露自己的判据，而不是"综合来看"',
+    );
+  });
+});
