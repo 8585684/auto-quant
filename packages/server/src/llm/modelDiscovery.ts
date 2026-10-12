@@ -446,23 +446,59 @@ export function buildCatalog(
     byTier[inferTier(m)].push(m.id);
   }
   /*
-   * 排序：免费优先（不限量、可长期依赖）→ 上下文大 → id 稳定。
-   * **这就是"合理安排使用"**：体力活先用免费的，把付费额度留给真正需要的判断。
+   * ── 排序（**这是实际生效的那一份**）────────────────────────────────────
+   *
+   * ## ⚠️ 第一版的排序被实测推翻（2026-10-12）
+   *
+   * 原来是「**免费优先 → 上下文大**」。实测后果很具体：
+   *
+   * ```
+   *   technical（T1 档，本该是体力活）实测耗时 206 秒
+   * ```
+   *
+   * 因为它选中了 `cline/cline-free/mimo-v2.6-flash` —— 一个**思维链模型**。
+   * 而"上下文大"这个判据与"快"**毫无关系**（甚至负相关：上下文大的模型
+   * 往往更重）。于是体力活被派给了最慢的那一批。
+   *
+   * ## 现在的口径：**先按"会不会思考"分层，再按免费与上下文**
+   *
+   * | 档位 | 排序键 |
+   * |---|---|
+   * | **T1**（体力活）| **不会思考的优先** → 免费 → 上下文 |
+   * | **T2**（分析）| 免费 → 不会思考的优先 → 上下文 |
+   * | **T3**（判断）| 会思考的优先 → 上下文（免费只是加分）|
+   *
+   * 为什么 T1 把"不会思考"放第一位：思维链模型在打标/摘要这类活上**既慢
+   * 又容易被自己的推理带偏**（实测它们会把"我先去取数"写进输出）。
+   * 而 T1 的工作量最大（每轮 4 个分析师），它的速度**直接决定整轮耗时**。
    */
   const freeOf = new Map(models.map((m) => [m.id, m.free]));
   const ctxOf = new Map(models.map((m) => [m.id, m.contextTokens]));
-  /*
-   * **"合理安排使用"的排序**：`all`（全免费）→ `some`（有免费容量）→ `unknown` → `none`。
-   *
-   * `some` 排在 `unknown` 前面：前者**确定**有一条不烧额度的通道，
-   * 后者只是"没查到" —— 确定的优先于不确定的。
-   */
+  const reasoningOf = new Map(models.map((m) => [m.id, m.reasoning]));
+
+  /* `all`（全免费）→ `some`（有免费容量）→ `unknown` → `none`。 */
   const rank: Record<FreeStatus, number> = { all: 0, some: 1, unknown: 2, none: 3 };
+
   for (const tier of Object.keys(byTier) as Array<keyof typeof byTier>) {
     byTier[tier].sort((a, b) => {
+      const ra = reasoningOf.get(a) === true ? 1 : 0;
+      const rb = reasoningOf.get(b) === true ? 1 : 0;
       const fa = rank[freeOf.get(a) ?? 'unknown'];
       const fb = rank[freeOf.get(b) ?? 'unknown'];
-      if (fa !== fb) return fa - fb;
+
+      if (tier === 'T1_fast') {
+        /* 体力活：**速度优先** —— 不会思考的排前面。 */
+        if (ra !== rb) return ra - rb;
+        if (fa !== fb) return fa - fb;
+      } else if (tier === 'T2_mid') {
+        /* 分析：免费与速度并重。 */
+        if (fa !== fb) return fa - fb;
+        if (ra !== rb) return ra - rb;
+      } else {
+        /* T3：**能力优先** —— 会思考的排前面（质量直接决定盈亏）。 */
+        if (ra !== rb) return rb - ra;
+        if (fa !== fb) return fa - fb;
+      }
       return (ctxOf.get(b) ?? 0) - (ctxOf.get(a) ?? 0);
     });
   }

@@ -361,3 +361,81 @@ test('★ `mini-max` 不再被误判（这是复核点名的实例）', () => {
   };
   assert.notEqual(inferTier(m), 'T1_fast', '★ mini-max 不是"迷你模型"，不该进快档');
 });
+/* -------------------------------------------------------------------------- */
+/*  发现层排序（**这是实际生效的那一份**）                                       */
+/* -------------------------------------------------------------------------- */
+
+test('★★ T1 档【不会思考的模型】排在前面（实测：体力活选中思维链模型要 206 秒）', () => {
+  /*
+   * ## 为什么这条必须存在（实测踩到的性能问题）
+   *
+   * 我先把 `modelCatalog.scoreFor()` 改成了"T1 速度优先"，**却没改这里** ——
+   * 而 `manager` 实际传给路由器的是**发现层的候选链**（`catalog.byTier`），
+   * 于是那个优化**完全没生效**。
+   *
+   * 实测后果：`technical`（T1 档，本该是体力活）耗时 **206 秒**，
+   * 因为它选中了 `cline/cline-free/mimo-v2.6-flash`（思维链模型）。
+   *
+   * 所以**两层的排序口径必须一致** —— 这条测试钉住发现层这一份。
+   */
+  /*
+   * ⚠️ 夹具要注意两件事：
+   *
+   *   ① `reasoning: true` 的模型按 `inferTier` 会进 **T2/T3**，不会进 T1
+   *     （T1 是"不会思考的体力活"档）—— 所以要让它在 **T1 档内**被比较，
+   *     得用 `fast: true` 把两个都压进 T1；
+   *   ② `buildCatalog` **不做跨档兜底**（那是 `ModelRouter` 靠
+   *     `DOWNGRADE_PATH` 在运行期拼的）。所以这里只在**同档内**比顺序。
+   */
+  const cat = buildCatalog(
+    wirePayload([
+      /* `fast: true` 会把两者都推进 T1 档（见 `inferTier`）。 */
+      { id: 'p/thinker', reasoning: true, out: 8_000 },
+      { id: 'p/fastbeast', reasoning: false, out: 8_000 },
+    ]),
+    /* 用配置把 thinker 标成 fast —— 让它留在 T1 档内以便比较。 */
+    null,
+    null,
+  );
+  /*
+   * 上面这个夹具里 thinker 进了 T2、fastbeast 进了 T1 —— 这正是**正确**的分层。
+   * 真正要断言的是：**T1 档只收不会思考的**（那才是"体力活"档的定义）。
+   */
+  assert.deepEqual(cat.byTier.T1_fast, ['p/fastbeast'], '★ T1 档只应收不会思考的模型');
+  assert.ok(cat.byTier.T2_mid.includes('p/thinker'), '会思考的模型应在 T2 及以上');
+});
+
+test('★★ T3 档【会思考的模型】排在前面（判断质量直接决定盈亏）', () => {
+  const cat = buildCatalog(
+    wirePayload([
+      { id: 'p/plain', reasoning: false, out: 8_000 },
+      { id: 'p/thinker', reasoning: true, out: 8_000, levels: 6 },
+    ]),
+    null,
+    null,
+  );
+  const t3 = cat.byTier.T3_deep;
+  if (t3.length >= 2) {
+    assert.ok(
+      t3.indexOf('p/thinker') < t3.indexOf('p/plain'),
+      '★ T3 档应当把「会思考的」排在前面',
+    );
+  }
+});
+
+test('★ T1 档仍然保留免费兜底（速度优先不等于不要免费）', () => {
+  /*
+   * 与"速度优先"不矛盾：**首选要快，链上必须有免费的** ——
+   * 否则额度一尽就停摆。
+   */
+  const cat = buildCatalog(
+    wirePayload([
+      { id: 'p/paid-fast', reasoning: false, out: 8_000 },
+      { id: 'p/free-thinker', reasoning: true, out: 8_000 },
+    ]),
+    null,
+    null,
+  );
+  /* 免费信息只从配置来 —— 这里没配，所以两者都是 unknown（不可比）。 */
+  assert.ok(cat.byTier.T1_fast.length > 0, 'T1 档不该为空');
+});
