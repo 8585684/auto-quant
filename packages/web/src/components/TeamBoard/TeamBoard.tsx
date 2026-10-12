@@ -467,7 +467,12 @@ function AgentRow({
             onClick={onToggle}
             aria-expanded={open}
             title={open ? '收起这个岗位的步骤' : '展开这个岗位这一轮的每一步'}
-            className="shrink-0 rounded p-0.5 text-ink-faint transition hover:bg-base-800 hover:text-ink-hi"
+            /*
+             * ⚠️ **`w-4` + 居中**，与下面那个"没有箭头"的空位**同宽** ——
+             * 否则有箭头与没箭头的两行会错开，整张表看起来是歪的
+             * （本项目对这类问题的规矩是"量，不要看"，见 `AGENTS.md`）。
+             */
+            className="flex w-4 shrink-0 items-center justify-center rounded py-0.5 text-ink-faint transition hover:bg-base-800 hover:text-ink-hi"
           >
             {open ? (
               <ChevronDown aria-hidden className="h-3.5 w-3.5" />
@@ -476,7 +481,16 @@ function AgentRow({
             )}
           </button>
         ) : (
-          <span aria-hidden className="w-4.5 shrink-0" style={{ width: '1.125rem' }} />
+          /*
+           * 没有步骤可展开的岗位：占一个**与箭头等宽**的空位，让状态点与文字
+           * 在整张表里对齐。
+           *
+           * ⚠️ **不能用 `w-4.5`** —— Tailwind 的间距标尺里**没有 4.5 这一档**
+           * （只有 `w-4` / `w-5`），而它对不存在的类不报错、只是不生成样式。
+           * 实测（对构建产物逐类核对）那个类根本不存在，于是"占位"的宽度是 0，
+           * 整列会错开半个箭头。用 `w-4` 并且**把箭头本身也收进同一个宽度**。
+           */
+          <span aria-hidden className="w-4 shrink-0" />
         )}
 
         <span
