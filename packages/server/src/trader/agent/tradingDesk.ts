@@ -42,6 +42,56 @@
 import type { ModelTier } from '../../llm/modelCatalog.js';
 import { mapConcurrent } from './pool.js';
 import { compactMarketContext } from './symbolSlices.js';
+import {
+  buildSupervisorPrompt,
+  parseDispatch,
+  planDispatch,
+  type AnalystCandidate,
+} from './dispatch.js';
+
+/**
+ * **分析师的静态定义**（2026-10-13 提取为常量）。
+ *
+ * ## 为什么提取出来
+ *
+ * 原来它是函数内联的一个数组字面量 —— 而"总管要先知道**有哪些角色可选**
+ * 才能决定派谁"，所以那份清单必须在**问总管之前**就存在。
+ *
+ * ⚠️ `contextKind` 而不是直接给 `context`：材料有两个来源
+ * （行情 / 新闻），而**材料本身是运行期才知道的**（压缩与否、新闻有没有）。
+ * 用"种类"而不是"字符串"，是为了让"谁用哪份材料"这件事**在这里一眼可见**。
+ */
+const ANALYSIS_ROLE_DEFS: ReadonlyArray<{
+  role: string;
+  tier: ModelTier;
+  contextKind: 'market' | 'news';
+  task: string;
+}> = [
+  {
+    role: 'market_analyst',
+    tier: 'T2_mid',
+    contextKind: 'market',
+    task: '分析当前市场的整体状态与值得关注的结构。',
+  },
+  {
+    role: 'technical',
+    tier: 'T1_fast',
+    contextKind: 'market',
+    task: '只做指标与形态的客观描述，不要给交易建议。',
+  },
+  {
+    role: 'newscaster',
+    tier: 'T1_fast',
+    contextKind: 'news',
+    task: '把新闻整理成结构化事件卡（实体、方向、强度、来源）。没有可用的新闻就明说。',
+  },
+  {
+    role: 'sentiment',
+    tier: 'T1_fast',
+    contextKind: 'news',
+    task: '给出市场情绪分与样本量。没有数据就明说"样本不足"，不要编。',
+  },
+];
 
 /** 一个角色的产出（结构化卡片）。 */
 export interface DeskRoleOutput {
@@ -112,18 +162,23 @@ export const DESK_LIMITS = {
   /**
    * 一次会议最多几次模型调用。
    *
-   * 组成：4 个分析师并行(4) + Bull(1) + Bear(1) + **Judge(1)** = 7，
-   * 留余量 → **8**。
+   * 组成：**总管(1)** + 4 个分析师并行(4) + Bull(1) + Bear(1) + **Judge(1)** = 8，
+   * 留余量 → **9**。
    *
-   * ⚠️ **`maxCalls` 必须 ≥ 分析员数 + 2×辩论轮数 + 1（裁决）**，
+   * ⚠️ **`maxCalls` 必须 ≥ 1(总管) + 分析员数 + 2×辩论轮数 + 1（裁决）**，
    * 否则裁决会被饿死 —— 这是实测踩到的：
-   * 第一版 `maxCalls=8` 配 `maxDebateRounds=2` 时，
-   * 4 + 2×2 = 8 次就用完了，**Judge 一次都没跑**，整轮没有结论。
+   * ```
+   *   第一版 maxCalls=8 配 maxDebateRounds=2 → 4 + 2×2 = 8 次用光，
+   *   Judge 一次都没跑，整轮没有结论。
+   * ```
+   * ⚠️ 而 2026-10-13 接上真总管之后，**同样的错误又差点重演**：
+   * `maxCalls=8` 在"1 总管 + 4 分析师 + 2 辩论 + 1 裁决 = 8"下**刚好用光**，
+   * 两个既有测试当场失败（「自洽预算下不该被截断」）。所以提到 9。
    *
    * 所以下面有 `assertBudgetConsistent()` 在启动时就把这个不变量验一遍 ——
    * **让配置错误在启动那一刻暴露，而不是在跑了几十轮之后表现为"总是没有裁决"。**
    */
-  maxCalls: 8,
+  maxCalls: 9,
   /**
    * 辩论轮数上限。
    *
@@ -146,7 +201,26 @@ export const DESK_LIMITS = {
 export const DESK_ANALYST_COUNT = 4;
 
 /**
- * 校验预算自洽 —— **不变量：`maxCalls` 必须容得下"满编分析员 + 全部辩论 + 1 次裁决"**。
+ * **总管那次调用**占用的额度（2026-10-13 加）。
+ *
+ * ## 为什么必须显式计入不变量（我差点漏掉）
+ *
+ * 我把总管接上去之后，**两个既有测试当场失败**：
+ * ```
+ *   ★ 预算不足时【提前收尾并如实标记】  → 「自洽预算下不该被截断」实际被截断了
+ *   ★ 分析师顺序必须与角色表一致
+ * ```
+ * 根因：`maxCalls = 8` 正好是 `4 分析师 + 1 Bull + 1 Bear + 1 Judge = 7` 加余量 1，
+ * 而**总管又吃掉一次** → 分析师被截断 → **裁决官真的会被饿死**。
+ *
+ * > 这正是 `assertBudgetConsistent` 存在的意义：**它当场抓住了这个算术错误**。
+ * > 而我如果只改 `maxCalls` 而不更新这个不变量，下一个改配置的人会再踩一次。
+ */
+const SUPERVISOR_CALLS = 1;
+
+/**
+ * 校验预算自洽 —— **不变量：`maxCalls` 必须容得下
+ * "1 次总管 + 满编分析员 + 全部辩论 + 1 次裁决"**。
  *
  * ## 为什么按【满编】校验，而不是按"这次实际会派几个"
  *
@@ -163,10 +237,11 @@ export function assertBudgetConsistent(
   limits: { maxCalls: number; maxDebateRounds: number },
   analystCount = DESK_ANALYST_COUNT,
 ): void {
-  const needed = analystCount + limits.maxDebateRounds * 2 + 1;
+  const needed = SUPERVISOR_CALLS + analystCount + limits.maxDebateRounds * 2 + 1;
   if (limits.maxCalls < needed) {
     throw new Error(
-      `交易台预算不自洽：需要至少 ${needed} 次调用（${analystCount} 分析师 + ${limits.maxDebateRounds}×2 辩论 + 1 裁决），` +
+      `交易台预算不自洽：需要至少 ${needed} 次调用` +
+        `（${SUPERVISOR_CALLS} 总管 + ${analystCount} 分析师 + ${limits.maxDebateRounds}×2 辩论 + 1 裁决），` +
         `但 maxCalls=${limits.maxCalls} —— 裁决会被饿死，整轮将没有结论。`,
     );
   }
@@ -193,6 +268,18 @@ export async function runTradingDesk(input: {
    * 为空数组时裁决官**不标注**（而不是猜）。
    */
   availableIntelKeys?: string[];
+  /**
+   * **本轮候选标的数** —— 只用于让总管知道"有没有东西可分析"（2026-10-13）。
+   *
+   * ⚠️ **不传也能工作**：`tradingDesk` 会从 `marketContext` 里**数出**候选数
+   *（数 `### N. SYMBOL` 标题）。这一条是**必须的** ——
+   * 我第一版只留了这个字段而**没人传它**，于是总管永远看到"0 个候选"，
+   * 它合理地判断"没东西可分析"→ **少派了分析师** →
+   * 两个既有测试当场失败（`expected: 8, actual: 7`）。
+   *
+   * 传这个字段只是"调用方已经知道确切数字"时的快捷方式。
+   */
+  analystUniverseSize?: number;
   positionContext: string;
   limits?: { maxCalls: number; maxDebateRounds: number };
   onStep?: (step: { role: string; phase: string; note: string }) => void;
@@ -215,8 +302,86 @@ export async function runTradingDesk(input: {
     input.onStep?.({ role, phase, note: text });
   };
 
-  /* ── ① 并行分析：四个分析师各看一个侧面（独立任务 → 可以并行）────────── */
-  note('supervisor', 'dispatch', '派出 4 个分析师并行调研');
+  /*
+   * ── ① **先问总管派谁**（2026-10-13 接线）────────────────────────────────
+   *
+   * ## 之前是什么样（用户需求 ① 的核心缺口）
+   *
+   * `firm.ts` 里总管的定义一直写着：
+   * ```
+   *   id: 'supervisor' · label: '总管' · tier: 'T3_deep' · status: 'staffed'
+   *   duty: '统筹全局：派出调研员、指派分析师、决定要不要开会辩论'
+   * ```
+   * **而它从未发起过任何模型调用** —— 只有一句
+   * `note('supervisor', 'dispatch', '派出 4 个分析师并行调研')` 日志标签。
+   * 派谁干活由下面一行 `.slice(0, ...)` 写死。
+   *
+   * 也就是说：**`status: 'staffed'`（在岗）是虚的，
+   * 而用户要的"最高智能AI担任最高统筹"从来没发生过。**
+   *
+   * ## 现在的分工
+   *
+   * · **代码守住硬边界**（预算 / 没新闻不派依赖新闻的角色 / 至少要有人干活）；
+   * · **总管在边界内决定派哪些**（见 `dispatch.ts`）。
+   *
+   * ⚠️ 调用失败或解析失败时**退回全派** —— 与改动前行为一致（保守降级）。
+   */
+  const analystCandidates: AnalystCandidate[] = ANALYSIS_ROLE_DEFS.map((r) => ({
+    role: r.role,
+    /* 只有这两个角色的任务是"整理新闻" —— 没有新闻时它们只能编。 */
+    needsNews: r.role === 'newscaster' || r.role === 'sentiment',
+  }));
+  let requestedRoles: string[] | null = null;
+  /*
+   * ⚠️ **候选数由材料自己数出来**（不依赖调用方传）——
+   * 见 `analystUniverseSize` 的说明：我第一版只留字段而没人传值，
+   * 于是总管永远看到 0，从而少派分析师。
+   *
+   * 数 `### N. SYMBOL` 标题 —— 那是 `prompt.ts` 渲染候选的固定形状。
+   */
+  const universeSize = input.analystUniverseSize
+    ?? (input.marketContext.match(/^### \d+\. /gm) ?? []).length;
+  if (canAsk()) {
+    callsUsed += 1;
+    try {
+      const q = buildSupervisorPrompt({
+        candidates: analystCandidates,
+        hasNews: input.newsContext.trim().length > 0,
+        positionCount: 0,
+        symbolCount: universeSize,
+      });
+      /*
+       * 总管的产出**不进 `analyses`** —— 它不是分析师，它的输出是"派谁"。
+       * 用 `ask` 走同一条路由（于是档位、超时、降级都一致）。
+       */
+      const out = await safeAsk(input.ask, {
+        role: 'supervisor',
+        tier: 'T3_deep',
+        context: q.user,
+        task: q.system,
+      });
+      if (out.ok) {
+        requestedRoles = parseDispatch(out.raw, analystCandidates.map((c) => c.role));
+      }
+    } catch {
+      /* 拿不到决定 → `requestedRoles` 保持 null → 退回全派。 */
+    }
+  }
+  const plan = planDispatch({
+    candidates: analystCandidates,
+    budget: Math.max(0, limits.maxCalls - callsUsed - 3 /* 给 Bull/Bear/Judge 留 3 次 */),
+    hasNews: input.newsContext.trim().length > 0,
+    requested: requestedRoles,
+  });
+  for (const s of plan.skipped) note('supervisor', 'dispatch', `不派 ${s.role}：${s.reason}`);
+  note(
+    'supervisor',
+    'dispatch',
+    plan.decidedBy === 'supervisor'
+      ? `总管决定派 ${plan.roles.length} 个分析师：${plan.roles.join('、')}`
+      : `派出 ${plan.roles.length} 个分析师并行调研（${plan.decidedBy === 'budget' ? '受预算限制' : '退回全派'}）`,
+  );
+
   /*
    * ── **给拿大材料的两个角色一份【紧凑材料】**（2026-10-12 接线）──────────
    *
@@ -304,38 +469,16 @@ export async function runTradingDesk(input: {
     return [compacted.shared, ...useSlices.map((s) => s.text)].join('\n\n');
   })();
 
-  const analysisRoles: Array<{ role: string; tier: ModelTier; context: string; task: string }> = [
-    {
-      role: 'market_analyst',
-      tier: 'T2_mid',
-      context: analystContext,
-      task: '分析当前市场的整体状态与值得关注的结构。',
-    },
-    {
-      role: 'technical',
-      tier: 'T1_fast',
-      context: analystContext,
-      task: '只做指标与形态的客观描述，不要给交易建议。',
-    },
-    {
-      role: 'newscaster',
-      tier: 'T1_fast',
-      context: input.newsContext,
-      task: '把新闻整理成结构化事件卡（实体、方向、强度、来源）。没有可用的新闻就明说。',
-    },
-    {
-      role: 'sentiment',
-      tier: 'T1_fast',
-      context: input.newsContext,
-      task: '给出市场情绪分与样本量。没有数据就明说"样本不足"，不要编。',
-    },
-  ];
+  const analysisRoles: Array<{ role: string; tier: ModelTier; context: string; task: string }> =
+    ANALYSIS_ROLE_DEFS.map((r) => ({
+      ...r,
+      /* 行情材料的两个角色用【压缩后】的材料（见 `analystContext` 的说明）；
+         新闻材料的两个角色用原样（`newsContext` 本来就是小的）。 */
+      context: r.contextKind === 'market' ? analystContext : input.newsContext,
+    }));
 
-  /*
-   * ⚠️ **并行但有上限**：先按剩余预算截断要派的角色数，
-   * 而不是"全派出去、跑完了再发现超预算"。后者会让预算形同虚设。
-   */
-  const affordable = analysisRoles.slice(0, Math.max(0, limits.maxCalls - 3 /* 给 Bull/Bear/Judge 留 3 次 */));
+  /* 总管已经决定了派谁（见上面的 `plan`）—— 这里只做"按计划过滤"。 */
+  const affordable = analysisRoles.filter((r) => plan.roles.includes(r.role));
   if (affordable.length < analysisRoles.length) truncatedByBudget = true;
 
   callsUsed += affordable.length;

@@ -89,24 +89,68 @@ test('★★ 团队模式一次 complete() 背后跑完整个交易台，并产�
   assert.ok(result.text.includes('<team>'), '★ 要有团队审计块');
 });
 
-test('★ 八个角色真的都被调用了（不是只问了裁决）', async () => {
+test('★ 角色真的都被调用了（不是只问了裁决）', async () => {
   const { call, seen } = roleAwareCall();
   const model = createTeamDecisionModel({ router: new ModelRouter({ call }), baseMaxTokens: 4096 });
-  await model.complete(SYS, USER, {});
+  const result = await model.complete(SYS, USER, {});
+  void result;
 
   /*
-   * **8 = 4 分析师 + bull + bear + judge + 风控官**
+   * ## ⚠️ 2026-10-13 语义变化：**没有新闻材料时总管会挡下两个角色**
    *
-   * 风控官是用户需求 #3（"风控由一个智能体来负责"）的落地 ——
-   * 它在裁决之后、渲染之前被问一次。
+   * 接上真总管之前，这里恒为 8（4 分析师 + bull + bear + judge + 风控官）。
+   * 现在总管会先看"有没有新闻材料"，而**本测试的 `USER` 里没有新闻** ——
+   * 于是它挡下了那两个**任务就是"整理新闻"**的角色：
+   * ```
+   *   不派 newscaster：本轮没有新闻材料（派它只会让它编造）
+   *   不派 sentiment：本轮没有新闻材料（派它只会让它编造）
+   * ```
+   * **那是设计意图，不是缺陷**：没有材料时它们只能编，
+   * 而它们会"正常完成" —— **那是看不见的失败**。
+   *
+   * ## 7 = 1 总管 + 2 行情分析师（market_analyst / technical）+ bull + bear + judge + 风控官
+   *
+   * ⚠️ 这条测试的意图是"**不是只问了裁决**" —— 那个意图没变，
+   * 变的是"没有新闻时该派几个"。要验"四个分析师都在"，
+   * 得另外给新闻材料（见下面那条专门验它的测试）。
    */
-  assert.equal(seen.length, 8, `应当有 8 次角色调用（7 角色 + 风控官），实际 ${seen.length}`);
+  assert.equal(seen.length, 7, `应当有 7 次角色调用（无新闻材料时的正确数量），实际 ${seen.length}`);
 
-  /* 关键角色都要在（含风控官） */
-  for (const role of ['market_analyst', 'technical', 'newscaster', 'sentiment', 'bull', 'bear', 'judge', 'risk_officer']) {
+  /* 关键角色都要在（含风控官与总管）。 */
+  for (const role of ['supervisor', 'market_analyst', 'technical', 'bull', 'bear', 'judge', 'risk_officer']) {
     assert.ok(
       seen.some((s) => s.includes(`「${role}」`)),
       `★ 角色 ${role} 没有被调用`,
+    );
+  }
+});
+
+test('★★★ 给了新闻材料 → 四个分析师都会被派（总管不会挡下新闻类角色）', async () => {
+  /*
+   * ⚠️ 这是上一条的**对照**：证明"少派两个"的原因是**材料缺失**，
+   * 而不是"总管随机决定"或"代码写死了只派两个"。
+   *
+   * 若这条也失败（给了新闻却没派满 4 个），那说明总管在**无理由地砍人** ——
+   * 而那是"最高智能AI统筹"变成"随机减配"的信号。
+   */
+  const { call, seen } = roleAwareCall();
+  const model = createTeamDecisionModel({ router: new ModelRouter({ call }), baseMaxTokens: 4096 });
+  await model.complete(SYS, USER, {});
+  void call;
+  /*
+   * `research` 是新闻材料的来源 —— 给它一个非空的调研结果。
+   */
+  const { call: call2, seen: seen2 } = roleAwareCall();
+  const model2 = createTeamDecisionModel({
+    router: new ModelRouter({ call: call2 }),
+    baseMaxTokens: 4096,
+    research: async () => ({ text: '新闻：ETF 连续 9 日流出。', keys: [] }),
+  });
+  await model2.complete(SYS, USER, {});
+  for (const role of ['market_analyst', 'technical', 'newscaster', 'sentiment']) {
+    assert.ok(
+      seen2.some((s) => s.includes(`「${role}」`)),
+      `★ 给了新闻材料时，${role} 应当被派（实际调用：${seen2.join(', ')}）`,
     );
   }
 });
@@ -230,7 +274,17 @@ test('★ 不传 research 时行为与之前一致（既有部署不受影响）
   const model = createTeamDecisionModel({ router: new ModelRouter({ call }), baseMaxTokens: 4096 });
   const result = await model.complete(SYS, USER, {});
   assert.ok(result.text.includes('<decision>'));
-  assert.equal(seen.length, 8, '角色数不变（8 = 7 角色 + 风控官）');
+  /*
+   * ⚠️ 9 = **1 总管** + 4 分析师 + bull + bear + judge + 风控官。
+   *
+   * 这条测试的意图仍然是"**不传 research 时行为与之前一致**" ——
+   * 而"之前"指的是"没接总管的时候"。接上总管后多了 1 次调用，
+   * 而 `newscaster` / `sentiment` 因为**没有新闻材料**被总管挡下
+   *（那是设计意图，见上面那条测试的说明）。
+   *
+   * 所以总数 = 9 − 2（被挡下的新闻类分析师）= **7**。
+   */
+  assert.equal(seen.length, 7, '角色数：1 总管 + 2 行情分析师 + bull/bear/judge + 风控官');
 });
 /* -------------------------------------------------------------------------- */
 /*  材料接线：行情数据必须真的进到角色手里（2026-10-12 实测修正）                 */

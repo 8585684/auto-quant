@@ -119,22 +119,25 @@ test('★ 预算不足时【提前收尾并如实标记】，而不是假装跑�
    * 那种情况是**配置错误**，不该被"优雅降级"掩盖。
    */
   /*
-   * 用**自洽**的配置（够满编：4 + 1×2 + 1 = 7），但把辩论轮数设成 0 ——
-   * 于是没有 Bull/Bear，预算只花在分析员与裁决上。
+   * 用**自洽**的配置（够满编：1 总管 + 4 + 0×2 + 1 = 6，取 8 留余量），
+   * 但把辩论轮数设成 0 —— 于是没有 Bull/Bear，预算只花在总管、分析员与裁决上。
    * `truncatedByBudget` 不该被置位（预算够）。
    *
    * ⚠️ 不自洽的配置（如 `maxCalls: 6`）会被 `assertBudgetConsistent` **直接拦下** ——
    * 那是配置错误，不该被"优雅降级"掩盖（见那条独立测试）。
+   *
+   * ⚠️ 2026-10-13：接上真总管后**必须 +1** —— 原来的 7 是
+   * "4 分析师 + 1 裁决"，现在还要加上总管那一次。
    */
   const log: string[] = [];
   const out = await runTradingDesk({
     ask: okAsk(log),
     ...CTX,
-    limits: { maxCalls: 7, maxDebateRounds: 0 },
+    limits: { maxCalls: 8, maxDebateRounds: 0 },
   });
 
   assert.equal(out.truncatedByBudget, false, '自洽预算下不该被截断');
-  assert.ok(out.callsUsed <= 7, '不得超出给定的上限');
+  assert.ok(out.callsUsed <= 8, '不得超出给定的上限');
   assert.equal(out.verdict?.ok, true, '★ 即使没有辩论，裁决仍必须跑 —— 否则这一轮没有结论');
 });
 
@@ -193,13 +196,25 @@ test('★★ 预算必须自洽：maxCalls 容不下"分析+辩论+裁决"时必
    *
    * 那个症状在界面上表现为"这一轮没有决策"，极难定位到"是算术错了"。
    * 所以让它**在启动那一刻就炸**，而不是跑了几十轮之后才被发现。
+   *
+   * ⚠️ 2026-10-13 接上真总管之后，**同一个错误又差点重演**：
+   * 不变量现在是 `1 总管 + 分析员 + 2×辩论 + 1 裁决`，
+   * 于是 8 次已经不够（需要 9）—— 两个既有测试当场抓住了它。
    */
   assert.throws(
     () => assertBudgetConsistent({ maxCalls: 8, maxDebateRounds: 2 }),
     /预算不自洽/,
-    '★ 8 次调用容不下 4 分析师 + 2 轮辩论 + 1 裁决（需要 9 次）',
+    '★ 8 次容不下 1 总管 + 4 分析师 + 2 轮辩论 + 1 裁决（需要 10 次）',
   );
-  assert.doesNotThrow(() => assertBudgetConsistent({ maxCalls: 9, maxDebateRounds: 2 }));
+  /*
+   * ⚠️ 用**真实配置**（`maxDebateRounds: 1`）验通过路径 ——
+   * 否则会把"1 轮辩论"与"2 轮辩论"的算术混在一起
+   *（我第一版就混了：断言 9 次配 2 轮辩论不抛错，而它其实需要 10）。
+   */
+  assert.doesNotThrow(
+    () => assertBudgetConsistent({ maxCalls: 9, maxDebateRounds: 1 }),
+    '★ 1 总管 + 4 分析师 + 1×2 辩论 + 1 裁决 = 8，9 次够',
+  );
   assert.doesNotThrow(() => assertBudgetConsistent(DESK_LIMITS), '默认配置必须自洽');
 });
 
@@ -326,6 +341,9 @@ test('★ 分析师顺序必须与角色表一致（闸门不能打乱顺序）'
   /*
    * `mapConcurrent` 保证"结果与输入同序" —— 这一条是它的回归保护。
    * 若顺序错了，`analyses[i]` 会把 A 角色的产出记到 B 角色名下。
+   *
+   * ⚠️ 2026-10-13：**总管也走同一个 `ask`**（它先被问一次），
+   * 所以要把 `supervisor` 从"发出顺序"里排除掉再比 —— 它不是分析师。
    */
   const order: string[] = [];
   const ask: AskRole = async ({ role }) => {
@@ -335,9 +353,10 @@ test('★ 分析师顺序必须与角色表一致（闸门不能打乱顺序）'
     return { role, modelId: `stub/${role}`, data: null, raw: '[]', latencyMs: 1, ok: true };
   };
   const out = await runTradingDesk({ ask, ...CTX });
+  const analystOrder = order.filter((r) => r !== 'supervisor');
   assert.equal(
     out.analyses.map((a) => a.role).join(','),
-    order.slice(0, out.analyses.length).join(','),
+    analystOrder.slice(0, out.analyses.length).join(','),
     '★ 产出的顺序必须与角色表一致',
   );
 });
