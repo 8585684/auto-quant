@@ -7,6 +7,106 @@
     color-scheme: dark;
   }
 
+  /*
+   * ========================================================================
+   *  调色板 —— 由 CSS 变量驱动，默认值 = 原版外观
+   * ========================================================================
+   *
+   * ## 为什么颜色要改成变量
+   *
+   * 这套界面要支持**多套模板**（见 `src/templates/`）：每套模板是一种完全
+   * 不同的外壳与配色，但它们共用同一批页面组件（`.panel` / `.btn` / `.th` …）。
+   *
+   * 如果颜色写死在 `tailwind.config.js` 的十六进制里，每套模板就得复制一份
+   * 配置并重新编译 —— 那是"多套皮肤"，不是"多套模板"，而且每加一套就要多
+   * 编译一次 CSS。
+   *
+   * 改成变量之后，模板只做一件事：**覆盖这些变量**。页面代码一个字都不用改。
+   *
+   * ## ⚠️ 每个令牌存两份（十六进制 + R G B 三元组），两份必须同步改
+   *
+   * Tailwind 编译透明度修饰符的方式是把它塞进 `rgb(... / <alpha>)`：
+   *
+   *     bg-accent/10   →   rgb(var(--aq-accent-rgb) / 0.1)
+   *
+   * 如果只有十六进制那一份，编译结果就是 `rgb(#7060f5 / 0.1)` ——
+   * **不是合法 CSS，浏览器整条声明丢弃**。这件事危险在于它是**静默**的：
+   * 类名生成了、构建过了、控制台干净，只是那一层底色/边框根本不存在。
+   * 仓库里 `down/10`、`warn/50`、`accent/10` 这类写法有一百多处（徽章底、
+   * 提示条底、选中行底、焦点环），全部会一起失效 —— 界面不会"坏"，只会变得
+   * 寡淡，而没有人会去查一个"看起来还行"的界面。
+   *
+   * 更隐蔽的是它**在 `@apply` 里会直接报错**（"The `border-base-850/70`
+   * class does not exist"）—— 报错只出现在那几行，很容易被当成个别问题修掉，
+   * 而剩下几十处继续静默失效。这条真的发生过。
+   *
+   * ## 这份默认值就是**原版外观**
+   *
+   * 一节都不要改：改这里等于改默认模板。新模板覆盖变量，见 `templates/`。
+   */
+  :root {
+    /* 层级（elevation）。数字越小越靠前。 */
+    --aq-base-950: #0a0a0a;
+    --aq-base-950-rgb: 10 10 10;
+    --aq-base-900: #121212;
+    --aq-base-900-rgb: 18 18 18;
+    --aq-base-850: #1a1a1a;
+    --aq-base-850-rgb: 26 26 26;
+    --aq-base-800: #212121;
+    --aq-base-800-rgb: 33 33 33;
+    --aq-base-750: #282828;
+    --aq-base-750-rgb: 40 40 40;
+    --aq-base-700: #2f2f2f;
+    --aq-base-700-rgb: 47 47 47;
+    --aq-base-600: #3d3d3d;
+    --aq-base-600-rgb: 61 61 61;
+
+    /* 文字四级。 */
+    --aq-ink-strong: #ffffff;
+    --aq-ink-strong-rgb: 255 255 255;
+    --aq-ink: #eae9f4;
+    --aq-ink-rgb: 234 233 244;
+    --aq-ink-mid: #b0aec0;
+    --aq-ink-mid-rgb: 176 174 192;
+    --aq-ink-lo: #7d7a8c;
+    --aq-ink-lo-rgb: 125 122 140;
+    --aq-ink-faint: #57545f;
+    --aq-ink-faint-rgb: 87 84 95;
+    /*
+     * `ink-soft` —— **迁移期兼容别名，等于 `ink-mid`**。
+     *
+     * 上游的多智能体分支（`feat/multi-agent-firm`）里有 13 处写着
+     * `text-ink-soft`，而**这个类从来没有被定义过**：Tailwind 对不存在的类
+     * 不报错，只是不生成样式 —— 那些文字于是继承了正文色（最亮的一级），
+     * 次要信息看起来和主要信息一样重。
+     *
+     * 上游自己的注释里写着「四级就是 hi/mid/lo/faint，不要写 ink-soft」，
+     * 所以这里**不新造第五级**，而是把它指向 `ink-mid`（那 13 处想表达的
+     * 就是"次要信息"）。等上游把那批调用点改掉之后，这个别名可以删掉 ——
+     * 与 `fontSize['2xs']` 是同一个做法（见 `tailwind.config.js`）。
+     */
+    --aq-ink-soft: #b0aec0;
+    --aq-ink-soft-rgb: 176 174 192;
+
+    /* 交易语义色。 */
+    --aq-up: #0ecb81;
+    --aq-up-rgb: 14 203 129;
+    --aq-down: #f6465d;
+    --aq-down-rgb: 246 70 93;
+    --aq-warn: #f59e0b;
+    --aq-warn-rgb: 245 158 11;
+
+    /* 强调色。 */
+    --aq-accent: #7060f5;
+    --aq-accent-rgb: 112 96 245;
+    --aq-accent-hi: #8172ff;
+    --aq-accent-hi-rgb: 129 114 255;
+
+    --aq-overlay: 6 6 6;
+    --aq-overlay-alpha: 0.72;
+  }
+
+
   html,
   body,
   #root {
@@ -31,7 +131,15 @@
    */
   * {
     scrollbar-width: thin;
-    scrollbar-color: #2c3546 transparent;
+    /*
+     * 滚动条颜色走变量。
+     *
+     * ⚠️ 这里原来写死 `#2c3546`。令牌改成变量之后，写死的那一份**不会**
+     * 跟着模板变 —— 表现是"换了模板，但滚动条还是旧的深蓝灰"，在一整套
+     * 中性色里格外明显，而且没有报错。同一个理由适用于本文件里其它
+     * 写死的颜色：能走变量的都走变量。
+     */
+    scrollbar-color: var(--aq-base-600) transparent;
   }
 
   ::-webkit-scrollbar {
@@ -42,13 +150,13 @@
     background: transparent;
   }
   ::-webkit-scrollbar-thumb {
-    background: #2c3546;
+    background: var(--aq-base-600);
     border: 3px solid transparent;
     background-clip: content-box;
     border-radius: 8px;
   }
   ::-webkit-scrollbar-thumb:hover {
-    background: #3a4558;
+    background: var(--aq-ink-lo);
     background-clip: content-box;
   }
   ::-webkit-scrollbar-corner {
@@ -73,7 +181,12 @@
   }
 
   ::selection {
-    background: rgba(91, 141, 239, 0.35);
+    /*
+     * `color-mix` 而不是 `rgba(...)`：选中态的底色应当是**当前模板的主色**
+     * 的三成，而不是某个写死的蓝。写死的话，换模板后选中文字的背景和主色
+     * 对不上。
+     */
+    background: color-mix(in srgb, var(--aq-accent) 32%, transparent);
   }
 
   /*
@@ -84,7 +197,13 @@
    * 这里统一给所有可聚焦元素一个清晰的焦点环。
    */
   :focus-visible {
-    outline: 2px solid theme('colors.accent');
+    /*
+     * 用 `var(--aq-accent)` 而不是 `theme('colors.accent')` ——
+     * 后者现在是 `rgb(var(--aq-accent-rgb) / <alpha-value>)`，
+     * 那个 `<alpha-value>` 占位符在 `theme()` 里不会被替换，产出的
+     * 是一条非法声明（焦点环**静默消失**，键盘用户看不出焦点在哪）。
+     */
+    outline: 2px solid var(--aq-accent);
     outline-offset: 2px;
     border-radius: 4px;
   }
@@ -114,6 +233,28 @@
   .page-pad {
     @apply p-4 sm:p-6 lg:p-8 2xl:p-10;
   }
+
+  /*
+   * 内容区的**高度链**。
+   *
+   * `xl:h-full` 是刻意的：只有宽屏（两栏布局生效的那一档）才把高度传下去。
+   * 窄屏上内容区是 `overflow-y-auto` 的滚动容器，页面按内容自然生长 ——
+   * 这时给它 `h-full` 反而会把长页面截断。
+   *
+   * 这条规则存在的原因：`/traders` 那张表要"撑满剩余高度、自己内部滚动"，
+   * 而它需要父级有一个**确定的高度**。父级若是 `auto`，`flex-1` 与 `h-full`
+   * 都会退化成按内容算 —— 表格于是把页面顶长，用户白滚一屏。
+   */
+  .page-fill {
+    @apply flex min-h-0 flex-col;
+  }
+
+  @media (min-width: 80em) {
+    .page-fill {
+      height: 100%;
+    }
+  }
+
   .panel {
     @apply rounded-lg border border-base-700 bg-base-900 shadow-panel;
   }

@@ -24,21 +24,49 @@ import {
   type UTCTimestamp,
 } from 'lightweight-charts';
 import type { Kline } from '@aq/shared';
-import { CHART_INK } from './equityCurve';
+import { useChartInk } from './useChartInk';
 
 export function CandlestickChart({
   candles,
   height = 460,
   loading = false,
+  fill = false,
 }: {
   candles: Kline[];
+  /**
+   * 固定高度（像素）。`fill` 为真时**忽略**它 —— 高度改由容器决定。
+   */
   height?: number;
   /** Render the "no data yet" copy only once the first fetch has settled. */
   loading?: boolean;
+  /**
+   * 撑满父容器的高度，而不是用固定像素。
+   *
+   * ## 为什么需要它
+   *
+   * 行情页要"不滚动就能看完"：图表得吃掉交易对表之外剩下的高度。写死 460px
+   * 时，窗口高一点就留一大片空、矮一点就把「最新K线」挤到屏幕外 —— 两种都
+   * 要用户滚动。用户的原话是「自动适配页面长度，不要超出页面」。
+   *
+   * 高度跟随容器需要两件事，缺一不可：
+   *
+   *   1. 外层 `h-full`（而不是 `style={{height}}`）—— 否则容器只有 0 高；
+   *   2. `ResizeObserver` **同时**上报高度（原来只报宽度）—— lightweight-charts
+   *      的 canvas 尺寸由它自己的 options 决定，CSS 变高不会自动跟上。
+   *
+   * 父级必须给出确定高度（`flex-1` + `min-h-0`），否则 `h-full` 解析成 `auto`，
+   * 图表会塌成 0 —— 与 `PageShell` 那条 `min-h-0` 是同一个道理。
+   */
+  fill?: boolean;
 }) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const chartRef = useRef<IChartApi | null>(null);
   const seriesRef = useRef<ISeriesApi<'Candlestick'> | null>(null);
+  /*
+   * 当前外观下的配色。**换模板或切深浅时它会变**，而下面两个 effect 都依赖
+   * 它 —— 所以图表会跟着重画，不会停在上一套主题的绿上（见 `useChartInk`）。
+   */
+  const ink = useChartInk();
 
   useEffect(() => {
     const container = containerRef.current;
@@ -50,31 +78,30 @@ export function CandlestickChart({
       layout: {
         background: { type: ColorType.Solid, color: 'transparent' },
         /*
-         * `ink-mid` (#a9b4c7) spelled out: lightweight-charts paints inside its
-         * own canvas-like layer and takes colours as strings only — the same
-         * exception as `CHART_INK` in `equityCurve.ts`, which is where every
-         * other raw colour here comes from.
+         * lightweight-charts 在自己的 canvas 层里画，颜色只能是字符串 ——
+         * 与 `equityCurve.ts` 里的 `CHART_INK` 是同一个例外，这里也统一
+         * 走 `ink`（它按当前模板与深浅实时取色）。
          *
-         * `ink-mid`, not `ink-lo`: these are prices sitting on a dark grid, and
-         * the dimmer token is unreadable at 11px on a laptop screen at 50%
-         * brightness — which is how a trading desk is usually lit.
+         * 用 `inkMid` 而不是 `axis`：这些是压在网格上的**价格数字**，
+         * 用刻度线那一档的灰在 11px 上读不清 —— 而交易台的屏幕亮度通常
+         * 只开到一半。
          */
-        textColor: '#a9b4c7',
+        textColor: ink.inkMid,
         fontFamily: 'JetBrains Mono, ui-monospace, Menlo, Consolas, monospace',
         fontSize: 11,
       },
       grid: {
         // `base-750`: one step off the panel, so the grid organises without
         // competing with the candles for attention.
-        vertLines: { color: CHART_INK.grid },
-        horzLines: { color: CHART_INK.grid },
+        vertLines: { color: ink.grid },
+        horzLines: { color: ink.grid },
       },
       rightPriceScale: {
-        borderColor: CHART_INK.grid,
+        borderColor: ink.grid,
         scaleMargins: { top: 0.08, bottom: 0.08 },
       },
       timeScale: {
-        borderColor: CHART_INK.grid,
+        borderColor: ink.grid,
         timeVisible: true,
         secondsVisible: false,
         rightOffset: 4,
@@ -84,8 +111,8 @@ export function CandlestickChart({
       },
       crosshair: {
         mode: CrosshairMode.Normal,
-        vertLine: { color: CHART_INK.rule, labelBackgroundColor: CHART_INK.track, width: 1 },
-        horzLine: { color: CHART_INK.rule, labelBackgroundColor: CHART_INK.track, width: 1 },
+        vertLine: { color: ink.rule, labelBackgroundColor: ink.track, width: 1 },
+        horzLine: { color: ink.rule, labelBackgroundColor: ink.track, width: 1 },
       },
       handleScale: { axisPressedMouseMove: { time: true, price: false } },
       localization: {
@@ -98,13 +125,13 @@ export function CandlestickChart({
     });
 
     const series = chart.addCandlestickSeries({
-      upColor: CHART_INK.up,
-      downColor: CHART_INK.down,
-      borderUpColor: CHART_INK.up,
-      borderDownColor: CHART_INK.down,
-      wickUpColor: CHART_INK.up,
-      wickDownColor: CHART_INK.down,
-      priceLineColor: CHART_INK.accent,
+      upColor: ink.up,
+      downColor: ink.down,
+      borderUpColor: ink.up,
+      borderDownColor: ink.down,
+      wickUpColor: ink.up,
+      wickDownColor: ink.down,
+      priceLineColor: ink.accent,
       priceLineStyle: LineStyle.Dashed,
     });
 
@@ -113,7 +140,14 @@ export function CandlestickChart({
 
     const observer = new ResizeObserver(() => {
       if (!containerRef.current) return;
-      chart.applyOptions({ width: containerRef.current.clientWidth });
+      /*
+       * 高度也要跟着报 —— 只报宽度时，`fill` 模式下的 canvas 会停在初始高度，
+       * 容器变高了图表还是一小条（见 `fill` 的说明）。
+       */
+      chart.applyOptions({
+        width: containerRef.current.clientWidth,
+        ...(fill ? { height: containerRef.current.clientHeight } : {}),
+      });
     });
     observer.observe(container);
 
@@ -123,7 +157,51 @@ export function CandlestickChart({
       chartRef.current = null;
       seriesRef.current = null;
     };
+    /*
+     * ⚠️ **依赖里没有 `ink`**，这是刻意的。
+     *
+     * 把 `ink` 放进来会让"换模板"变成"重建图表" —— 而重建会**丢掉用户
+     * 当前的缩放与平移位置**（本文件顶部那段注释正是说这件事：重建是
+     * 实时终端里最不该发生的行为）。
+     *
+     * 外观变化的处理放在下面那个 `applyOptions` 的 effect 里：换配色不需要
+     * 换图表，只需要把新的颜色**应用**上去。
+     */
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [height]);
+
+  /*
+   * 外观（模板 / 深浅）变化时，把新配色**应用**到已有的图表与序列上。
+   *
+   * 用 `applyOptions` 而不是重建：用户在这里可能已经缩放到某个区间，
+   * 重建会把他拨回去（见上面那段注释）。`applyOptions` 只换颜色，
+   * 视口与数据一个都不动。
+   */
+  useEffect(() => {
+    const chart = chartRef.current;
+    const series = seriesRef.current;
+    if (!chart || !series) return;
+
+    chart.applyOptions({
+      layout: { textColor: ink.inkMid },
+      grid: { vertLines: { color: ink.grid }, horzLines: { color: ink.grid } },
+      rightPriceScale: { borderColor: ink.grid },
+      timeScale: { borderColor: ink.grid },
+      crosshair: {
+        vertLine: { color: ink.rule, labelBackgroundColor: ink.track },
+        horzLine: { color: ink.rule, labelBackgroundColor: ink.track },
+      },
+    });
+    series.applyOptions({
+      upColor: ink.up,
+      downColor: ink.down,
+      borderUpColor: ink.up,
+      borderDownColor: ink.down,
+      wickUpColor: ink.up,
+      wickDownColor: ink.down,
+      priceLineColor: ink.accent,
+    });
+  }, [ink]);
 
   useEffect(() => {
     const series = seriesRef.current;
@@ -146,7 +224,12 @@ export function CandlestickChart({
   }, [candles]);
 
   return (
-    <div className="relative w-full" style={{ height }}>
+    /*
+     * `fill` 走 `h-full`（父级已经给了确定高度），否则用固定像素。
+     * 不做兜底：父级没给高度时图表塌成 0 是**立刻看得见的**错误，
+     * 比"看着正常但画在屏幕外"好排查。
+     */
+    <div className={fill ? 'relative h-full w-full' : 'relative w-full'} style={fill ? undefined : { height }}>
       <div ref={containerRef} className="h-full w-full" />
       {/*
        * Four states, not two: "still fetching" and "this symbol has no history

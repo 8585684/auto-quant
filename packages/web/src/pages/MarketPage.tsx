@@ -16,6 +16,7 @@ import { useEvents } from '../lib/store';
 import { useDocumentTitle, usePolled } from '../lib/hooks';
 import { Badge, Button, Empty, ErrorNote, Panel, Spinner3, TextInput, cn } from '../components/ui';
 import { CandlestickChart } from '../components/CandlestickChart';
+import { PageActions } from '../templates/lib/PageActions';
 import { fmtCompactAmount, fmtPercent, fmtPriceUsd, pnlColor } from '../lib/format';
 
 const INTERVALS = ['1m', '5m', '15m', '1h', '4h', '1d'] as const;
@@ -129,7 +130,11 @@ export function MarketPage() {
   const hiddenRows = matched.length - filtered.length;
 
   return (
-    <div className="space-y-3">
+    /*
+     * `page-fill`：整页撑满外壳给的确定高度，图表与交易对表各自内部滚动。
+     * 见 `index.css` 里 `.page-fill` 的说明 —— 宽屏下才有 `height:100%`。
+     */
+    <div className="page-fill gap-3">
       {/* ------------------------------------------------------------------ */}
       {/*  顶栏：当前交易对的报价 + 周期切换                                   */}
       {/* ------------------------------------------------------------------ */}
@@ -159,18 +164,41 @@ export function MarketPage() {
         </div>
       </div>
 
-      <div className="grid grid-cols-1 gap-3 md:grid-cols-[minmax(0,300px)_minmax(0,1fr)]">
+      {/*
+        ⚠️ **左栏在 xl 下是 440px，不是 300px。**
+
+        这一列装的是一张 4 列表（交易对 / 价格 / 24h 涨跌 / 24h 成交额）。实测
+        （1440px 视口、控制台模板）它的最小宽度是 **413px**，其中「交易对」一列
+        就被币安那种 `1000BONKUSDT` 这种名字撑到 128px。300px 的容器装不下它：
+        表格撑破容器、右两列滚出可视区，而深色底上那条横向滚动条几乎看不见 ——
+        看起来就是**数字被裁掉了**（用户报的就是这个）。
+
+        所以 xl（≥1280）给 440px：容器内宽 422px > 413px，四列全部露出来。
+        md–lg 之间**故意保持 300px** —— 那一档右列还是 `1fr` 的K线图，把 440px
+        让给左表会把图挤到 300px 上下；窄屏上让表格自己横滚（`scroll-x`）本来就是
+        这一栏的设计。单元格内边距同步收窄到 6px，见 `templates/console/theme.css`。
+      */}
+      {/*
+        `min-h-0` 让这一行能**被压到比内容矮**：它是 `page-fill` 的 flex 子项，
+        默认 `min-height:auto` 时会被两栏的内容顶高，整页照样溢出。
+      */}
+      <div className="grid min-h-0 grid-cols-1 gap-3 md:grid-cols-[minmax(0,300px)_minmax(0,1fr)] xl:grid-cols-[minmax(0,440px)_minmax(0,1fr)]">
         {/* ---------------------------------------------------------------- */}
         {/*  交易对清单                                                       */}
         {/* ---------------------------------------------------------------- */}
         <Panel
           title="交易对"
+          /*
+           * 左栏撑满这一行的高度，表格体内部滚动 —— 交易对最多 528 个，
+           * 让它把整页顶长就等于"看图表必须先滚过几百行币种"。
+           */
+          className="flex min-h-0 flex-col"
+          bodyClassName="flex min-h-0 flex-1 flex-col p-2"
           actions={
             <span className="num text-xs text-ink-faint">
               {filtered.length} / {matched.length}
             </span>
           }
-          bodyClassName="p-2"
           padded={false}
         >
           <div className="relative mb-2">
@@ -216,7 +244,13 @@ export function MarketPage() {
                * `scroll-x` 只包住表格本身：窄屏上让这 4 列自己横滚，
                * 而不是把整页顶出横向滚动条（Layout 的内容区会直接裁掉）。
                */}
-              <div className="scroll-x max-h-[min(60vh,560px)] overflow-y-auto">
+              <div className="scroll-x min-h-0 flex-1 overflow-y-auto">
+                {/*
+                  单元格上显式写 `px-1.5`（6px）：两套模板的基础内边距不一样
+                  （经典 `px-3` = 12px、控制台 `0 6px`），而这张表在 440px 的列里
+                  只有 16px 余量 —— 按模板走的话经典那边会多出 48px 又溢出。
+                  宽度是这里最硬的约束，所以密度写成页面级的事实，不交给模板。
+                */}
                 <table className="w-full min-w-[276px] border-collapse">
                   <thead className="sticky top-0 z-10 bg-base-900">
                     <tr>
@@ -225,7 +259,7 @@ export function MarketPage() {
                           key={key}
                           scope="col"
                           aria-sort={sortKey === key ? (sortDir === 'asc' ? 'ascending' : 'descending') : 'none'}
-                          className={cn('th', key !== 'symbol' && 'text-right')}
+                          className={cn('th px-1.5', key !== 'symbol' && 'text-right')}
                         >
                           <button
                             type="button"
@@ -273,15 +307,15 @@ export function MarketPage() {
                             isActive && 'bg-accent/10',
                           )}
                         >
-                          <td className="td font-semibold text-ink-hi">
+                          <td className="td px-1.5 font-semibold text-ink-hi">
                             {row.baseAsset}
                             <span className="text-ink-faint">USDT</span>
                           </td>
-                          <td className="td num text-right">{fmtPriceUsd(row.price)}</td>
-                          <td className={cn('td num text-right', pnlColor(row.changePercent24h))}>
+                          <td className="td px-1.5 num text-right">{fmtPriceUsd(row.price)}</td>
+                          <td className={cn('td px-1.5 num text-right', pnlColor(row.changePercent24h))}>
                             {fmtPercent(row.changePercent24h)}
                           </td>
-                          <td className="td num text-right text-ink-lo">
+                          <td className="td px-1.5 num text-right text-ink-lo">
                             {fmtCompactAmount(row.quoteVolume24h, 'USDT')}
                           </td>
                         </tr>
@@ -304,7 +338,7 @@ export function MarketPage() {
         {/* ---------------------------------------------------------------- */}
         {/*  图表 + 最新K线                                                   */}
         {/* ---------------------------------------------------------------- */}
-        <div className="min-w-0 space-y-2">
+        <div className="flex min-h-0 min-w-0 flex-col gap-2">
           <Panel
             title={
               <span className="flex flex-wrap items-center gap-2">
@@ -319,17 +353,31 @@ export function MarketPage() {
               </span>
             }
             actions={
+              /*
+               * 「刷新」是页面级动作 → 统一接口；「每 15s 自动刷新」是**说明文字**，
+               * 不属于动作，所以它留在原地（`Panel` 的 actions 槽里），只有按钮被
+               * portal 进工具栏。
+               */
               <span className="flex items-center gap-2">
                 <span className="num hidden text-xs text-ink-faint sm:inline">
                   {klinesQuery.loading ? '加载中…' : '每 15s 自动刷新'}
                 </span>
-                <Button size="sm" busy={klinesQuery.loading} onClick={() => klinesQuery.reload()}>
-                  <RefreshCw aria-hidden className="h-3.5 w-3.5" />
-                  刷新
-                </Button>
+                <PageActions
+                  start={
+                    <Button size="sm" busy={klinesQuery.loading} onClick={() => klinesQuery.reload()}>
+                      <RefreshCw aria-hidden className="h-3.5 w-3.5" />
+                      刷新
+                    </Button>
+                  }
+                />
               </span>
             }
-            bodyClassName="p-1"
+            /*
+             * 图表面板吃掉右栏剩下的高度，「最新K线」保持自然高度贴在下面。
+             * `min-h-0` 见 `CandlestickChart` 的 `fill` 说明。
+             */
+            className="flex min-h-0 flex-1 flex-col"
+            bodyClassName="flex min-h-0 flex-1 flex-col p-1"
             padded={false}
           >
             {klinesQuery.error ? (
@@ -347,7 +395,7 @@ export function MarketPage() {
                 hint="换一个周期试试，或确认该交易对在交易所可交易。"
               />
             ) : (
-              <CandlestickChart candles={candles} height={460} />
+              <CandlestickChart candles={candles} fill />
             )}
           </Panel>
 

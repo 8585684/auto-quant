@@ -40,6 +40,7 @@ import {
   cn,
 } from '../ui';
 import { SectionLabel } from '../shell';
+import { PageActions } from '../../templates/lib/PageActions';
 import { fmtDateTime, fmtInt, fmtLatency } from '../../lib/format';
 
 /* -------------------------------------------------------------------------- */
@@ -641,9 +642,14 @@ export function AiModelsSection() {
         title="已配置模型"
         count={fmtInt(models.length)}
         actions={
-          <Button variant="primary" size="sm" onClick={openCreate} disabled={providers.length === 0}>
-            + 添加模型
-          </Button>
+          /* 页面级动作 → 统一接口。禁用态跟着 providers 走，不在这里重复判断。 */
+          <PageActions
+            start={
+              <Button variant="primary" size="sm" onClick={openCreate} disabled={providers.length === 0}>
+                + 添加模型
+              </Button>
+            }
+          />
         }
       />
 
