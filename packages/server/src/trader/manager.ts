@@ -378,6 +378,180 @@ function agentWorkdir(traderId: number): string {
   const base = process.env.AQ_AGENT_WORKDIR ?? '/opt/autoquant/data/agent-workspace';
   return `${base}/trader-${traderId}`;
 }
+
+/**
+ * **后台调研的定时器**（每个机器人一个）—— 2026-10-13。
+ *
+ * ⚠️ 放在模块级（而不是类字段）：`research` 是一个闭包，
+ * 它拿不到 `TraderManager` 的 `this`。而"每个机器人最多一个刷新循环"
+ * 这个约束需要**跨调用共享状态**。
+ */
+const researchRefreshers = new Map<number, NodeJS.Timeout>();
+
+/**
+ * **保证这个机器人有一个后台调研循环**（幂等）。
+ *
+ * ## 为什么需要它（用户需求 ② 的实质）
+ *
+ * > 「系统**不再是像现在这样定时去工作**，而是**持续、并发**的工作」
+ *
+ * 而实测（`#2471`）整轮 **619 秒** —— 因为决策**同步等**调研跑完。
+ * 四个猎手并发也要约 400 秒，而 240 秒的猎手超时在并发下让四个**全部超时**。
+ *
+ * 解耦之后：调研在后台持续跑，决策读缓存**立即返回**。
+ *
+ * ⚠️ **幂等是必须的**：`research()` 每轮都调它，若每次都起一个定时器，
+ * 几分钟内就会堆出几十个 claude code 进程（实测单进程约 250MB）。
+ */
+function ensureResearchRefresher(
+  traderId: number,
+  symbols: readonly string[],
+  apiKey: string,
+): void {
+  if (researchRefreshers.has(traderId)) return;
+  /*
+   * 间隔默认 10 分钟。新闻不是秒级变化的，而**一次调研要 6–8 分钟**
+   *（四个猎手、两个一批）—— 间隔比它短只会让下一轮撞上还没跑完的那轮。
+   */
+  const raw = Number(process.env.AQ_RESEARCH_INTERVAL_MS ?? '');
+  const intervalMs = Number.isFinite(raw) && raw >= 60_000 ? raw : 10 * 60_000;
+
+  const runOnce = (): void => {
+    const cached = researchCache.get(traderId);
+    if (cached?.refreshing === true) return;
+    researchCache.set(traderId, {
+      text: cached?.text ?? '',
+      at: cached?.at ?? 0,
+      refreshing: true,
+    });
+    void refreshResearch(traderId, symbols, apiKey)
+      .catch(() => undefined)
+      .finally(() => {
+        const cur = researchCache.get(traderId);
+        if (cur !== undefined) cur.refreshing = false;
+      });
+  };
+
+  const timer = setInterval(runOnce, intervalMs);
+  /* 不因为这个定时器把进程吊在退出前。 */
+  timer.unref();
+  researchRefreshers.set(traderId, timer);
+  /* 立刻跑一次 —— 否则第一轮决策要等一个间隔才有材料。 */
+  runOnce();
+}
+
+/**
+ * **真正跑一次四猎手调研**，把结果写进 `researchCache`。
+ *
+ * ⚠️ 它**不抛错**（调用方已经 catch）—— 后台任务失败不该影响任何东西。
+ *
+ * ⚠️ 动态 `import()` 而不是顶部静态导入：`manager.ts` 与
+ * `agent/harness.js` 之间有循环依赖（harness 用到 manager 的日志类型），
+ * 而这段代码**只在后台首次刷新时才需要**。
+ */
+async function refreshResearch(
+  traderId: number,
+  symbols: readonly string[],
+  apiKey: string,
+): Promise<void> {
+  const { runAgentTask } = await import('./agent/harness.js');
+  const { HUNTERS, buildHunterTask, mergeHunterReports, summariseHunters } = await import('./intel/hunters.js');
+  const { mapConcurrent } = await import('./agent/pool.js');
+  const { parseIntelReport } = await import('./intel/parseIntel.js');
+  const { rankIntel } = await import('./intel/freshness.js');
+
+  const limit = Math.max(1, Number(process.env.AQ_HUNTER_CONCURRENCY ?? '') || 2);
+  /*
+   * ⚠️ 超时给到 **600 秒**（原来 240 秒）。
+   *
+   * 实测：单猎手约 197 秒，而**两个并发时每个都超过 240 秒** → 四个全部超时。
+   * 后台任务不再有"拖慢决策"的顾虑（决策不等它），所以**给足时间**是对的取舍。
+   */
+  const timeoutMs = Number(process.env.AQ_RESEARCH_TIMEOUT_MS ?? 600_000);
+
+  const results = await mapConcurrent(HUNTERS, limit, async (hunter) => {
+    /* ⚠️ 每个猎手一个独立 workdir/HOME —— 共用会让并发实例争用 ~/.claude。 */
+    const dir = `${agentWorkdir(traderId)}/hunter-${hunter.id}`;
+    try {
+      mkdirSync(dir, { recursive: true });
+    } catch {
+      /* 建不出来就用共用目录 —— 至少不要因此整个失败。 */
+    }
+    const r = await runAgentTask({
+      task: buildHunterTask(hunter, symbols),
+      allowedTools: 'WebSearch,WebFetch',
+      model: process.env.AQ_RESEARCH_GROUP ?? 'group/team-news',
+      fastModel: process.env.AQ_GRUNT_GROUP ?? 'group/team-grunt',
+      workdir: dir,
+      timeoutMs,
+      authToken: apiKey,
+    });
+    return {
+      hunterId: hunter.id,
+      label: hunter.label,
+      ok: r.ok,
+      text: r.text,
+      ...(r.error === undefined ? {} : { error: r.error }),
+      latencyMs: r.latencyMs,
+    };
+  });
+
+  const reports = results.map((res, i) => {
+    if (res.ok) return res.value;
+    const hunter = HUNTERS[i];
+    return {
+      hunterId: hunter?.id ?? `hunter_${i}`,
+      label: hunter?.label ?? `猎手 ${i}`,
+      ok: false,
+      text: '',
+      error: res.error,
+      latencyMs: 0,
+    };
+  });
+
+  runtimeLogs.write(traderId, 'info', 'team', `[调研] ${summariseHunters(reports)}`);
+  /* ⚠️ 失败原因必须写进日志 —— "知道它失败"与"知道为什么失败"是两件事。 */
+  for (const rep of reports.filter((x) => !x.ok)) {
+    runtimeLogs.write(traderId, 'warn', 'team', `[调研] ${rep.label} 未产出：${rep.error ?? '未知原因'}`);
+  }
+
+  if (reports.filter((x) => x.ok).length === 0) {
+    /*
+     * ⚠️ **全部失败时不覆盖旧缓存** —— 旧结果可能还有用（只是旧），
+     * 覆盖成空会让下一轮"什么都没有"。
+     */
+    runtimeLogs.write(traderId, 'warn', 'team', '[调研] 全部猎手未产出 —— 保留上一份结果（若有）');
+    return;
+  }
+
+  const merged = mergeHunterReports(reports);
+  const parsed = parseIntelReport(merged, Date.now(), 'news_hunter');
+  if (parsed.intel.length > 0) {
+    const ranked = rankIntel(parsed.intel, Date.now());
+    if (ranked.length > 0) {
+      const text = ranked
+        .map((r) => {
+          const h = (r.assessment.ageMs / 3_600_000).toFixed(1);
+          return `- [${r.intel.direction}] ${r.intel.summary}\n` +
+            `  来源：${r.intel.sourceUrl}（${r.assessment.independentSources} 个独立来源）\n` +
+            `  ${h} 小时前 · ${r.assessment.verdict}`;
+        })
+        .join('\n');
+      researchCache.set(traderId, { text, at: Date.now(), refreshing: false });
+      runtimeLogs.write(
+        traderId, 'info', 'team',
+        `[调研] 可用情报 ${ranked.length} 条（过期/未确认被剔除 ${parsed.intel.length - ranked.length} 条）`,
+      );
+      return;
+    }
+    const note = '（本轮没有可用的新鲜情报：查到的不够新，或只有单一来源未经确认）';
+    researchCache.set(traderId, { text: note, at: Date.now(), refreshing: false });
+    return;
+  }
+  /* 解析不出结构化情报 → 退回合并后的原文（格式没对上，但原文仍可能有信息）。 */
+  runtimeLogs.write(traderId, 'warn', 'team', '[调研] 产出不是结构化格式 —— 退回原文使用');
+  researchCache.set(traderId, { text: merged, at: Date.now(), refreshing: false });
+}
 export class TraderManager {
   private readonly running = new Map<number, AutoTrader>();
   /**
@@ -1005,6 +1179,57 @@ export class TraderManager {
           return cached.text;
         }
 
+        /*
+         * ── ①b **后台刷新，决策不等它**（2026-10-13 解耦）──────────────────
+         *
+         * ## 为什么必须解耦（实测数据）
+         *
+         * 用户的要求：
+         * > 「系统**不再是像现在这样定时去工作**，而是**持续、并发**的工作」
+         *
+         * 而实测（`#2471`）整轮 **619 秒** —— 因为决策**同步等**调研跑完。
+         * 四个猎手即便并发也要约 400 秒（两个一批，每批约 200 秒），
+         * 而 `240 秒` 的猎手超时在并发下让**四个全部超时**：
+         * ```
+         *   [调研] 新闻猎手 未产出：agent 超过 240 秒未返回
+         *   （四个都是同一个原因）
+         * ```
+         *
+         * ## 正确形状：调研在后台持续跑，决策读最新结果
+         *
+         * ```
+         *   后台：每 N 分钟跑一次四猎手 → 写进 `researchCache`
+         *   决策：读缓存（几乎总是新鲜的）→ **立即返回**
+         * ```
+         * 于是"持续工作"与"决策不被拖慢"**同时成立**。
+         *
+         * ⚠️ 缓存**空**时（首次启动）也不阻塞等待 —— 立刻返回一句说明，
+         * 让团队知道"这一轮没有新闻材料"。**不能让整轮卡在调研上。**
+         */
+        ensureResearchRefresher(traderId, symbols, apiKey);
+        if (cached !== undefined) {
+          /* 有**过期**缓存 → 先用它（总比"什么都没有"好），后台已在刷新。 */
+          runtimeLogs.write(
+            traderId, 'info', 'team',
+            `[调研] 缓存已过期（${Math.round(age / 60_000)} 分钟前）—— 先用旧结果，后台正在刷新`,
+          );
+          return cached.text;
+        }
+        runtimeLogs.write(
+          traderId, 'info', 'team',
+          '[调研] 首次调研在后台进行 —— 本轮**没有新闻材料**（下一轮就会有）',
+        );
+        return '（本轮没有新闻材料：首次调研正在后台进行，下一轮就会有）';
+
+        /* eslint-disable no-unreachable */
+        /*
+         * ⚠️ **下面这一段（原"同步调研"）已被上面的"后台刷新"取代。**
+         *
+         * 它暂时保留在这里**是为了让这次改动可以小步回滚** ——
+         * 我已经因为大段替换两次写坏这个文件（见设计文档附八十五）。
+         *
+         * ⚠️ 下一轮把它整段删掉（用小 edit、每步编译）。
+         */
 
         /*
          * ⚠️ **第一优先：让真 agent 自己去查**（2026-10-12 实测后改的）。
