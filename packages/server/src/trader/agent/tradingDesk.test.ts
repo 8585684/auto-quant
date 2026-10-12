@@ -287,3 +287,57 @@ test('★★★ 裁决官的提示词必须要求【独立判断、不许复读�
     );
   });
 });
+test('★★★ 分析师并发有【上限】（将来按币并行时不能起 20+ 个进程）', async () => {
+  /*
+   * ## 为什么现在只有 4 个分析师也要有闸门
+   *
+   * 因为**这个数字会变**：用户已提过"按币并行"（500 个标的、N 个 agent）。
+   * 一旦分析角色变成"每个标的一个人"，无界 `Promise.all` 会**同时起 20+ 个**。
+   *
+   * 实测约束：**claude code 单进程约 250MB** —— 20 个并行 ≈ 5GB。
+   * 用户说的"不限制并发"指的是 **magpie 侧**（模型调用）；
+   * **服务器侧的 CPU/内存是真实约束**（那是我们自己的机器）。
+   *
+   * ## 这条测试钉住什么
+   *
+   * 它验证"**闸门真的在生效**"：把上限设成 2，然后看**同时**有几个在跑。
+   * 若将来有人把 `mapConcurrent` 换回 `Promise.all`，峰值会变成 4 → 测试失败。
+   */
+  process.env.AQ_ANALYST_CONCURRENCY = '2';
+  let running = 0;
+  let peak = 0;
+  const ask: AskRole = async ({ role }) => {
+    running += 1;
+    peak = Math.max(peak, running);
+    await new Promise((r) => setTimeout(r, 30));
+    running -= 1;
+    return { role, modelId: `stub/${role}`, data: null, raw: '结论：不行动。', latencyMs: 1, ok: true };
+  };
+  try {
+    await runTradingDesk({ ask, ...CTX });
+    assert.ok(peak <= 2, `★ 同时最多 2 个分析师（实测峰值 ${peak}）—— 闸门没生效`);
+    assert.ok(peak >= 2, `★ 但要真的并发（峰值 ${peak} 说明退化成串行了）`);
+  } finally {
+    delete process.env.AQ_ANALYST_CONCURRENCY;
+  }
+});
+
+test('★ 分析师顺序必须与角色表一致（闸门不能打乱顺序）', async () => {
+  /*
+   * `mapConcurrent` 保证"结果与输入同序" —— 这一条是它的回归保护。
+   * 若顺序错了，`analyses[i]` 会把 A 角色的产出记到 B 角色名下。
+   */
+  const order: string[] = [];
+  const ask: AskRole = async ({ role }) => {
+    order.push(role);
+    /* 故意让**先发的慢** —— 按完成顺序收集就会颠倒。 */
+    await new Promise((r) => setTimeout(r, order.length === 1 ? 40 : 5));
+    return { role, modelId: `stub/${role}`, data: null, raw: '[]', latencyMs: 1, ok: true };
+  };
+  const out = await runTradingDesk({ ask, ...CTX });
+  assert.equal(
+    out.analyses.map((a) => a.role).join(','),
+    order.slice(0, out.analyses.length).join(','),
+    '★ 产出的顺序必须与角色表一致',
+  );
+});

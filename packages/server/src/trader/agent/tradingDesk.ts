@@ -40,6 +40,7 @@
  */
 
 import type { ModelTier } from '../../llm/modelCatalog.js';
+import { mapConcurrent } from './pool.js';
 
 /** 一个角色的产出（结构化卡片）。 */
 export interface DeskRoleOutput {
@@ -242,29 +243,67 @@ export async function runTradingDesk(input: {
   if (affordable.length < analysisRoles.length) truncatedByBudget = true;
 
   callsUsed += affordable.length;
-  const analyses = await Promise.all(
-    affordable.map(async (a) => {
-      /*
-       * ⚠️ **必须走 `safeAsk`**（2026-10-12 实测踩到）。
-       *
-       * 原来这里直接 `input.ask(a)` + 自己的 try/catch ——
-       * 于是**角色级超时对它不生效**（超时是在 `safeAsk` 里做的）。
-       *
-       * 后果实测可见：
-       * ```
-       *   [analysis] technical：完成（398758ms）      ← T1 档，超时该是 60 秒
-       *   [analysis] market_analyst：完成（400858ms）
-       * ```
-       * **一个分析师跑了 398 秒**，而整轮就是被它拖到 7 分钟以上的。
-       *
-       * 而 `technical` 是 T1（"体力活"档）—— 它花 398 秒**本身就是异常信号**，
-       * 正是角色超时要拦的那种情况。
-       */
-      const out = await safeAsk(input.ask, a);
-      note(a.role, 'analysis', out.ok ? `完成（${out.latencyMs}ms）` : `失败：${out.error ?? '未知'}`);
-      return out;
-    }),
-  );
+  /*
+   * ── **用并发闸门，而不是无界 `Promise.all`**（2026-10-12 接线）──────────
+   *
+   * ## 现在只有 4 个分析师，为什么也要闸门
+   *
+   * 因为**这个数字会变**：用户已经提过"按币并行"（500 个标的、N 个 agent），
+   * 而一旦分析角色变成"每个标的一个人"，无界 `Promise.all` 会**同时起 20+ 个**。
+   *
+   * 实测约束：**claude code 单进程约 250MB** —— 20 个并行 ≈ 5GB。
+   * 用户说的"不限制并发"指的是 **magpie 侧**（模型调用），
+   * **服务器侧的 CPU/内存是真实约束**（那是我们自己的机器）。
+   *
+   * ## 现在闸门给多少
+   *
+   * `AQ_ANALYST_CONCURRENCY`，默认 **4**。
+   * · 4 个分析师时 → **等于无界**（行为与原来完全一致，没有副作用）；
+   * · 将来变成 20 个标的时 → 自动变成"4 个一批"，**不需要再改这里**。
+   *
+   * ## 顺序与错误语义**必须保持**
+   *
+   * `mapConcurrent` 保证"结果与输入同序"（否则 `analyses[i]` 会对错角色），
+   * 且单个失败只标记它自己（`safeAsk` 本来就不抛）。
+   */
+  const concurrency = Number(process.env.AQ_ANALYST_CONCURRENCY ?? 4);
+  const analysisResults = await mapConcurrent(affordable, concurrency, async (a) => {
+    /*
+     * ⚠️ **必须走 `safeAsk`**（2026-10-12 实测踩到）。
+     *
+     * 原来这里直接 `input.ask(a)` + 自己的 try/catch ——
+     * 于是**角色级超时对它不生效**（超时是在 `safeAsk` 里做的）。
+     *
+     * 后果实测可见：
+     * ```
+     *   [analysis] technical：完成（398758ms）      ← T1 档，超时该是 60 秒
+     *   [analysis] market_analyst：完成（400858ms）
+     * ```
+     * **一个分析师跑了 398 秒**，而整轮就是被它拖到 7 分钟以上的。
+     *
+     * 而 `technical` 是 T1（"体力活"档）—— 它花 398 秒**本身就是异常信号**，
+     * 正是角色超时要拦的那种情况。
+     */
+    const out = await safeAsk(input.ask, a);
+    note(a.role, 'analysis', out.ok ? `完成（${out.latencyMs}ms）` : `失败：${out.error ?? '未知'}`);
+    return out;
+  });
+
+  const analyses: DeskRoleOutput[] = analysisResults.map((r, i) => {
+    if (r.ok) return r.value;
+    /*
+     * `mapConcurrent` 只在 `fn` **抛错**时才给 `ok: false` ——
+     * 而 `safeAsk` 是不抛的，所以这条分支理论上走不到。
+     * 但**不能因此省略它**：省略会让类型上多一个 `undefined`，
+     * 而且将来若有人去掉 `safeAsk` 的包装，这里会静默变成 `undefined` 角色。
+     */
+    const a = affordable[i]!;
+    note(a.role, 'analysis', `抛错：${r.error}`);
+    return {
+      role: a.role, modelId: '（未调用成功）', data: null, raw: '', latencyMs: 0,
+      ok: false, error: r.error,
+    };
+  });
 
   /*
    * ── ② 对抗论证：Bull 与 Bear 各自构建最强论证（**串行**，共享同一份材料）──
