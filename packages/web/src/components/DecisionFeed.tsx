@@ -1909,7 +1909,27 @@ function DecisionOutcome({
    * 都不会因为这次改动而消失。
    */
   const [expanded, setExpanded] = useState(false);
-  const notes = entry?.adjustments?.length ? entry.adjustments : decision.adjustments;
+  /*
+   * ⚠️ **两边都要兜底成 `[]`**（2026-10-12 实测抓到的第二个崩溃点）。
+   *
+   * 原来写的是 `entry?.adjustments?.length ? entry.adjustments : decision.adjustments`：
+   * 前半段对 `entry` 用了可选链，**但兜底那一侧直接读 `decision.adjustments`** ——
+   * 而 `decision` 缺这个字段时它就是 `undefined`。
+   *
+   * 下一个表达式（`notes.length`，见文件下方）于是抛
+   * `Cannot read properties of undefined (reading 'length')`。
+   *
+   * ## 为什么这是真 BUG（不是"测试数据的问题"）
+   *
+   * 决策记录**跨版本累积**，而 `adjustments` 是后来才加上的字段 ——
+   * 本地库里实测就有 `[{"symbol":"BTCUSDT","action":"open_long"}]`
+   * 这种只有两个字段的旧记录。
+   *
+   * 而崩溃发生在**渲染路径**：`FeedErrorBoundary` 会把**整块决策看板**
+   * 换成一张错误卡（实测现象：团队看板完全不显示）。
+   * **一条旧记录足以让整个看板打不开。**
+   */
+  const notes = entry?.adjustments?.length ? entry.adjustments : (decision.adjustments ?? []);
 
   if (!entry) {
     return (
@@ -2168,14 +2188,31 @@ export function figureParts(decision: Decision, price: number | null): Figure[] 
    * `add_to_position` = 0、`reduce_position` = 0）。所以这段渲染目前没有线上样本，
    * 但**"没用过"不等于"不该显示"** —— 它一被用上，操作员就得看懂它。
    */
+  /*
+   * ⚠️ **判据必须是"真的是个数字"，不能是 `!== null`**（2026-10-12 实测抓到的真 BUG）。
+   *
+   * 现象：界面上一条开仓决策显示成 `止盈 -- · 止损 -- · undefinedx` ——
+   * 那个 `undefinedx` 是 `` `${decision.leverage}x` `` 里的 `${undefined}`。
+   *
+   * 原因：这些字段判的是 `!== null`，而**字段缺失时它是 `undefined`**，
+   * 而 `undefined !== null` **为真** —— 代码"以为有值"。
+   *
+   * 为什么字段会缺：决策记录**跨版本累积**，这些字段都是后来才加上的
+   *（实测库里有一条只有 `symbol`+`action` 两个字段的旧记录）。
+   *
+   * 判据选 `typeof === 'number'` + `Number.isFinite`（而不是 `!= null`）：
+   * 后者挡得住 `null`/`undefined`，但**挡不住 `NaN`** —— 而 `NaN` 会让
+   * `fmtPriceUsd` 输出 `NaN`，同样是坏数据。
+   */
+  const num = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v);
   if (decision.action === 'add_to_position') {
     const parts: Figure[] = [
       /* 加仓金额比"仓位"更贴切：它说的是"再投多少"。 */
       { key: 'size', label: '加仓', value: fmtUsd(decision.positionSizeUsd, 2) },
     ];
     if (decision.leverage > 0) parts.push({ key: 'leverage', label: '', value: `${decision.leverage}x` });
-    if (decision.stopLoss !== null) parts.push({ key: 'stop', label: '止损', value: fmtPriceUsd(decision.stopLoss) });
-    if (decision.takeProfit !== null)
+    if (num(decision.stopLoss)) parts.push({ key: 'stop', label: '止损', value: fmtPriceUsd(decision.stopLoss) });
+    if (num(decision.takeProfit))
       parts.push({ key: 'target', label: '止盈', value: fmtPriceUsd(decision.takeProfit) });
     return parts;
   }
@@ -2187,7 +2224,7 @@ export function figureParts(decision: Decision, price: number | null): Figure[] 
      * 所以按"哪个有值显示哪个"来渲染 —— 两个都空就只显示保护位。
      */
     const parts: Figure[] = [];
-    if (decision.reducePercent !== null) {
+    if (num(decision.reducePercent)) {
       /*
        * ⚠️ `reducePercent` 是**百分数**，不是比例。
        *
@@ -2196,21 +2233,21 @@ export function figureParts(decision: Decision, price: number | null): Figure[] 
        * 那会把 50% 显示成 0.50%，让操作员以为它只象征性地减了一点点。
        */
       parts.push({ key: 'reduce', label: '减仓', value: `${decision.reducePercent.toFixed(1)}%` });
-    } else if (decision.reduceQuantity !== null) {
+    } else if (num(decision.reduceQuantity)) {
       parts.push({ key: 'reduce', label: '减仓', value: fmtQty(decision.reduceQuantity) });
     }
-    if (decision.stopLoss !== null) parts.push({ key: 'stop', label: '止损', value: fmtPriceUsd(decision.stopLoss) });
-    if (decision.takeProfit !== null)
+    if (num(decision.stopLoss)) parts.push({ key: 'stop', label: '止损', value: fmtPriceUsd(decision.stopLoss) });
+    if (num(decision.takeProfit))
       parts.push({ key: 'target', label: '止盈', value: fmtPriceUsd(decision.takeProfit) });
     return parts;
   }
 
   if (decision.action === 'adjust_protection') {
     const adjusted: Figure[] = [];
-    if (decision.stopLoss !== null) {
+    if (num(decision.stopLoss)) {
       adjusted.push({ key: 'stop', label: '止损 →', value: fmtPriceUsd(decision.stopLoss) });
     }
-    if (decision.takeProfit !== null) {
+    if (num(decision.takeProfit)) {
       adjusted.push({ key: 'target', label: '止盈 →', value: fmtPriceUsd(decision.takeProfit) });
     }
     /*
@@ -2222,19 +2259,48 @@ export function figureParts(decision: Decision, price: number | null): Figure[] 
 
   if (!isOpenAction(decision.action)) return [];
 
-  const parts: Figure[] = [{ key: 'size', label: '', value: fmtUsd(decision.positionSizeUsd, 2) }];
+  /*
+   * ⚠️ **判据必须是"真的是个数字"，不能是 `!== null`**（2026-10-12 实测抓到的真 BUG）。
+   *
+   * ## 现象
+   *
+   * 界面上一条开仓决策显示成：
+   * ```
+   *   止盈 --  ·  止损 --  ·  undefinedx
+   * ```
+   * **`undefinedx`** —— 那是 `` `${decision.leverage}x` `` 里的 `${undefined}`。
+   *
+   * ## 原因
+   *
+   * 这些字段原本判的是 `!== null`，但**字段缺失时它是 `undefined`**，
+   * 而 `undefined !== null` **为真** —— 于是代码"以为有值"，把 `undefined`
+   * 送进了模板串 / `fmtPriceUsd`。
+   *
+   * ## 为什么字段会缺
+   *
+   * 决策记录**跨版本累积**：`leverage` / `stopLoss` / `takeProfit` 都是
+   * 后来才加上的字段（实测库里有一条 `[{"symbol":"BTCUSDT","action":"open_long"}]`
+   * 只有两个字段的旧记录）。
+   *
+   * ## 判据选 `typeof === 'number'`（而不是 `!= null`）
+   *
+   * `!= null`（松等于）能同时挡 `null` 和 `undefined`，但**挡不住 `NaN`** ——
+   * 而 `NaN` 会让 `fmtPriceUsd` 输出 `NaN`，也是坏数据。
+   * `typeof === 'number'` 配合 `Number.isFinite` 是最严的"这是个能显示的数字"。
+   */
+  const parts: Figure[] = [{ key: 'size', label: '', value: fmtUsd(num(decision.positionSizeUsd) ? decision.positionSizeUsd : null, 2) }];
   if (price !== null) parts.push({ key: 'entry', label: '开仓', value: fmtPriceUsd(price) });
-  if (decision.stopLoss !== null) parts.push({ key: 'stop', label: '止损', value: fmtPriceUsd(decision.stopLoss) });
-  if (decision.takeProfit !== null)
+  if (num(decision.stopLoss)) parts.push({ key: 'stop', label: '止损', value: fmtPriceUsd(decision.stopLoss) });
+  if (num(decision.takeProfit))
     parts.push({ key: 'target', label: '止盈', value: fmtPriceUsd(decision.takeProfit) });
-  if (price !== null && decision.stopLoss !== null && decision.takeProfit !== null) {
+  if (price !== null && num(decision.stopLoss) && num(decision.takeProfit)) {
     // `Math.abs` 两侧：做空时价格在止损之上、止盈之下，直接相减会得到一个**负数**
     // 的风险回报比 —— 那是一个不存在的比例，看起来像算错了。
     const risk = Math.abs(price - decision.stopLoss);
     const reward = Math.abs(decision.takeProfit - price);
     if (risk > 0) parts.push({ key: 'reward', label: '', value: `1:${(reward / risk).toFixed(2)}` });
   }
-  parts.push({ key: 'leverage', label: '', value: `${decision.leverage}x` });
+  if (num(decision.leverage)) parts.push({ key: 'leverage', label: '', value: `${decision.leverage}x` });
 
   return parts;
 }
