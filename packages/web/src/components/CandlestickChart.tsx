@@ -30,11 +30,34 @@ export function CandlestickChart({
   candles,
   height = 460,
   loading = false,
+  fill = false,
 }: {
   candles: Kline[];
+  /**
+   * 固定高度（像素）。`fill` 为真时**忽略**它 —— 高度改由容器决定。
+   */
   height?: number;
   /** Render the "no data yet" copy only once the first fetch has settled. */
   loading?: boolean;
+  /**
+   * 撑满父容器的高度，而不是用固定像素。
+   *
+   * ## 为什么需要它
+   *
+   * 行情页要"不滚动就能看完"：图表得吃掉交易对表之外剩下的高度。写死 460px
+   * 时，窗口高一点就留一大片空、矮一点就把「最新K线」挤到屏幕外 —— 两种都
+   * 要用户滚动。用户的原话是「自动适配页面长度，不要超出页面」。
+   *
+   * 高度跟随容器需要两件事，缺一不可：
+   *
+   *   1. 外层 `h-full`（而不是 `style={{height}}`）—— 否则容器只有 0 高；
+   *   2. `ResizeObserver` **同时**上报高度（原来只报宽度）—— lightweight-charts
+   *      的 canvas 尺寸由它自己的 options 决定，CSS 变高不会自动跟上。
+   *
+   * 父级必须给出确定高度（`flex-1` + `min-h-0`），否则 `h-full` 解析成 `auto`，
+   * 图表会塌成 0 —— 与 `PageShell` 那条 `min-h-0` 是同一个道理。
+   */
+  fill?: boolean;
 }) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const chartRef = useRef<IChartApi | null>(null);
@@ -117,7 +140,14 @@ export function CandlestickChart({
 
     const observer = new ResizeObserver(() => {
       if (!containerRef.current) return;
-      chart.applyOptions({ width: containerRef.current.clientWidth });
+      /*
+       * 高度也要跟着报 —— 只报宽度时，`fill` 模式下的 canvas 会停在初始高度，
+       * 容器变高了图表还是一小条（见 `fill` 的说明）。
+       */
+      chart.applyOptions({
+        width: containerRef.current.clientWidth,
+        ...(fill ? { height: containerRef.current.clientHeight } : {}),
+      });
     });
     observer.observe(container);
 
@@ -194,7 +224,12 @@ export function CandlestickChart({
   }, [candles]);
 
   return (
-    <div className="relative w-full" style={{ height }}>
+    /*
+     * `fill` 走 `h-full`（父级已经给了确定高度），否则用固定像素。
+     * 不做兜底：父级没给高度时图表塌成 0 是**立刻看得见的**错误，
+     * 比"看着正常但画在屏幕外"好排查。
+     */
+    <div className={fill ? 'relative h-full w-full' : 'relative w-full'} style={fill ? undefined : { height }}>
       <div ref={containerRef} className="h-full w-full" />
       {/*
        * Four states, not two: "still fetching" and "this symbol has no history

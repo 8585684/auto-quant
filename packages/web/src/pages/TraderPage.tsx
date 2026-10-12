@@ -30,7 +30,6 @@ import { LeverageArc } from '../components/LeverageArc';
 import {
   EQUITY_RANGES,
   filterByRange,
-  hasEquityVariation,
   type EquityRange,
 } from '../components/equityCurve';
 import { CandlestickChart } from '../components/CandlestickChart';
@@ -59,8 +58,12 @@ type ChartTab = 'equity' | 'candles';
 /**
  * 展开后的权益曲线高度。
  *
- * 220px 在 900px 视口上约 24% 屏高：有形状时够看清趋势，没形状时根本不会画出来
- * （见 `EquityMiniStrip`，`LAYOUT.md` §3「图表只在有数据可看时才占大块」）。
+ * 220px 在 900px 视口上约 24% 屏高。
+ *
+ * ⚠️ **这个高度不再随数据变化。** 曲线以前会在"数据太薄"时塌成
+ * `EquityMiniStrip` 的 36px 细条，于是同一块版面会随数据变高变矮 ——
+ * 用户明确要求"不管有没有数据都保持展开状态一致"（总览页那条的同一句话）。
+ * 细条现在只在**用户自己点了「收起」**时出现，那是显式动作，不是数据决定的。
  *
  * 决策流**不再有对应的常量**：它住在右栏，高度由外壳那份"可视区 − 顶栏"给，
  * 页面手算一个视口高度必然算错（见 `DecisionFeed` 顶部注释）。
@@ -176,11 +179,18 @@ export function TraderPage() {
   const [chartTab, setChartTab] = useState<ChartTab>('equity');
   const [range, setRange] = useState<EquityRange>('ALL');
   /**
-   * 手动覆盖"要不要展开曲线"。
+   * 手动覆盖"要不要收起曲线"。
    *
-   * `null` = 交给数据判断（有形状就展开，平线就收起）；`true` = 操作者自己点开了
-   * 一条平线；`false` = 自己收起了有形状的曲线。切区间时清空覆盖，重新按数据判断 ——
-   * 换一段窗口本来就该重新看一眼。
+   * ⚠️ **默认永远是展开的**（`null` 就走展开），不再由数据形状决定。
+   *
+   * 原来的规则是"有形状（≥3 点且有波动）才展开，否则塌成 36px 的缩略条"。
+   * 那条规则让**同一块版面随数据变高变矮**：机器人刚开始跑时是一行细条，
+   * 跑够两个周期后突然长成 220px 图表，下面的持仓表和决策流跟着上下跳。
+   * 用户的原话是「也是同理」—— 与总览页那条同一个要求：**不管有没有数据，
+   * 展开状态都要一致**。
+   *
+   * 保留手动开关：`true` = 用户自己点开（现在等于默认），`false` = 用户自己
+   * 收起。那是个**显式动作**，与"数据一变版面就跳"是两回事。
    */
   const [chartOverride, setChartOverride] = useState<boolean | null>(null);
   const { runOnce, busyId: runOnceBusyId } = useRunOnce();
@@ -699,19 +709,19 @@ export function TraderPage() {
   /*
    * 图表与缩略条共用同一份"可见区间"数据。
    *
-   * `filterByRange` 必须在这里调用一次，而不是让图表自己筛：收起与否取决于
-   * **当前区间**里有没有形状，两处各筛一次就会出现"图表画的是 7D、判断用的是全部"
-   * 这种自相矛盾的状态。
+   * `filterByRange` 在这里调用一次，而不是让图表自己筛：图表与缩略条用的是
+   * **当前区间**的同一份数据，两处各筛一次会出现"图表画的是 7D、另一处用的是
+   * 全部"这种自相矛盾的状态。
    */
   const windowed = useMemo(() => filterByRange(snapshots, range), [snapshots, range]);
   const windowFirst = windowed[0]?.equity ?? equity;
   const windowDelta = equity - windowFirst;
   const windowPercent = windowFirst !== 0 ? (windowDelta / Math.abs(windowFirst)) * 100 : 0;
-  const curveHasShape = useMemo(
-    () => hasEquityVariation(windowed.map((snapshot) => snapshot.equity)),
-    [windowed],
-  );
-  const curveCollapsed = chartOverride ?? !curveHasShape;
+  /*
+   * 默认展开（`chartOverride === null`）—— 不再看 `windowed` 有没有形状。
+   * 理由见上面 `chartOverride` 的声明。
+   */
+  const curveCollapsed = chartOverride ?? false;
 
   const model = modelsQuery.data?.find((row) => row.id === trader?.aiModelId) ?? null;
   const strategy = strategiesQuery.data?.find((row) => row.id === trader?.strategyId) ?? null;

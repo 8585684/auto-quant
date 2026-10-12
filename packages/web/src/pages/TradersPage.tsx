@@ -47,9 +47,20 @@ type PendingAction = { kind: 'stop' | 'delete'; trader: TraderRow } | null;
  * 所以这一页只有：页头、一行舰队合计、整宽表格。
  *
  * 之前下半屏空着，是因为表格高度写死 `max-h-[70vh]` 而内容只有几行：面板在
- * 半屏处就结束了，下面是一片页面底色，看起来像页面坏了。现在表格容器**按视口
- * 撑满**（`h-[calc(100vh-22rem)]`），空的地方落在表格内部 —— 那是"表格还有位置"，
+ * 半屏处就结束了，下面是一片页面底色，看起来像页面坏了。现在表格容器**撑满
+ * 面板剩下的高度**，空的地方落在表格内部 —— 那是"表格还有位置"，
  * 而不是"页面到底了"。行高保持一档 `py-2` 的密度。
+ *
+ * ## ⚠️ 为什么是 `flex-1` 而不是 `h-[calc(100vh-22rem)]`
+ *
+ * 那个算式是**猜**出来的：它假设"页头 + 合计条 + 面板头 + 页脚"正好 22rem。
+ * 实际在 1600×1000 下多 79px，在 2564×1225 下多 180px —— 于是表格把页面
+ * 顶长，用户必须滚动才能看到最后一行和面板底边，而**下面明明还有空**。
+ * 屏幕越高、比例越宽，猜错的量越大。
+ *
+ * 撑满必须由**布局**算，不能由算式猜：页面 `page-fill`、面板 `flex-1`、
+ * 表格体再 `flex-1`，剩下的高度是多少就占多少。这样任何视口、任何一行合计条
+ * 换行的情况下都成立。
  *
  * 为什么不换成卡片网格：卡片在只有一两个维护时会排成一行，垂直方向**留白更多**，
  * 想填满就得把卡片拉高 —— 那正是"用大卡片解决空"的老毛病。而且卡片意味着
@@ -180,7 +191,7 @@ export function TradersPage() {
      * 也不设 `max-w`：列表页就是**整宽一张表**（LAYOUT.md §0 规则 2 / §2），
      * 宽屏上把空间给表格，不要在两边留白。
      */
-    <div className="w-full space-y-3">
+    <div className="page-fill w-full gap-3">
       <SectionHeading
         title="机器人"
         sub="每个机器人 = 一份交易所凭证 + 一个 AI 模型 + 一套策略，按固定间隔循环决策。"
@@ -241,7 +252,16 @@ export function TradersPage() {
 
       {actionError && <ErrorNote>{actionError}</ErrorNote>}
 
-      <Panel padded={false} bodyClassName="p-0">
+      <Panel
+        padded={false}
+        /*
+         * 面板撑满页面剩余高度，表格体再撑满面板剩余高度（见下面 `flex-1`）。
+         * `min-h-0` 是必须的：flex 子项默认 `min-height:auto`，不加它表格会被
+         * 内容顶高、永远不产生内部滚动条，`flex-1` 就白写了。
+         */
+        className="flex min-h-0 flex-1 flex-col"
+        bodyClassName="flex min-h-0 flex-1 flex-col p-0"
+      >
         {tradersQuery.loading && traders.length === 0 ? (
           <Spinner3 label="正在加载机器人" />
         ) : traders.length === 0 ? (
@@ -275,7 +295,7 @@ export function TradersPage() {
               容器撑满剩余视口高度：行少时下面是表格自己的空白（"还有位置"），
               行多时表体自己滚动，页面不会被顶长。
             */}
-            <div className="scroll-x h-[calc(100vh-22rem)] min-h-[16rem] overflow-y-auto">
+            <div className="scroll-x min-h-[16rem] flex-1 overflow-y-auto">
               <table className="w-full border-collapse">
                 <thead className="sticky top-0 z-10 border-b border-base-800 bg-base-850">
                   <tr>

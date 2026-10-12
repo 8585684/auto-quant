@@ -233,6 +233,28 @@
   .page-pad {
     @apply p-4 sm:p-6 lg:p-8 2xl:p-10;
   }
+
+  /*
+   * 内容区的**高度链**。
+   *
+   * `xl:h-full` 是刻意的：只有宽屏（两栏布局生效的那一档）才把高度传下去。
+   * 窄屏上内容区是 `overflow-y-auto` 的滚动容器，页面按内容自然生长 ——
+   * 这时给它 `h-full` 反而会把长页面截断。
+   *
+   * 这条规则存在的原因：`/traders` 那张表要"撑满剩余高度、自己内部滚动"，
+   * 而它需要父级有一个**确定的高度**。父级若是 `auto`，`flex-1` 与 `h-full`
+   * 都会退化成按内容算 —— 表格于是把页面顶长，用户白滚一屏。
+   */
+  .page-fill {
+    @apply flex min-h-0 flex-col;
+  }
+
+  @media (min-width: 80em) {
+    .page-fill {
+      height: 100%;
+    }
+  }
+
   .panel {
     @apply rounded-lg border border-base-700 bg-base-900 shadow-panel;
   }

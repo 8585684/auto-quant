@@ -254,7 +254,7 @@ export function DataPage() {
   const hasLines = shown.length > 0;
 
   return (
-    <div className="space-y-3">
+    <div className="page-fill gap-3">
       <div className="flex flex-wrap items-end justify-between gap-3">
         <div className="min-w-0">
           <h1 className="text-xl font-semibold tracking-wide text-ink-hi">数据与日志</h1>
@@ -303,6 +303,19 @@ export function DataPage() {
 
       <Panel
         title="运行时日志"
+        /*
+         * 日志面板吃掉**这一页剩下的全部高度**，日志体再吃掉面板剩下的高度
+         * （见下面 `flex-1`）。
+         *
+         * 原来日志体写死 `h-[min(70vh,560px)]`：屏幕一高，70vh 就比"面板真正
+         * 剩下的高度"还大，页面被顶长 —— 用户必须滚动才能看到日志框的下沿和
+         * 底下的说明卡，而下面明明还有空。用户的原话是「日志框也要动态大小，
+         * 保证不同页面下这一块能完整显示，而不用用户滚动页面」。
+         *
+         * `min-h-0` 是必须的：flex 子项默认 `min-height:auto`，不加它日志体会
+         * 被内容顶高、永远不产生内部滚动条，`flex-1` 就白写了。
+         */
+        className="flex min-h-0 flex-1 flex-col"
         actions={
           <div className="flex flex-wrap items-center justify-end gap-1.5">
             {/* 级别：文字 + 颜色，两者都在 */}
@@ -396,7 +409,12 @@ export function DataPage() {
             */}
           </div>
         }
-        bodyClassName="p-2"
+        /*
+         * 面板体也带 `min-h-0` —— 它是这一串里最容易漏的一环：flex 子项默认
+         * `min-height:auto`，日志内容有 800px 高时，它会把面板体顶到 886px，
+         * 面板再顶到 887px，`flex-1` 完全失效（实测就是这个数字）。
+         */
+        bodyClassName="flex min-h-0 flex-1 flex-col p-2"
         padded={false}
       >
         <div className="mb-2 flex flex-wrap items-center gap-2">
@@ -441,7 +459,15 @@ export function DataPage() {
           ref={scrollRef}
           className={cn(
             'overflow-y-auto overflow-x-hidden rounded-md border border-base-800 bg-base-950 p-1 font-mono text-base leading-relaxed',
-            hasLines ? 'h-[min(70vh,560px)]' : 'min-h-0',
+            /*
+             * 有内容时撑满面板剩下的高度（父级已经是 flex 列，见上面 Panel 的
+             * `flex-1`）；空/加载/出错时**不预留那块高度**，只占一行多一点 ——
+             * 空列表撑满一屏正是 `LAYOUT.md` §4 要消掉的浪费。
+             *
+             * `flex-1` 与 `min-h-0` 缺一不可：前者是"占满剩余"，后者是"允许被
+             * 压到比内容矮" —— 没有后者，日志体永远按内容撑高，内部滚动条不会出现。
+             */
+            hasLines ? 'min-h-0 flex-1' : 'min-h-0',
           )}
         >
           {source === 'rest' && restQuery.loading && shown.length === 0 ? (

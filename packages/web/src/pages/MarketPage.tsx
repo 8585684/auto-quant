@@ -130,7 +130,11 @@ export function MarketPage() {
   const hiddenRows = matched.length - filtered.length;
 
   return (
-    <div className="space-y-3">
+    /*
+     * `page-fill`：整页撑满外壳给的确定高度，图表与交易对表各自内部滚动。
+     * 见 `index.css` 里 `.page-fill` 的说明 —— 宽屏下才有 `height:100%`。
+     */
+    <div className="page-fill gap-3">
       {/* ------------------------------------------------------------------ */}
       {/*  顶栏：当前交易对的报价 + 周期切换                                   */}
       {/* ------------------------------------------------------------------ */}
@@ -174,18 +178,27 @@ export function MarketPage() {
         让给左表会把图挤到 300px 上下；窄屏上让表格自己横滚（`scroll-x`）本来就是
         这一栏的设计。单元格内边距同步收窄到 6px，见 `templates/console/theme.css`。
       */}
-      <div className="grid grid-cols-1 gap-3 md:grid-cols-[minmax(0,300px)_minmax(0,1fr)] xl:grid-cols-[minmax(0,440px)_minmax(0,1fr)]">
+      {/*
+        `min-h-0` 让这一行能**被压到比内容矮**：它是 `page-fill` 的 flex 子项，
+        默认 `min-height:auto` 时会被两栏的内容顶高，整页照样溢出。
+      */}
+      <div className="grid min-h-0 grid-cols-1 gap-3 md:grid-cols-[minmax(0,300px)_minmax(0,1fr)] xl:grid-cols-[minmax(0,440px)_minmax(0,1fr)]">
         {/* ---------------------------------------------------------------- */}
         {/*  交易对清单                                                       */}
         {/* ---------------------------------------------------------------- */}
         <Panel
           title="交易对"
+          /*
+           * 左栏撑满这一行的高度，表格体内部滚动 —— 交易对最多 528 个，
+           * 让它把整页顶长就等于"看图表必须先滚过几百行币种"。
+           */
+          className="flex min-h-0 flex-col"
+          bodyClassName="flex min-h-0 flex-1 flex-col p-2"
           actions={
             <span className="num text-xs text-ink-faint">
               {filtered.length} / {matched.length}
             </span>
           }
-          bodyClassName="p-2"
           padded={false}
         >
           <div className="relative mb-2">
@@ -231,7 +244,7 @@ export function MarketPage() {
                * `scroll-x` 只包住表格本身：窄屏上让这 4 列自己横滚，
                * 而不是把整页顶出横向滚动条（Layout 的内容区会直接裁掉）。
                */}
-              <div className="scroll-x max-h-[min(60vh,560px)] overflow-y-auto">
+              <div className="scroll-x min-h-0 flex-1 overflow-y-auto">
                 {/*
                   单元格上显式写 `px-1.5`（6px）：两套模板的基础内边距不一样
                   （经典 `px-3` = 12px、控制台 `0 6px`），而这张表在 440px 的列里
@@ -325,7 +338,7 @@ export function MarketPage() {
         {/* ---------------------------------------------------------------- */}
         {/*  图表 + 最新K线                                                   */}
         {/* ---------------------------------------------------------------- */}
-        <div className="min-w-0 space-y-2">
+        <div className="flex min-h-0 min-w-0 flex-col gap-2">
           <Panel
             title={
               <span className="flex flex-wrap items-center gap-2">
@@ -359,7 +372,12 @@ export function MarketPage() {
                 />
               </span>
             }
-            bodyClassName="p-1"
+            /*
+             * 图表面板吃掉右栏剩下的高度，「最新K线」保持自然高度贴在下面。
+             * `min-h-0` 见 `CandlestickChart` 的 `fill` 说明。
+             */
+            className="flex min-h-0 flex-1 flex-col"
+            bodyClassName="flex min-h-0 flex-1 flex-col p-1"
             padded={false}
           >
             {klinesQuery.error ? (
@@ -377,7 +395,7 @@ export function MarketPage() {
                 hint="换一个周期试试，或确认该交易对在交易所可交易。"
               />
             ) : (
-              <CandlestickChart candles={candles} height={460} />
+              <CandlestickChart candles={candles} fill />
             )}
           </Panel>
 

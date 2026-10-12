@@ -16,11 +16,13 @@
  *      (counted once per account), 交易 is what each bot itself is doing (adds up).
  *      The per-bot 归属权益 never appears as a total — that sum counted one
  *      wallet once per bot and read ~3× high (see `lib/fleetTotals.ts`);
- *   3. 主区 — the equity curve, which is the primary visual **only when the
- *      series has shape** (≥3 points with real variation, `equityShape`). A flat
- *      or thin series collapses to a 36px strip (§4: never spend a third of the
- *      viewport drawing a straight line). It plots the **account-basis** curve;
- *      each bot's attributed curve lives on its own dashboard;
+ *   3. 主区 — the equity curve, **always drawn at full height**. It used to
+ *      collapse to a 36px strip when the series was flat or thin (§4: never
+ *      spend a third of the viewport drawing a straight line), but that made
+ *      the page change height as data arrived — the user asked for a stable
+ *      layout ("不管有没有数据都要保持展开状态一致"). It plots the
+ *      **account-basis** curve; each bot's attributed curve lives on its own
+ *      dashboard;
  *   4. 机器人明细 — the dense per-bot table;
  *   5. 运行环境 — a footer, at the smallest size on the page, holding status
  *      only. Internal diagnostics (clock offset, API weight) appear **only when
@@ -46,10 +48,8 @@ import { NewTraderModal, StartTraderModal } from '../components/TraderModals';
 import { EQUITY_RANGES, mergeEquityCurves, rangeSpanMs, type EquityRange } from '../components/equityCurve';
 import {
   EquitySkeleton,
-  EquityStrip,
   SystemFact,
   TradersSnapshotTable,
-  equityShape,
   useRecentTrades,
 } from './overviewParts';
 import {
@@ -72,8 +72,9 @@ import {
  * whole library in front of the first paint of the headline numbers. The shell
  * and the rail render immediately; the curve lands a moment later.
  *
- * It is reached only when `equityShape` says there is something to draw, so a
- * flat or brand-new account never downloads it at all.
+ * ⚠️ 这条 `lazy` 现在**每次都会加载**：曲线不再按数据形状收起，所以一个全新的
+ * 账户也会去下载它。这是刻意的取舍 —— 分块仍在（它不阻塞首屏标题数字的绘制，
+ * 外壳与左栏先渲染、曲线稍后落位），但"数据薄时省掉这次下载"换不来稳定版面。
  */
 const EquityCurveChart = lazy(() =>
   import('../components/EquityCurveChart').then((module) => ({ default: module.EquityCurveChart })),
@@ -286,10 +287,6 @@ export function OverviewPage() {
 
   const listFailed = tradersQuery.error !== null && tradersQuery.data === null;
 
-  /* --- 曲线形态：决定主区是画图表、还是收成一条紧凑的缩略线（§4） ------- */
-  const shape = equityShape(curve);
-  const rangeLabel = range === 'ALL' ? '全部区间' : `近 ${range}`;
-
   const pnlTone = (value: number): 'default' | 'up' | 'down' =>
     value > 0 ? 'up' : value < 0 ? 'down' : 'default';
 
@@ -489,7 +486,23 @@ export function OverviewPage() {
             <ErrorNote>{equityQuery.error}</ErrorNote>
           ) : equityQuery.loading && equityQuery.data === null ? (
             <EquitySkeleton />
-          ) : shape.hasShape ? (
+          ) : (
+            /*
+             * ⚠️ **永远画完整曲线，不再按数据形状决定展开还是收成一条缩略线。**
+             *
+             * 原来的规则是"有形状（≥3 点且有波动）才展开，否则塌成 36px 的
+             * `EquityStrip`"。理由本身没错（§4：不要拿三分之一屏去画一条直线），
+             * 但它带来一个更糟的问题：**同一块版面会随数据变高变矮** ——
+             * 机器人还没跑够两个周期时是一行缩略线，跑够了突然长成 240px 图表，
+             * 整页其它区块跟着上下跳。用户的原话是「这个图标默认就要展开显示，
+             * 不管有没有数据都要保持展开状态一致」。
+             *
+             * 高度稳定比"省那 200px"重要：这一页是首屏，它会跳就意味着每次
+             * 刷新都要重新找一遍"我的机器人在哪"。
+             *
+             * 数据不足时的提示没有丢：曲线没有点可画时 `EquityCurveChart`
+             * 自己会给空态说明。
+             */
             <Panel padded={false} bodyClassName="p-3">
               <Suspense fallback={<EquitySkeleton />}>
                 <EquityCurveChart
@@ -501,14 +514,6 @@ export function OverviewPage() {
                 />
               </Suspense>
             </Panel>
-          ) : (
-            <EquityStrip
-              points={curve}
-              change={equityChange}
-              changePercent={equityChangePercent}
-              rangeLabel={rangeLabel}
-              flat={shape.flat}
-            />
           )}
         </section>
 
