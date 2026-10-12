@@ -217,8 +217,24 @@ const TIER_GROUP_LADDERS: Readonly<Record<string, readonly string[]>> = {
  * ⚠️ 未知角色退回调用方给的 `baseMaxTokens` —— **不改既有行为**。
  */
 export const ROLE_MAX_TOKENS: Readonly<Record<string, number>> = {
-  /* 分析师：描述性任务，短输出。 */
-  market_analyst: 1024,
+  /*
+   * ── ⚠️ **`market_analyst` 必须 2048，不能 1024**（2026-10-12 实测）───────
+   *
+   * 我第一版给了 1024（理由是"分析师是描述性任务"），但实测发现
+   * **它恰好卡在临界点上**（同一组、同一提示词，只变预算与材料规模）：
+   * ```
+   *    6 标的（26,252 字符）mt=1024 → 11.7s · content= 779 字  ✅
+   *    6 标的（26,252 字符）mt=2048 → 34.5s · content= 931 字  ✅
+   *   12 标的（54,971 字符）mt=1024 → 16.5s · content=   0 字  ❌
+   *   12 标的（54,971 字符）mt=2048 → 26.8s · content=3917 字  ✅ ← 2048 就够
+   * ```
+   * `content = 0 字` 会让角色判定失败 → 触发重试 → **白烧一轮**。
+   *
+   * ⚠️ 它是**唯一读全量候选**的角色（`technical` 读的是限流后的材料），
+   * 所以预算要更宽。而 T2 的超时线是 **180 秒** —— 26.8 秒用得起。
+   */
+  market_analyst: 2048,
+  /* 其他分析师：材料已被限流，1024 够用（实测 6 标的给 779 字）。 */
   technical: 1024,
   newscaster: 1024,
   sentiment: 1024,
