@@ -669,6 +669,51 @@ export class TraderManager {
    * the bot — it can only delay a notification. That separation is what makes it
    * safe to attach a streaming dependency to a system that must run unattended.
    */
+  /**
+   * **写状态并推送**（2026-10-13 加）—— 修一个真实的"自相矛盾"。
+   *
+   * ## 用户报的现象
+   *
+   * > 「明显BUG，运行状态一边停止，一边是运行中」
+   *
+   * 截图里同时出现：页头徽章「**运行中**」，而按钮是「**启动**」。
+   *
+   * ## 根因：`manager.ts` 里 9 处 `traders.setStatus` **全都只写数据库、不推送**
+   *
+   * ```
+   *   autoTrader.ts（正确）:
+   *     setStatus() { traderStore.setStatus(...); eventBus.publish({type:'trader_status'}) }
+   *
+   *   manager.ts（9 处，错）:
+   *     traders.setStatus(traderId, 'stopped', null);   ← 无推送
+   * ```
+   *
+   * 于是点"停止"之后：
+   * ```
+   *   REST 重新拉取 → trader.status = 'stopped' → 按钮变「启动」   ✅
+   *   WebSocket 从未收到 stopped 推送 → liveStatus 仍是旧的 running
+   *                                     → 徽章显示「运行中」      ❌
+   * ```
+   * **两个数据源说的是两件事**，界面就自相矛盾了。
+   *
+   * ## 为什么之前没被发现
+   *
+   * 前端的 `status = liveStatus ?? trader?.status` **假设"推送总是比 REST 新"** ——
+   * 而这里的情况恰好相反：**推送压根没发**，于是 REST 是对的、推送是陈旧的。
+   *
+   * ⚠️ 修法放在**服务端**（而不是让前端去猜哪个更新）：推送缺了就是缺了，
+   * 前端无论怎么合并都补不出一个从未发出的通知。
+   */
+  private setTraderStatus(traderId: number, status: TraderStatus, error: string | null = null): void {
+    traders.setStatus(traderId, status, error);
+    eventBus.publish({
+      type: 'trader_status',
+      traderId,
+      status,
+      ...(error === null ? {} : { detail: error }),
+    });
+  }
+
   private async startUserStream(traderId: number, connection: ExchangeConnection): Promise<void> {
     if (!connection.rest.hasCredentials) return;
 
@@ -1867,7 +1912,7 @@ export class TraderManager {
       if (blocking.length > 0) {
         dropConnections(this.connections, traderId);
         const message = blocking.map((c) => `${c.name}: ${c.detail}`).join(' ');
-        traders.setStatus(traderId, 'error', message);
+        this.setTraderStatus(traderId, 'error', message);
         return {
           result: { ok: false, error: message, preflight: checks },
           permanent: isPermanentStartFailure(message),
@@ -2364,7 +2409,7 @@ export class TraderManager {
       log.error(`启动机器人 ${traderId} 失败：${message}`);
       this.running.delete(traderId);
       dropConnections(this.connections, traderId);
-      traders.setStatus(traderId, 'error', message);
+      this.setTraderStatus(traderId, 'error', message);
       return {
         result: { ok: false, error: message, preflight: checks },
         permanent: isPermanentStartFailure(message),
@@ -2424,7 +2469,7 @@ export class TraderManager {
     const generation = (this.startGeneration.get(traderId) ?? 0) + 1;
     this.startGeneration.set(traderId, generation);
 
-    traders.setStatus(traderId, 'starting', null);
+    this.setTraderStatus(traderId, 'starting', null);
 
     /*
      * ⚠️ **"卡在启动中"本身是个 bug，必须有兜底（2026-10-10 实测）。**
@@ -2459,7 +2504,7 @@ export class TraderManager {
         `启动仍在进行中，已超过 ${Math.round(START_WATCHDOG_MS / 1000)} 秒未完成` +
         '（可能是 AI 模型不可用导致的长重试）。请等待它结束；若持续不结束请看服务器日志。';
       log.error(`机器人 ${traderId} ${message}`);
-      traders.setStatus(traderId, 'error', message);
+      this.setTraderStatus(traderId, 'error', message);
     }, START_WATCHDOG_MS);
     /* 别让这个定时器拖住进程退出。 */
     startWatchdog.unref?.();
@@ -2471,14 +2516,14 @@ export class TraderManager {
         if (result.ok) return;
         log.warn(`机器人 ${traderId} 启动失败：${result.error ?? '未知错误'}`);
         /* 失败必须落到 `error` —— 否则状态会停在 `starting` 上（见看门狗）。 */
-        traders.setStatus(traderId, 'error', result.error ?? '启动失败');
+        this.setTraderStatus(traderId, 'error', result.error ?? '启动失败');
       })
       .catch((error: unknown) => {
         clearTimeout(startWatchdog);
         if (this.startGeneration.get(traderId) !== generation) return;
         const message = (error as Error).message;
         log.error(`机器人 ${traderId} 启动时抛错：${message}`);
-        traders.setStatus(traderId, 'error', message);
+        this.setTraderStatus(traderId, 'error', message);
       });
     return { ok: true, preflight: [] };
   }
@@ -2509,10 +2554,10 @@ export class TraderManager {
     if (autoTrader) {
       /* 掐断在途的 AI 请求 —— 这是"停止"要立即生效的那部分。 */
       autoTrader.abortInFlightCycle();
-      traders.setStatus(traderId, 'stopped', null);
+      this.setTraderStatus(traderId, 'stopped', null);
       await autoTrader.stop();
     } else {
-      traders.setStatus(traderId, 'stopped', null);
+      this.setTraderStatus(traderId, 'stopped', null);
     }
     this.cancelFillReconcile(traderId);
     /*
@@ -3076,7 +3121,7 @@ export class TraderManager {
        * (`status='error'` + `lastError`, which `TradersPage` renders).
        */
       const detail = `启动恢复失败，已停止自动重试，需要人工处理：${result.error ?? '未知错误'}`;
-      traders.setStatus(trader.id, 'error', detail);
+      this.setTraderStatus(trader.id, 'error', detail);
       runtimeLogs.write(trader.id, 'error', 'manager', detail);
       eventBus.publish({
         type: 'log',

@@ -133,6 +133,7 @@ import {
   FileText,
   LoaderCircle,
   Lock,
+  Maximize2,
   RotateCw,
   Sparkles,
   TriangleAlert,
@@ -543,6 +544,8 @@ export function DecisionFeed({
   actions,
   nextCycleAt = null,
   mode = 'strategy',
+  focusMode = false,
+  onToggleFocus,
 }: {
   traderId: number;
   running?: boolean;
@@ -558,6 +561,17 @@ export function DecisionFeed({
    * 不传 `mode` 就与改动前逐字节一致。
    */
   mode?: 'strategy' | 'ai_managed' | 'ai_team';
+  /**
+   * **是否处于"决策流占满整页"的聚焦模式**（2026-10-13 用户要求）。
+   *
+   * 用户原话：
+   * > 「这一块UI展示区域太小了，根本显示不了这么多，**直接跳转把这块占用全部页面**」
+   *
+   * ⚠️ 默认 `false` —— 不传就与改动前完全一致（三种模式都不受影响）。
+   */
+  focusMode?: boolean;
+  /** 退出聚焦模式（聚焦时在工具栏显示「返回」）。 */
+  onToggleFocus?: () => void;
 }) {
   const live = useEvents((s) => s.byTrader[traderId]?.decisions);
   const liveCycle = useLiveCycle(traderId);
@@ -915,6 +929,25 @@ export function DecisionFeed({
       <Link to="/data" className="text-xs text-ink-lo transition hover:text-accent">
         全部记录
       </Link>
+      {/*
+        ── **全屏切换**（2026-10-13 用户要求）──────────────────────────────
+        用户原话：
+        > 「这一块UI展示区域太小了，根本显示不了这么多，**直接跳转把这块占用全部页面**」
+
+        ⚠️ 只在**调用方提供了 `onToggleFocus`** 时显示 ——
+        于是其他页面（概览、常见问题）的用法完全不变。
+      */}
+      {onToggleFocus !== undefined && (
+        <button
+          type="button"
+          onClick={onToggleFocus}
+          title={focusMode ? '返回常规视图（图表与账户卡）' : '让决策流占满整页 —— 团队看板在 40% 宽度下装不下'}
+          className="inline-flex items-center gap-1 rounded px-1.5 py-1 text-xs text-ink-lo transition hover:text-ink-hi"
+        >
+          <Maximize2 aria-hidden className="h-3.5 w-3.5" />
+          {focusMode ? '退出全屏' : '全屏'}
+        </button>
+      )}
     </span>
   );
 

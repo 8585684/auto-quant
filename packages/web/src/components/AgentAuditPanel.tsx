@@ -106,35 +106,74 @@ export function AgentAuditPanel({ traderId }: { traderId: number }): React.React
   const memory = data?.memory ?? [];
   const total = runs.length + experiments.length + memory.length;
 
+  /*
+   * ── **整个面板默认收起**（2026-10-13 用户要求）────────────────────────
+   *
+   * 用户的原话：
+   * > 「这一块功能有存在的价值吗？（我作为真人来说没有看出来这个有什么用，
+   * >  也不知道他是干嘛的，你先做**最小化调整改动，做成默认收缩隐藏**）」
+   *
+   * ## 他说得对：默认展开时它只是占地方
+   *
+   * 默认展开的样子是「标题 + 一句说明 + 三个都收起的行」——
+   * **一个字的有用信息都没给，却占了一整屏的宽度与高度**。
+   * 而三张表各自**本来就是收起**的（`Section` 的 `useState(false)`），
+   * 所以用户看到的就是一个"什么都没显示的大框"。
+   *
+   * ## 为什么保留它（而不是删掉）
+   *
+   * 它是用户 2026-10-12 明确要求的「**汇报工作的**」那一环 ——
+   * 数据是真的（`#10` 上 runs 280 / experiments 24 / memory 90），
+   * 只是**默认不该占地方**。
+   *
+   * ⚠️ 收起时把**条数**显示在标题上（`智能体审计 · 3 类记录`）——
+   * 否则"收起了"与"没数据"在界面上长得一样。
+   */
+  const [open, setOpen] = useState(false);
+
   return (
-    <Panel title="智能体审计">
-      <p className="mb-2 px-3 pt-3 text-xs text-ink-faint">
-        团队做过什么、改了什么、学到了什么 —— 这三张表此前在界面上完全看不到。
-      </p>
-      {query.loading && data === undefined ? (
-        <div className="px-3 py-3 text-base text-ink-faint">正在读取…</div>
-      ) : total === 0 ? (
-        <div className="px-3 py-3 text-base text-ink-faint">
-          还没有审计记录。机器人跑过一轮、或 AI 调整过一次参数之后，这里就会有内容。
-        </div>
-      ) : (
-        <div className="overflow-hidden rounded-md border border-base-700">
-          <Section title="运行轨迹" hint="谁跑了、多久、花了多少 token" count={runs.length}>
-            {runs.length === 0 ? (
-              <p className="text-xs text-ink-faint">还没有运行记录。</p>
-            ) : (
-              <table className="w-full text-xs">
-                <thead>
-                  <tr className="text-left text-ink-faint">
-                    <th className="py-1 font-normal">时刻</th>
-                    <th className="py-1 font-normal">类型</th>
-                    <th className="py-1 font-normal">触发</th>
-                    <th className="py-1 font-normal">结果</th>
-                    <th className="py-1 text-right font-normal">token</th>
-                    <th className="py-1 text-right font-normal">耗时</th>
-                  </tr>
-                </thead>
-                <tbody>
+    <Panel>
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        className="flex w-full items-center gap-2 px-3 py-2 text-left hover:bg-base-850"
+        title="团队做过什么、改了什么、学到了什么 —— 点开查看"
+      >
+        <span className="text-base font-medium text-ink-hi">智能体审计</span>
+        <span className="num text-xs text-ink-faint">
+          {total === 0 ? '暂无记录' : `${total} 条记录`}
+        </span>
+        <span className="min-w-0 flex-1 truncate text-xs text-ink-faint">
+          团队做过什么、改了什么、学到了什么
+        </span>
+        <span className="shrink-0 text-xs text-ink-faint">{open ? '收起' : '展开'}</span>
+      </button>
+      {open && (
+        <div className="border-t border-base-700">
+          {query.loading && data === undefined ? (
+            <div className="px-3 py-3 text-base text-ink-faint">正在读取…</div>
+          ) : total === 0 ? (
+            <div className="px-3 py-3 text-base text-ink-faint">
+              还没有审计记录。机器人跑过一轮、或 AI 调整过一次参数之后，这里就会有内容。
+            </div>
+          ) : (
+            <div className="overflow-hidden rounded-md border border-base-700">
+              <Section title="运行轨迹" hint="谁跑了、多久、花了多少 token" count={runs.length}>
+                {runs.length === 0 ? (
+                  <p className="text-xs text-ink-faint">还没有运行记录。</p>
+                ) : (
+                  <table className="w-full text-xs">
+                    <thead>
+                      <tr className="text-left text-ink-faint">
+                        <th className="py-1 font-normal">时刻</th>
+                        <th className="py-1 font-normal">类型</th>
+                        <th className="py-1 font-normal">触发</th>
+                        <th className="py-1 font-normal">结果</th>
+                        <th className="py-1 text-right font-normal">token</th>
+                        <th className="py-1 text-right font-normal">耗时</th>
+                      </tr>
+                    </thead>
+                    <tbody>
                   {runs.map((r) => (
                     <tr key={r.id} className="border-t border-base-700/40">
                       <td className="num py-1 whitespace-nowrap text-ink-faint">{stamp(r.createdAt)}</td>
@@ -209,6 +248,8 @@ export function AgentAuditPanel({ traderId }: { traderId: number }): React.React
               </ul>
             )}
           </Section>
+            </div>
+          )}
         </div>
       )}
     </Panel>

@@ -184,6 +184,25 @@ export function TraderPage() {
    * 换一段窗口本来就该重新看一眼。
    */
   const [chartOverride, setChartOverride] = useState<boolean | null>(null);
+  /*
+   * **决策流聚焦模式**（2026-10-13 用户要求）。
+   *
+   * 用户的原话：
+   * > 「这一块UI展示区域太小了，根本显示不了这么多，**直接跳转把这块占用全部页面**。
+   * >  把结论那块移动到左边」
+   *
+   * ## 为什么用"聚焦开关"而不是直接改成全宽
+   *
+   * 右栏（决策流）在 xl 下只占 `flex-[2]`（40%），而团队看板要显示
+   * 总管 + 4 分析师 + 辩论 + 裁决 + 风控，**40% 宽确实装不下**。
+   *
+   * 但**直接改成全宽会牺牲行情图表与账户卡片** —— 那些也是操作员要看的东西。
+   * 所以做成**一个可切换的视图**：需要细看团队时点「全屏」，看完点「返回」。
+   *
+   * ⚠️ 默认 `false`（保持既有布局）—— 三种模式都受影响，
+   * 所以不能替用户改默认值。
+   */
+  const [feedFocus, setFeedFocus] = useState(false);
   const { runOnce, busyId: runOnceBusyId } = useRunOnce();
   const { requestReview, busyId: reviewBusyId } = useAgentReview();
 
@@ -712,7 +731,31 @@ export function TraderPage() {
     () => hasEquityVariation(windowed.map((snapshot) => snapshot.equity)),
     [windowed],
   );
-  const curveCollapsed = chartOverride ?? !curveHasShape;
+  /*
+   * ── **没有数据时不要折叠**（2026-10-13 用户要求，针对所有模式）──────────
+   *
+   * 用户的原话：
+   * > 「图表这个你修复一下（针对所有模式生效），就是**没有数据的前提下，
+   * >  也是默认完整展开的**，不像现在这样没有数据就折叠状态」
+   *
+   * ## 原来为什么错
+   *
+   * 折叠的判据是 `!curveHasShape` —— 而 `hasEquityVariation([])` 返回 `false`，
+   * 于是**"没有数据"与"有数据但太平"被混成了同一件事**：
+   * ```
+   *   windowed.length === 0 → 折叠 → 只显示一条 36px 的"还没有权益快照…"
+   * ```
+   * 而那两种情况的**用户意图完全不同**：
+   * ```
+   *   没有数据      → 我想看到"这里应该有什么、为什么还没有"（需要一个可见的位置）
+   *   有数据但太平  → 我想把高度让给决策流（折叠是对的）
+   * ```
+   *
+   * 所以判据要**先排除"没有数据"** —— 那时**完整展开**，
+   * 让空图表与说明占住它该占的位置。
+   */
+  const curveHasNoData = windowed.length === 0;
+  const curveCollapsed = chartOverride ?? (!curveHasNoData && !curveHasShape);
 
   const model = modelsQuery.data?.find((row) => row.id === trader?.aiModelId) ?? null;
   const strategy = strategiesQuery.data?.find((row) => row.id === trader?.strategyId) ?? null;
@@ -1290,6 +1333,42 @@ export function TraderPage() {
      */
     <div className="flex h-full min-h-0 flex-col gap-4">
       <div className="min-h-0 flex-1">
+      {/*
+        ── **聚焦模式：决策流独占整页**（2026-10-13 用户要求）────────────────
+        用户原话：
+        > 「这一块UI展示区域太小了，根本显示不了这么多，**直接跳转把这块占用全部页面**」
+
+        焦点模式下**不渲染主内容**（图表、账户卡、成交表）——
+        那些内容在别的视图里看得到，而团队看板需要的是**宽度**。
+      */}
+      {feedFocus ? (
+        <div className="flex h-full min-h-0 flex-col">
+          <div className="mb-2 flex shrink-0 items-center gap-2">
+            <Button variant="ghost" onClick={() => setFeedFocus(false)} title="返回常规视图（图表与账户卡）">
+              ← 返回
+            </Button>
+            <span className="text-sm text-ink-faint">
+              决策流已占满整页 —— 这样团队看板才装得下
+            </span>
+          </div>
+          <div className="min-h-0 flex-1">
+            <DecisionFeed
+              traderId={traderId}
+              running={running}
+              mode={trader?.mode ?? 'strategy'}
+              nextCycleAt={trader?.nextCycleAt ?? null}
+              onToggleFocus={() => setFeedFocus(false)}
+              focusMode
+              actions={
+                <>
+                  {runNowAction}
+                  {reviewAction}
+                </>
+              }
+            />
+          </div>
+        </div>
+      ) : (
       <PageShell
         aside={
           <DecisionFeed
@@ -1641,16 +1720,31 @@ export function TraderPage() {
           **智能体审计**（用户 2026-10-12 要求的「汇报工作的」那一环）。
 
           它把三张此前**前端完全不可见**的表呈现出来
-          （`agent_runs` / `agent_experiments` / `agent_memory`）——
-          仓储层一直有，API 一直没有，于是界面上"它在跑"却看不到"它在学"。
+          （`agent_runs` / `agent_experiments` / `agent_memory`）。
 
-          ⚠️ **不按模式隐藏**：这三张表是 `ai_managed` 就有的（AI 自己调参 + 复盘），
-          团队模式会往里面写更多（每个角色一条）。所以"有没有数据"决定显示什么，
-          而不是模式决定显不显示。
+          ── ⚠️ 2026-10-13 用户报的问题（**我越界了**）──────────────────────
+          > 「还有你做的这个，为什么会出现在智能托管模式机器人里面（赚大钱）？
+          >  你这次更新不都是只针对团队模式吗？」
+
+          用户说得对。这条硬约束写在需求里：
+          > 「你现在的更新迭代**不要影响我现在实盘跑的机器人**：赚大钱」
+
+          `#10 赚大钱` 是 `ai_managed`，而我**主动**让它显示了新面板 ——
+          代码注释里我甚至写着「不按模式隐藏」，理由是"那三张表 ai_managed 也有"。
+
+          **那个理由混淆了两件事**：
+          ```
+            数据存在      ≠ 用户要在这个模式里看到新界面
+          ```
+          实测那三张表在 `#10` 上确实有数据（runs 280 / experiments 24 /
+          memory 90），**但那是既有 AI 托管的行为**，不是"应该给它加个新面板"的理由。
+
+          所以现在**只对 `ai_team` 显示** —— 与本次大更新的边界一致。
         */}
-        <AgentAuditPanel traderId={traderId} />
+        {trader.mode === 'ai_team' && <AgentAuditPanel traderId={traderId} />}
 
       </PageShell>
+      )}
       </div>
 
       {/*
