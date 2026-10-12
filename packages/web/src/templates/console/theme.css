@@ -727,6 +727,23 @@ html.aq-console .textarea {
   color: var(--aq-ink);
   font-size: 12.5px;
   height: 28px;
+  /*
+   * ⚠️ **竖向 padding 必须归零。**
+   *
+   * `index.css` 的 `.input/.select/.textarea` 带着 `py-2`（上下各 8px），而这里
+   * 把高度钉死在 28px。不归零的话内容盒只剩 28 − 8 − 8 − 2 = **10px**，
+   * 而行盒是 `text-md` 的 **21px** —— Chromium 把这个行盒在内容盒里居中后
+   * 上下各裁掉 5.5px，<select> 的当前选中项就变成了**只看得到中间半截**。
+   * 用户报的「下拉框还是有 BUG」就是这个：截图里没有一行选项名能读全。
+   *
+   * <input> 看不出问题纯属巧合：Chromium 对 input 会在内容盒里重新居中文字，
+   * 对 select 则按行盒排版再交给 overflow 裁 —— 所以同一个高度下只有下拉框坏。
+   *
+   * 高度既然由 `height` 说了算，竖向 padding 在这里只是来抢内容盒的空间。
+   * `.textarea` 在下面单独设回 6px（它 `height: auto`，需要这个内边距）。
+   */
+  padding-top: 0;
+  padding-bottom: 0;
   padding-left: 8px;
   padding-right: 8px;
 }

@@ -63,6 +63,17 @@ function cssRules(css: string): Array<{ selectors: string[]; body: string }> {
   return out;
 }
 
+/**
+ * 这条规则命中的是不是**下拉框**。
+ *
+ * ⚠️ 用**类名的词边界**，不是 `includes('.select')`：`tr.selected`（数据表格的
+ * 选中行）里也含 `.select` 这七个字符，但它是一个不同的类。假阳性在这里的
+ * 代价是**测试报出一条并不存在的 bug**，而那种红会训练人以后忽略这条用例。
+ *
+ * 提成模块级是因为**两条用例都要用它**（箭头那条、竖向 padding 那条）。
+ */
+const hitsSelect = (selector: string): boolean => /\.select(?![\w-])/.test(selector);
+
 /* -------------------------------------------------------------------------- */
 /*  注册表本身                                                                  */
 /* -------------------------------------------------------------------------- */
@@ -330,16 +341,6 @@ test('★ 下拉框的箭头不能被 `background` 简写打散', () => {
    */
   const rules = cssRules(stripComments(src('templates/console/theme.css')));
 
-  /*
-   * ⚠️ 判"这条规则命中下拉框"用的是**类名的词边界**，不是 `includes('.select')`。
-   *
-   * 第一版写成 `includes('.select')`，于是 `tr.selected`（数据表格的选中行）
-   * 也被算了进来 —— 它里面确实有 `.select` 这七个字符，但那是一个不同的类。
-   * 假阳性在这里的代价是**测试报出一条并不存在的 bug**，而那种红会训练人
-   * 以后忽略这条用例。
-   */
-  const hitsSelect = (selector: string): boolean => /\.select(?![\w-])/.test(selector);
-
   const shorthand = rules.filter(
     (rule) =>
       rule.selectors.some(hitsSelect) &&
@@ -373,6 +374,75 @@ test('★ 下拉框的箭头不能被 `background` 简写打散', () => {
       `html.aq-console .select 缺少 ${longhand} —— 四条 background-* 必须写在同一个地方，否则箭头会变形或平铺。`,
     );
   }
+});
+
+test('★ 下拉框的文字不能被竖向 padding 挤出内容盒', () => {
+  /*
+   * 用户报的现象：截图里**每一行选项名都只看得到中间半截**，上下被切掉。
+   * 同一个弹窗里的 `<input>` 完全正常 —— 所以看起来像"下拉框独有的 bug"。
+   *
+   * ## 成因（两个来源的数值叠在一起）
+   *
+   * `index.css` 的 `.input/.select/.textarea` 带着 `py-2`（上下各 8px）。
+   * 模板再把高度钉死在 28px（见下面那条 `height`）。于是内容盒只剩
+   * `28 − 8 − 8 − 2(边框) = 10px`，而行盒是 `text-md` 的 **21px** ——
+   * Chromium 把行盒在内容盒里居中后上下各裁掉 5.5px，选中项就成了半截字。
+   *
+   * `<input>` 看不出问题纯属巧合：Chromium 对 input 会在内容盒里**重新居中
+   * 文字**，对 select 则按行盒排版再交给 overflow 裁 —— 同一个高度下只有
+   * 下拉框坏。这也是为什么它值得一条断言：**读源码时两个数值都合理**，
+   * 只有量 computed style 才看得出来（实测 `padding: 8px` + `height: 28px`）。
+   *
+   * 高度既然由 `height` 说了算，竖向 padding 在这里就是来抢内容盒空间的。
+   */
+  const rules = cssRules(stripComments(src('templates/console/theme.css')));
+
+  /* 先确认前提还在：`index.css` 确实给了竖向 padding，否则这条断言就没意义。 */
+  const base = cssRules(stripComments(src('index.css')));
+  const fieldRule = base.find(
+    (rule) => rule.selectors.includes('.input') && rule.selectors.includes('.select'),
+  );
+  assert.ok(fieldRule, '找不到 `index.css` 里 `.input, .select, .textarea` 那条规则。');
+  assert.match(
+    fieldRule!.body,
+    /@apply[^;]*\bpy-2\b/,
+    '`index.css` 的字段规则不再带 `py-2` —— 如果竖向 padding 已经去掉，' +
+      '下面那条"必须归零"的断言就该一起删掉，别让它变成一条永远为真的空话。',
+  );
+
+  /*
+   * ⚠️ 判的是**命中下拉框的每一条规则**，不是单看 `html.aq-console .select` 那一条。
+   *
+   * 竖向归零写在共享的 `html.aq-console .input, .select, .textarea` 里（高度
+   * 也在那儿），而 `.select` 单列那条只管箭头。第一版断言只查后者，于是它
+   * 报了一条**并不存在的 bug** —— 规则确实写了，只是写在另一条里。
+   * 这种假阳性会训练人以后忽略这条用例，所以按"命中谁"来查。
+   */
+  const hits = rules.filter((rule) => rule.selectors.some(hitsSelect));
+  assert.ok(hits.length > 0, '模板里没有任何命中 `.select` 的规则。');
+
+  const zeroed = (prop: string): boolean =>
+    hits.some((rule) => new RegExp(`${prop}\\s*:\\s*0(?![\\d.])`).test(rule.body));
+
+  for (const prop of ['padding-top', 'padding-bottom']) {
+    assert.ok(
+      zeroed(prop),
+      `控制台模板没有给下拉框写 \`${prop}: 0\` —— 它继承了 index.css 的 ` +
+        '`py-2`，而高度是钉死的 28px，竖向 padding 会把行盒挤出内容盒，' +
+        '选中项只显示半截字。',
+    );
+  }
+
+  /* 横向 padding 仍然是刻意的：它是给右侧箭头留位子的，不能一起归零。 */
+  const selectRule = rules.find(
+    (rule) => rule.selectors.length === 1 && rule.selectors[0] === 'html.aq-console .select',
+  );
+  assert.ok(selectRule, '找不到 `html.aq-console .select` 这条规则。');
+  assert.match(
+    selectRule!.body,
+    /padding-right\s*:/,
+    'html.aq-console .select 不能把 padding-right 也归零 —— 那是箭头的位置。',
+  );
 });
 
 test('★ registry.ts 保持纯数据：不许 import CSS', () => {
