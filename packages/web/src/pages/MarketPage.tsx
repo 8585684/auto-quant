@@ -16,6 +16,7 @@ import { useEvents } from '../lib/store';
 import { useDocumentTitle, usePolled } from '../lib/hooks';
 import { Badge, Button, Empty, ErrorNote, Panel, Spinner3, TextInput, cn } from '../components/ui';
 import { CandlestickChart } from '../components/CandlestickChart';
+import { PageActions } from '../templates/lib/PageActions';
 import { fmtCompactAmount, fmtPercent, fmtPriceUsd, pnlColor } from '../lib/format';
 
 const INTERVALS = ['1m', '5m', '15m', '1h', '4h', '1d'] as const;
@@ -319,14 +320,23 @@ export function MarketPage() {
               </span>
             }
             actions={
+              /*
+               * 「刷新」是页面级动作 → 统一接口；「每 15s 自动刷新」是**说明文字**，
+               * 不属于动作，所以它留在原地（`Panel` 的 actions 槽里），只有按钮被
+               * portal 进工具栏。
+               */
               <span className="flex items-center gap-2">
                 <span className="num hidden text-xs text-ink-faint sm:inline">
                   {klinesQuery.loading ? '加载中…' : '每 15s 自动刷新'}
                 </span>
-                <Button size="sm" busy={klinesQuery.loading} onClick={() => klinesQuery.reload()}>
-                  <RefreshCw aria-hidden className="h-3.5 w-3.5" />
-                  刷新
-                </Button>
+                <PageActions
+                  start={
+                    <Button size="sm" busy={klinesQuery.loading} onClick={() => klinesQuery.reload()}>
+                      <RefreshCw aria-hidden className="h-3.5 w-3.5" />
+                      刷新
+                    </Button>
+                  }
+                />
               </span>
             }
             bodyClassName="p-1"

@@ -12,6 +12,7 @@ import { useRunOnce } from '../lib/actions';
 import { Button, ErrorNote, Modal, Panel, Spinner3, cn } from '../components/ui';
 import { SectionHeading, TraderStatusBadge } from '../components/Badges';
 import { Metric, SectionLabel } from '../components/shell';
+import { PageActions } from '../templates/lib/PageActions';
 import { NewTraderModal, StartTraderModal } from '../components/TraderModals';
 import { TraderConfigModal } from '../components/TraderConfigModal';
 import { NET_PNL_FORMULA, PnlBreakdown, pnlFormulaText, statsCosts, type PnlCosts } from '../components/PnlBreakdown';
@@ -184,9 +185,23 @@ export function TradersPage() {
         title="机器人"
         sub="每个机器人 = 一份交易所凭证 + 一个 AI 模型 + 一套策略，按固定间隔循环决策。"
         right={
-          <Button variant="primary" onClick={() => setNewOpen(true)}>
-            + 新建机器人
-          </Button>
+          /*
+           * 动作走**统一接口**（`templates/lib/PageActions.tsx`）：
+           *
+           *   · 控制台模板有工具栏 → 这两个按钮被 portal 进那条 40px 的带子，
+           *     位置固定、永远可见，破坏性的「新建」靠右；
+           *   · 经典模板没有工具栏 → **就地渲染**，也就是这一行原来的样子。
+           *
+           * 页面只说"有什么动作"，不说"放哪"。两种模板下渲染的是同一批按钮，
+           * 所以切模板不会丢功能。
+           */
+          <PageActions
+            end={
+              <Button variant="primary" onClick={() => setNewOpen(true)}>
+                + 新建机器人
+              </Button>
+            }
+          />
         }
       />
 
@@ -247,9 +262,13 @@ export function TradersPage() {
               count={traders.length}
               className="mb-2 px-3 pt-3"
               actions={
-                <Button size="sm" variant="ghost" busy={tradersQuery.loading} onClick={() => void tradersQuery.reload()}>
-                  刷新
-                </Button>
+                <PageActions
+                  start={
+                    <Button size="sm" variant="ghost" busy={tradersQuery.loading} onClick={() => void tradersQuery.reload()}>
+                      刷新
+                    </Button>
+                  }
+                />
               }
             />
             {/*

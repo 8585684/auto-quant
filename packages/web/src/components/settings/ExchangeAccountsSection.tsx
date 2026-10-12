@@ -39,6 +39,7 @@ import {
 } from '../ui';
 import { CheckList } from '../Badges';
 import { Metric, MetricGroup, PageShell, SectionLabel } from '../shell';
+import { PageActions } from '../../templates/lib/PageActions';
 import { BalanceCell } from '../BalanceCells';
 import {
   BALANCE_LABEL,
@@ -563,19 +564,30 @@ export function ExchangeAccountsSection() {
                   <span className="hidden text-xs text-ink-faint lg:inline">
                     「刷新」绕过服务端缓存
                   </span>
-                  <Button
-                    size="sm"
-                    busy={refreshingAll}
-                    title="强制刷新所有凭证的实时余额（绕过服务端缓存）"
-                    onClick={() => void refreshAll(accounts.map((row) => row.id))}
-                  >
-                    <RotateCw aria-hidden className="h-3.5 w-3.5" />
-                    刷新全部
-                  </Button>
-                  <Button variant="primary" size="sm" onClick={openCreate} disabled={exchanges.length === 0}>
-                    <Plus aria-hidden className="h-3.5 w-3.5" />
-                    添加凭证
-                  </Button>
+                  {/*
+                    两个按钮走统一接口：控制台模板收进工具栏，经典模板就地显示。
+                    上面那行说明文字**不是动作**，留在原地 —— 工具栏里放一句
+                    "「刷新」绕过服务端缓存"会把 40px 的带子变成一段说明。
+                  */}
+                  <PageActions
+                    start={
+                      <Button
+                        size="sm"
+                        busy={refreshingAll}
+                        title="强制刷新所有凭证的实时余额（绕过服务端缓存）"
+                        onClick={() => void refreshAll(accounts.map((row) => row.id))}
+                      >
+                        <RotateCw aria-hidden className="h-3.5 w-3.5" />
+                        刷新全部
+                      </Button>
+                    }
+                    end={
+                      <Button variant="primary" size="sm" onClick={openCreate} disabled={exchanges.length === 0}>
+                        <Plus aria-hidden className="h-3.5 w-3.5" />
+                        添加凭证
+                      </Button>
+                    }
+                  />
                 </>
               }
             />
