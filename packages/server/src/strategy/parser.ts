@@ -808,6 +808,22 @@ export function parseDecisionResponse(raw: string, ctx: ParseContext): ParsedDec
       limitPrice,
       /* 只有限价单才有"等多久"可言 —— 市价单立即成交，等多久无意义。 */
       waitMinutes: entryType === 'limit' ? (coerced.wait_minutes ?? null) : null,
+      /*
+       * **这条决策依据了哪几条情报**（2026-10-12 新增）。
+       *
+       * ⚠️ 只在模型真的给了且非空时才带上这个键 ——
+       * 纯技术面决策**不写它**，于是 `Decision` 的形状与改动前一致
+       *（这是"增量更新"的硬要求：省略时行为完全不变）。
+       *
+       * ⚠️ **校验留在这里还是留给调用方？**
+       * 这里**只做形状校验**（非空字符串、去重）；"是不是我们给过它的情报"
+       * 需要**那次调用的情报列表** —— 那个信息不在解析器手上，
+       * 所以由调用方用 `filterKnownIntelKeys()` 再校验一遍。
+       * 两处分工：解析器保证"格式对"，调用方保证"没编造"。
+       */
+      ...(Array.isArray(coerced.intel_keys) && coerced.intel_keys.length > 0
+        ? { intelKeys: [...new Set(coerced.intel_keys.filter((k) => typeof k === 'string' && k.length > 0))] }
+        : {}),
       reasoning: coerced.reasoning ?? '',
       /*
        * 评分与它的依据 —— **原样带过去，不做任何加工**。

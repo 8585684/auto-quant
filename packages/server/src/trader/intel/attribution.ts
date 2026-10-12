@@ -94,3 +94,44 @@ export function signalsWithEnoughSamples(
   for (const a of all) counts.set(a.signalKey, (counts.get(a.signalKey) ?? 0) + 1);
   return [...counts.entries()].filter(([, n]) => n >= minSamples).map(([k]) => k);
 }
+
+/**
+ * **过滤掉模型"编造"的情报键**（2026-10-12，防幻觉的关键一环）。
+ *
+ * ## 为什么必须有它
+ *
+ * 模型被要求"标注这条决策依据了哪几条情报"。但**它可能写出一个不存在的情报键**：
+ *
+ * ```
+ *   给它的情报：coindesk.com|bullish|BTCUSDT
+ *   它写的：    bloomberg.com|bullish|BTCUSDT     ← 编的
+ * ```
+ *
+ * **后果（而且很隐蔽）**：那个编造的键会**永远只有一个样本**
+ *（因为下次不会再有同样的编造），于是：
+ * · 它永远达不到 `MIN_SAMPLES` → 失效检测对它**永不生效**；
+ * · 更糟的是，它让"归因数据"看起来比实际更丰富 ——
+ *   操作员会以为"这个信号有历史"，其实**一条都没有**。
+ *
+ * ## 判据：**只接受"这次真的给过它的"键**
+ *
+ * 这是唯一可靠的判据 —— 不能靠"域名看起来像不像真的"，
+ * 因为模型编的域名**看起来完全正常**。
+ *
+ * @param claimed 模型写出的键
+ * @param known 这次调用**实际给过它**的情报键
+ * @returns `kept` 通过校验的；`rejected` 被剔除的（**要记日志** —— 编造率本身是有用信号）
+ */
+export function filterKnownIntelKeys(
+  claimed: readonly string[],
+  known: readonly string[],
+): { kept: string[]; rejected: string[] } {
+  const allowed = new Set(known);
+  const kept: string[] = [];
+  const rejected: string[] = [];
+  for (const k of claimed) {
+    if (allowed.has(k)) kept.push(k);
+    else rejected.push(k);
+  }
+  return { kept, rejected };
+}

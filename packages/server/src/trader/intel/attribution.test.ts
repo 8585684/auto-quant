@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { signalKeyOf, tradesForSignal, signalsWithEnoughSamples, type Attribution } from './attribution.js';
+import { signalKeyOf, tradesForSignal, signalsWithEnoughSamples, filterKnownIntelKeys, type Attribution } from './attribution.js';
 import { assessSignal, SIGNAL_LIMITS } from './signalHealth.js';
 
 const at = (over: Partial<Attribution> = {}): Attribution => ({
@@ -81,4 +81,49 @@ test('★★★ 反应衰减需要 signalStrength —— 归因必须带上它',
 test('★ 空输入 → 空结果（不崩）', () => {
   assert.deepEqual(tradesForSignal([], 'x'), []);
   assert.deepEqual(signalsWithEnoughSamples([], 20), []);
+});
+
+test('★★★ 模型"编造"的情报键必须被剔除（防幻觉的关键）', () => {
+  /*
+   * ## 为什么必须有它
+   *
+   * 模型被要求标注"依据了哪几条情报"，但它可能写出**不存在的情报键**：
+   * ```
+   *   给它的：coindesk.com|bullish|BTCUSDT
+   *   它写的：bloomberg.com|bullish|BTCUSDT     ← 编的
+   * ```
+   *
+   * **后果很隐蔽**：那个编造的键会**永远只有一个样本**
+   *（下次不会再有同样的编造）→ 永远达不到 `MIN_SAMPLES` →
+   * 失效检测对它**永不生效**；而且它让归因数据**看起来比实际更丰富**。
+   *
+   * ⚠️ 判据只能是"**这次真的给过它的**" —— 不能靠"域名看起来像不像真的"，
+   * 因为模型编的域名**看起来完全正常**。
+   */
+  const known = ['coindesk.com|bullish|BTCUSDT', 'theblock.com|bearish|ETHUSDT'];
+  const r = filterKnownIntelKeys(
+    ['coindesk.com|bullish|BTCUSDT', 'bloomberg.com|bullish|BTCUSDT'],
+    known,
+  );
+  assert.deepEqual(r.kept, ['coindesk.com|bullish|BTCUSDT']);
+  assert.deepEqual(r.rejected, ['bloomberg.com|bullish|BTCUSDT'], '★ 编造的要被报出来');
+});
+
+test('★ 全部编造 → 全部剔除（决策仍成立，只是没有情报归因）', () => {
+  const r = filterKnownIntelKeys(['x.com|bullish|A'], ['y.com|bearish|B']);
+  assert.deepEqual(r.kept, []);
+  assert.equal(r.rejected.length, 1);
+});
+
+test('★ 没给过任何情报时，任何声称都不可信', () => {
+  /* 纯技术面决策却说"依据某情报" —— 那是编的。 */
+  const r = filterKnownIntelKeys(['a.com|bullish|BTCUSDT'], []);
+  assert.deepEqual(r.kept, []);
+});
+
+test('★ 合法键全部保留（不能误杀）', () => {
+  const known = ['a.com|bullish|BTCUSDT', 'b.com|bearish|ETHUSDT'];
+  const r = filterKnownIntelKeys(known, known);
+  assert.deepEqual(r.kept, known);
+  assert.deepEqual(r.rejected, []);
 });
