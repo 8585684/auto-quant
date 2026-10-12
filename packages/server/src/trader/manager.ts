@@ -23,6 +23,7 @@ import { ModelRouter } from '../llm/modelRouter.js';
 import { createMagpieCallFactory, discoverFromGateway } from './magpieGateway.js';
 import { resolveTeamGateway } from './teamGateway.js';
 import { collectMarketResearch, DEFAULT_SEARCH_ENDPOINT } from './agent/webSearch.js';
+import { runAgentTask } from './agent/harness.js';
 import { runSelfCheck } from './selfcheckRunner.js';
 import { createRoutedDecisionModel, createTeamDecisionModel, tierForRole } from './routedModel.js';
 
@@ -320,6 +321,16 @@ interface TeamModelBuild {
  */
 const SELF_CHECK_TIMEOUT_SECONDS = 120;
 
+/**
+ * **agent 的"办公室"** —— 每个机器人一个独立工作目录。
+ *
+ * 为什么要独立目录：harness 会在 `cwd` 里读写文件、存会话状态。
+ * 多个机器人共用一个目录会互相踩（一个的会话状态被另一个读到）。
+ */
+function agentWorkdir(traderId: number): string {
+  const base = process.env.AQ_AGENT_WORKDIR ?? '/opt/autoquant/data/agent-workspace';
+  return `${base}/trader-${traderId}`;
+}
 export class TraderManager {
   private readonly running = new Map<number, AutoTrader>();
   /**
@@ -930,6 +941,64 @@ export class TraderManager {
        * 端点可用 `MAGPIE_SEARCH_URL` 覆盖（默认 magpie 的标准位置）。
        */
       research: async (symbols) => {
+        /*
+         * ⚠️ **第一优先：让真 agent 自己去查**（2026-10-12 实测后改的）。
+         *
+         * ## 为什么换掉"直接调 MCP 搜索"
+         *
+         * 实测对照（同一个新闻调研任务）：
+         *
+         * | | 直接调搜索 / 单次模型调用 | harness agent |
+         * |---|---|---|
+         * | 情报产出 | 零（「我无法联网，没有工具」）| **3 条具体新闻 + 资金流 + 来源链接** |
+         *
+         * 差别在于 agent 会**自己决定查什么、查几轮、把结果综合成结论** ——
+         * 而"调一次搜索接口"只是把原始结果丢出来。
+         *
+         * 用户的原话：
+         * > 「智能体就像一个真人一样，公司干活的员工……能**自己上班干活**，
+         * >  而不是像机器人一样**问一次答一次**」
+         *
+         * ## 为什么仍然保留 MCP 搜索作为兜底
+         *
+         * harness 没装、超时、模型不认识 —— 任何一种都可能发生。
+         * **兜底不是"退化成没用"，而是"至少还有原始搜索数据"**。
+         */
+        const agentResult = await runAgentTask(
+          {
+            task:
+              `你是量化机构的新闻调研员。请联网查这几个标的**今天**的新闻与市场情绪：${symbols.join('、')}。\n\n` +
+              '要求：\n' +
+              '1. 每个标的给 1-3 条**真实的、带来源链接**的新闻（不要编造）；\n' +
+              '2. 说明该新闻对价格的方向含义（利多/利空/中性）；\n' +
+              '3. 如果查不到，**明确说查不到** —— 不要用常识填充成"新闻"；\n' +
+              '4. 最后用一段话概括当前市场情绪。',
+            allowedTools: 'WebSearch,WebFetch',
+            model: process.env.AQ_RESEARCH_GROUP ?? 'group/team-news',
+            fastModel: process.env.AQ_GRUNT_GROUP ?? 'group/team-grunt',
+            workdir: agentWorkdir(traderId),
+            timeoutMs: Number(process.env.AQ_RESEARCH_TIMEOUT_MS ?? 240_000),
+            authToken: apiKey,
+          },
+        );
+
+        if (agentResult.ok) {
+          runtimeLogs.write(
+            traderId,
+            'info',
+            'team',
+            `[调研] agent 自己查到了资料（${Math.round(agentResult.latencyMs / 1000)}s，${agentResult.text.length} 字）`,
+          );
+          return agentResult.text;
+        }
+
+        runtimeLogs.write(
+          traderId,
+          'warn',
+          'team',
+          `[调研] agent 未能完成（${agentResult.error ?? '未知'}）—— 退回直接搜索`,
+        );
+
         const result = await collectMarketResearch(
           {
             endpoint: process.env.MAGPIE_SEARCH_URL ?? DEFAULT_SEARCH_ENDPOINT,
