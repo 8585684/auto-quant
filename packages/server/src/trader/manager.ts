@@ -441,6 +441,33 @@ function ensureResearchRefresher(
 }
 
 /**
+ * **停掉某个机器人的后台调研循环**（2026-10-13）。
+ *
+ * ## 为什么必须停（一个真实的资源泄漏）
+ *
+ * 实测：`#11` 已经 `stopped`，而服务器上**还有 2 个 claude 进程在跑**。
+ * 核实后发现 `researchRefreshers` **只在创建处出现，从未被清理** ——
+ * 也就是说：
+ * ```
+ *   机器人停止 → 决策循环停了 → 而后台调研【每 10 分钟】照常起 4 个进程
+ * ```
+ * 它**不会报错、不会出现在界面上**，只是安静地吃 CPU/内存
+ *（实测单个 claude 进程约 250MB）。
+ *
+ * ⚠️ **同时清掉缓存**：缓存是"这个机器人当前的情报"，
+ * 机器人停掉之后再启动时，一份 10 分钟前的旧情报没有意义 ——
+ * 而留着它会让新启动的第一轮**基于旧情报决策**。
+ */
+export function stopResearchRefresher(traderId: number): void {
+  const timer = researchRefreshers.get(traderId);
+  if (timer !== undefined) {
+    clearInterval(timer);
+    researchRefreshers.delete(traderId);
+  }
+  researchCache.delete(traderId);
+}
+
+/**
  * **真正跑一次四猎手调研**，把结果写进 `researchCache`。
  *
  * ⚠️ 它**不抛错**（调用方已经 catch）—— 后台任务失败不该影响任何东西。
@@ -2450,6 +2477,15 @@ export class TraderManager {
       traders.setStatus(traderId, 'stopped', null);
     }
     this.cancelFillReconcile(traderId);
+    /*
+     * ⚠️ **必须停掉后台调研循环**（2026-10-13 实测发现的资源泄漏）。
+     *
+     * 实测：`#11` 已 `stopped`，而服务器上**还有 2 个 claude 进程在跑** ——
+     * 因为 `researchRefreshers` 只在创建处出现，从未被清理。
+     * 后果：机器人停止后后台调研**每 10 分钟照常起 4 个进程**，
+     * 不报错、界面看不见，只是安静地吃 CPU/内存（单个约 250MB）。
+     */
+    stopResearchRefresher(traderId);
     const stream = this.userStreams.get(traderId);
     if (stream) {
       await stream.stop().catch(() => undefined);
