@@ -57,6 +57,28 @@ export interface DeskRoleOutput {
 }
 
 /** 一次交易台会议的完整产出。 */
+/**
+ * **辩论者拿到的市场材料上限**（字符）。
+ *
+ * 见 `debateMaterial` 的说明：原来给的是**全文**（实测约 15 万 token），
+ * 而 bull 与 bear 是**串行**的 → 这一段的耗时是两份全文之和。
+ *
+ * 现在只给前 12000 字：足够核对事实（关键位、方向、结构），
+ * 但不至于让辩论者重读一遍分析师已经消化过的材料。
+ *
+ * ⚠️ 这个值不是"越小越好"：辩论者需要能**核对**分析师的结论。
+ * 完全去掉市场材料会让论证失去依据（那正是"分工"的反面 ——
+ * 让下游盲信上游）。
+ */
+const DEBATE_MARKET_CHARS = 12_000;
+
+/**
+ * **分析师产出给辩论者的窗口**（字符）。
+ *
+ * 400（原值）太短：辩论者现在主要靠它，截断会让论证失去依据。
+ * 1200 大约是"一段完整结论 + 关键依据"的长度。
+ */
+const ANALYST_DIGEST_CHARS = 1_200;
 export interface DeskOutcome {
   /** 各分析师的并行产出。 */
   analyses: DeskRoleOutput[];
@@ -73,7 +95,7 @@ export interface DeskOutcome {
   summary: string;
 }
 
-/** 一个"问某个角色"的函数（由调用方注入真实实现，便于测试）。 */
+/** 一次"问某个角色"的函数（由调用方注入真实实现，便于测试）。 */
 export type AskRole = (input: {
   role: string;
   tier: ModelTier;
@@ -241,16 +263,58 @@ export async function runTradingDesk(input: {
     }),
   );
 
-  /* ── ② 对抗论证：Bull 与 Bear 各自构建最强论证（**串行**，共享同一份材料）── */
+  /*
+   * ── ② 对抗论证：Bull 与 Bear 各自构建最强论证（**串行**，共享同一份材料）──
+   *
+   * ## ⚠️ 为什么**不再**把完整市场材料塞给辩论者（2026-10-12 实测修正）
+   *
+   * 原来这里直接拼 `input.marketContext` —— 而实测它的规模是：
+   *
+   * ```
+   *   候选池按提示词预算从 22 个裁剪到 20 个（每个标的约占 7506 tokens）
+   *   → 20 × 7506 ≈ 15 万 token
+   * ```
+   *
+   * 于是**每个辩论者都要读 15 万字**，加上新闻、持仓、分析师产出 ——
+   * 而 bull 与 bear 是**串行**的（共享材料、互相看得见），
+   * 所以这一段的耗时是**两份 15 万字之和**。
+   *
+   * 用户对分工的设计意图恰恰相反：
+   *
+   * > 「总管委派子代理去做市场调研……**根据资料反馈给相应的智能体做处理，
+   * >  资料整理、判断、决策**等等」
+   *
+   * **分析师的职责就是"资料整理"** —— 他们消化原始材料，
+   * 辩论者应当基于**消化后的结论**论证，而不是把原始材料再读一遍。
+   *
+   * ## 现在的口径
+   *
+   * | 角色 | 拿到什么 |
+   * |---|---|
+   * | 4 个分析师 | **完整**市场材料（他们负责消化）|
+   * | bull / bear | **压缩后的**市场材料 + 分析师产出 |
+   * | judge | 分析师产出 + 双方论证 |
+   *
+   * ⚠️ **仍然保留一段市场材料**（而不是完全去掉）：
+   * 辩论者需要能**核对事实**（"分析师说的那个支撑位到底是多少"）。
+   * 只是不必是全文 —— 见 `DEBATE_MARKET_CHARS`。
+   */
   const debateMaterial = [
-    '## 市场',
-    input.marketContext,
+    '## 市场（摘要 —— 完整材料已由分析师消化，下面是前段）',
+    input.marketContext.slice(0, DEBATE_MARKET_CHARS),
+    ...(input.marketContext.length > DEBATE_MARKET_CHARS
+      ? ['', `（市场材料共 ${input.marketContext.length} 字，此处只给前 ${DEBATE_MARKET_CHARS} 字 —— 需要细节请问分析师产出）`]
+      : []),
     '## 新闻与情绪',
     input.newsContext.length > 0 ? input.newsContext : '（本轮没有可用的新闻/情绪数据）',
     '## 持仓与账户',
     input.positionContext,
+    /*
+     * 分析师产出给**更长的窗口**（400 → 1200 字）——
+     * 因为辩论者现在主要靠它：截得太短会让论证失去依据。
+     */
     '## 分析师产出',
-    analyses.map((a) => `- ${a.role}: ${a.ok ? a.raw.slice(0, 400) : `（失败：${a.error ?? '未知'}）`}`).join('\n'),
+    analyses.map((a) => `- ${a.role}: ${a.ok ? a.raw.slice(0, ANALYST_DIGEST_CHARS) : `（失败：${a.error ?? '未知'}）`}`).join('\n'),
   ].join('\n\n');
 
   let bull: DeskRoleOutput | null = null;
