@@ -327,6 +327,42 @@ const SELF_CHECK_TIMEOUT_SECONDS = 120;
  * 为什么要独立目录：harness 会在 `cwd` 里读写文件、存会话状态。
  * 多个机器人共用一个目录会互相踩（一个的会话状态被另一个读到）。
  */
+/**
+ * **调研结果的缓存**（2026-10-12 实测后加的）。
+ *
+ * ## 为什么必须缓存
+ *
+ * 实测：一次真 agent 调研要 **197 秒**（2608 字的带来源简报）。
+ * 而它**原本每轮都重跑** —— 于是每一轮决策都先白等 3 分钟，
+ * 而这 3 分钟里查到的新闻**和上一轮基本一样**（新闻不是秒级变化的）。
+ *
+ * ## 这条改动其实实现了"调研与决策解耦"的最小形态
+ *
+ * | 情况 | 行为 |
+ * |---|---|
+ * | 缓存新鲜 | **立刻返回**（决策不再等待）|
+ * | 缓存过期 | **立刻返回旧结果 + 后台刷新** —— 决策用"稍旧但可用"的情报，而不是等 |
+ * | 完全没有缓存 | 只能等（第一次总得查一次）|
+ *
+ * 这正是用户要的"7×24 不间断"该有的形状：
+ * **调研在后台持续跑，决策随时读最新可用的结果**，两者不互相阻塞。
+ *
+ * ⚠️ 为什么不是"后台定时刷新"：那需要一个常驻 timer（上一轮刚为 `stopAll()`
+ * 清理过 timer 泄漏问题）。用"用到时看是否过期、过期就在后台刷一次"更简单，
+ * 且**没有额外生命周期**。
+ */
+interface ResearchCache {
+  text: string;
+  at: number;
+  /** 刷新是否正在进行 —— 防止并发轮次同时起多个 agent。 */
+  refreshing: boolean;
+}
+const researchCache = new Map<number, ResearchCache>();
+
+/** 缓存有效期：默认 15 分钟（新闻不是秒级变化的）。 */
+function researchTtlMs(): number {
+  return Number(process.env.AQ_RESEARCH_TTL_MS ?? 15 * 60_000);
+}
 function agentWorkdir(traderId: number): string {
   const base = process.env.AQ_AGENT_WORKDIR ?? '/opt/autoquant/data/agent-workspace';
   return `${base}/trader-${traderId}`;
@@ -942,6 +978,24 @@ export class TraderManager {
        */
       research: async (symbols) => {
         /*
+         * ── ① 先看缓存（见 `researchCache` 的说明）──────────────────────
+         *
+         * 实测一次 agent 调研要 **197 秒**，而新闻不是秒级变化的 ——
+         * 让每轮决策都白等 3 分钟是纯浪费，且会把整轮拖到十几分钟。
+         */
+        const cached = researchCache.get(traderId);
+        const age = cached === undefined ? Infinity : Date.now() - cached.at;
+
+        if (cached !== undefined && age < researchTtlMs()) {
+          runtimeLogs.write(
+            traderId, 'info', 'team',
+            `[调研] 用缓存结果（${Math.round(age / 1000)}s 前查到，有效期 ${Math.round(researchTtlMs() / 60_000)} 分钟）`,
+          );
+          return cached.text;
+        }
+
+
+        /*
          * ⚠️ **第一优先：让真 agent 自己去查**（2026-10-12 实测后改的）。
          *
          * ## 为什么换掉"直接调 MCP 搜索"
@@ -989,6 +1043,8 @@ export class TraderManager {
             'team',
             `[调研] agent 自己查到了资料（${Math.round(agentResult.latencyMs / 1000)}s，${agentResult.text.length} 字）`,
           );
+          /* 存进缓存 —— 下一次决策就不必再等这 3 分钟。 */
+          researchCache.set(traderId, { text: agentResult.text, at: Date.now(), refreshing: false });
           return agentResult.text;
         }
 
@@ -1019,6 +1075,10 @@ export class TraderManager {
             ? `市场调研完成：${symbols.length > 0 ? `针对 ${symbols.join('/')}` : '整体市场'}`
             : `市场调研失败：${result.errors.join('；')}`,
         );
+        /* 兜底结果也缓存 —— 它至少比"没有情报"好，且能省掉下一轮的搜索。 */
+        if (result.ok) {
+          researchCache.set(traderId, { text: result.text, at: Date.now(), refreshing: false });
+        }
         return result.text;
       },
     });
