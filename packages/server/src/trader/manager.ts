@@ -389,6 +389,23 @@ function agentWorkdir(traderId: number): string {
 const researchRefreshers = new Map<number, NodeJS.Timeout>();
 
 /**
+ * **在飞调研的中止控制器**（每个机器人一个）—— 2026-10-13。
+ *
+ * ## 为什么需要它（实测）
+ *
+ * 修了定时器泄漏之后，实测仍看到：
+ * ```
+ *   #11 status = stopped        ← 已停止
+ *   claude 进程 2 个，etime 00:27  ← 但进程还在跑
+ * ```
+ * 它们是"启动时立刻跑一次"那批猎手 —— **已经起飞的进程停不下来**，
+ * 会跑完（约 200–600 秒）才自然退出，期间每个约 150–250MB。
+ *
+ * 所以停止时要**主动中止**它们（`harness` 已支持 `signal`）。
+ */
+const researchAborts = new Map<number, AbortController>();
+
+/**
  * **保证这个机器人有一个后台调研循环**（幂等）。
  *
  * ## 为什么需要它（用户需求 ② 的实质）
@@ -424,7 +441,13 @@ function ensureResearchRefresher(
       at: cached?.at ?? 0,
       refreshing: true,
     });
-    void refreshResearch(traderId, symbols, apiKey)
+    /*
+     * 每次刷新一个**新的** controller（上一次的已经作废）——
+     * 于是"停止"只需要 abort 最新那一个。
+     */
+    const controller = new AbortController();
+    researchAborts.set(traderId, controller);
+    void refreshResearch(traderId, symbols, apiKey, controller.signal)
       .catch(() => undefined)
       .finally(() => {
         const cur = researchCache.get(traderId);
@@ -464,6 +487,18 @@ export function stopResearchRefresher(traderId: number): void {
     clearInterval(timer);
     researchRefreshers.delete(traderId);
   }
+  /*
+   * ⚠️ **中止在飞的猎手**（2026-10-13 补）。
+   *
+   * 只清定时器是不够的：实测 `#11` 已 stopped 而 `claude` 进程仍在跑
+   *（`etime 00:27`）—— 那是"启动时立刻跑一次"那批。它们会跑完
+   *（约 200–600 秒）才自然退出，期间每个约 150–250MB。
+   */
+  const controller = researchAborts.get(traderId);
+  if (controller !== undefined) {
+    controller.abort();
+    researchAborts.delete(traderId);
+  }
   researchCache.delete(traderId);
 }
 
@@ -480,6 +515,7 @@ async function refreshResearch(
   traderId: number,
   symbols: readonly string[],
   apiKey: string,
+  signal?: AbortSignal,
 ): Promise<void> {
   const { runAgentTask } = await import('./agent/harness.js');
   const { HUNTERS, buildHunterTask, mergeHunterReports, summariseHunters } = await import('./intel/hunters.js');
@@ -512,6 +548,8 @@ async function refreshResearch(
       workdir: dir,
       timeoutMs,
       authToken: apiKey,
+      /* 机器人停止时中止在飞的猎手 —— 见 `researchAborts` 的说明。 */
+      ...(signal === undefined ? {} : { signal }),
     });
     return {
       hunterId: hunter.id,

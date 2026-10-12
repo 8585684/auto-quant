@@ -64,3 +64,34 @@ test('★ 幂等：重复 start 不该堆出多个定时器', () => {
     '★ 必须有"已存在就返回"的闸门',
   );
 });
+
+test('★★★ 停止时必须【中止在飞的猎手进程】—— 只清定时器不够', () => {
+  /*
+   * ## 实测
+   *
+   * 修了定时器泄漏之后，线上仍看到：
+   * ```
+   *   #11 status = stopped
+   *   claude 进程 2 个，etime 00:27     ← 仍在跑
+   * ```
+   * 它们是"启动时立刻跑一次"那批 —— **已经起飞的进程停不下来**，
+   * 会跑完（约 200–600 秒）才自然退出，期间每个约 150–250MB。
+   *
+   * ## 这条测试钉住什么
+   *
+   * `stopResearchRefresher` 必须**同时** abort 那个 controller，
+   * 而 `harness` 必须真的把 signal 接上（否则 abort 只是个没人听的信号）。
+   */
+  const fn = SRC.slice(SRC.indexOf('export function stopResearchRefresher'));
+  assert.ok(fn.includes('controller.abort()'), '★ 必须 abort 在飞的调研');
+  assert.ok(fn.includes('researchAborts.delete('), '★ 必须清掉 controller 引用');
+
+  /* harness 必须支持 signal，并且真的用它 kill 进程。 */
+  const harness = readFileSync(new URL('./agent/harness.ts', import.meta.url), 'utf8');
+  assert.ok(harness.includes('signal?: AbortSignal'), '★ harness 必须接受中止信号');
+  assert.ok(
+    harness.includes("addEventListener('abort'"),
+    '★ 必须真的监听 abort（只声明参数而不监听 = 信号没人听）',
+  );
+  assert.ok(harness.includes("child.kill('SIGKILL')"), '★ 收到 abort 时必须杀进程');
+});

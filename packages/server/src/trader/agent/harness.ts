@@ -61,6 +61,12 @@ export interface AgentTaskInput {
   baseUrl?: string;
   /** magpie 调用密钥。 */
   authToken: string;
+  /**
+   * **外部中止信号**（2026-10-13 加）—— 机器人停止时用它把在飞的 agent 杀掉。
+   *
+   * ⚠️ 不传 = 行为与改动前完全一致（只受 `timeoutMs` 约束）。
+   */
+  signal?: AbortSignal;
 }
 
 /** 一次 agent 任务的结果。 */
@@ -141,6 +147,33 @@ export const spawnClaudeCode: SpawnAgent = async (input) => {
       child.kill('SIGKILL');
       finish({ ok: false, text: '', error: `agent 超过 ${Math.round(timeoutMs / 1000)} 秒未返回`, latencyMs: Date.now() - started });
     }, timeoutMs);
+
+    /*
+     * ── **外部中止通道**（2026-10-13 加）──────────────────────────────────
+     *
+     * ## 为什么需要它（实测）
+     *
+     * 实测：`#11` 已经 `stopped`，而服务器上**仍有 2 个 claude 进程在跑**
+     *（`etime 00:27`）—— 它们是"启动时立刻跑一次"那批猎手。
+     *
+     * 我修了定时器泄漏（`stopResearchRefresher`），但**已经起飞的进程停不下来**：
+     * 它们会跑完（约 200–600 秒）才自然退出。而单个 claude 进程约 150–250MB ——
+     * **机器人停止后还在吃几分钟资源**，且期间它还会写 `researchCache`。
+     *
+     * ⚠️ 用 `AbortSignal`（Node 标准形状）而不是自造接口：
+     * 调用方直接传 `controller.signal`，与 `fetch` 的用法一致。
+     */
+    const onAbort = (): void => {
+      child.kill('SIGKILL');
+      finish({ ok: false, text: '', error: '已中止（机器人停止）', latencyMs: Date.now() - started });
+    };
+    if (input.signal !== undefined) {
+      if (input.signal.aborted) {
+        onAbort();
+      } else {
+        input.signal.addEventListener('abort', onAbort, { once: true });
+      }
+    }
 
     child.stdout.on('data', (c: Buffer) => { out += c.toString('utf8'); });
     child.stderr.on('data', (c: Buffer) => { err += c.toString('utf8'); });
