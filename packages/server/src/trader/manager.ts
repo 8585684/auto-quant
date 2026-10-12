@@ -9,6 +9,7 @@ import { connectExchange, preflight, type ExchangeConnection, type PreflightChec
 import type { BinanceEnvironment } from '../binance/endpoints.js';
 import { BinanceUserDataStream } from '../binance/ws.js';
 import type { Vault } from '../crypto/vault.js';
+import { mkdirSync } from 'node:fs';
 import { createLogger } from '../logger.js';
 import { env } from '../env.js';
 import { MarketDataService } from '../market/service.js';
@@ -1056,6 +1057,40 @@ export class TraderManager {
          */
         const hunterLimit = Math.max(1, Number(process.env.AQ_HUNTER_CONCURRENCY ?? '') || 2);
         const hunterTimeout = Number(process.env.AQ_RESEARCH_TIMEOUT_MS ?? 240_000);
+        /*
+         * ⚠️ **每个猎手一个独立的工作目录**（2026-10-13 实测后加）。
+         *
+         * ## 为什么（一次真实的全部失败）
+         *
+         * 第一版四个猎手共用 `agentWorkdir(traderId)`，实测结果：
+         * ```
+         *   [调研] 4 个来源中 **4 个未产出**：新闻猎手、资金猎手、社区猎手、宏观猎手
+         * ```
+         * **而同一个 workdir 下单猎手是能跑成的**（实测约 197 秒、查到 3 条新闻）。
+         * 差别只有"并发 + 共用目录"。
+         *
+         * ## 根因在 `harness.ts` 的这两行
+         * ```
+         *   cwd:  input.workdir
+         *   HOME: process.env.AQ_HARNESS_HOME ?? `${input.workdir}/.home`
+         * ```
+         * 于是四个并发实例**共用一个 `HOME`** —— 而 claude code 会把
+         * 配置、会话与历史写进 `~/.claude`。多个进程同时写同一份状态，
+         * 正是"单跑能成、并发全败"的典型形状。
+         *
+         * 所以给每个猎手一个子目录（`mkdirSync` 是必须的：
+         * `cwd` 不存在时 `spawn` 直接 ENOENT）。
+         */
+        const hunterWorkdir = (hunterId: string): string => {
+          const dir = `${agentWorkdir(traderId)}/hunter-${hunterId}`;
+          try {
+            mkdirSync(dir, { recursive: true });
+          } catch {
+            /* 建不出来就退回共用目录 —— 至少不要因为它整个失败。 */
+            return agentWorkdir(traderId);
+          }
+          return dir;
+        };
         const hunterResults = await mapConcurrent(
           HUNTERS,
           hunterLimit,
@@ -1065,7 +1100,7 @@ export class TraderManager {
               allowedTools: 'WebSearch,WebFetch',
               model: process.env.AQ_RESEARCH_GROUP ?? 'group/team-news',
               fastModel: process.env.AQ_GRUNT_GROUP ?? 'group/team-grunt',
-              workdir: agentWorkdir(traderId),
+              workdir: hunterWorkdir(hunter.id),
               timeoutMs: hunterTimeout,
               authToken: apiKey,
             });
@@ -1103,6 +1138,19 @@ export class TraderManager {
         const okReports = hunterReports.filter((rep) => rep.ok);
         const mergedText = mergeHunterReports(hunterReports);
         runtimeLogs.write(traderId, 'info', 'team', `[调研] ${summariseHunters(hunterReports)}`);
+        /*
+         * ⚠️ **失败原因必须写进日志**（2026-10-13 实测踩到）。
+         *
+         * 第一版只写了"4 个来源中 4 个未产出"——**没写为什么**。
+         * 于是排查时我无法回答"是超时、是 harness 没装、还是并发冲突"，
+         * 只能靠猜。**而"知道它失败了"和"知道它为什么失败"是两件事** ——
+         * 前者只是让人焦虑，后者才能修。
+         *
+         * ⚠️ 写在 `if (agentResult.ok)` **之前** —— 全部失败时也要留下来。
+         */
+        for (const rep of hunterReports.filter((x) => !x.ok)) {
+          runtimeLogs.write(traderId, 'warn', 'team', `[调研] ${rep.label} 未产出：${rep.error ?? '未知原因'}`);
+        }
         /*
          * ⚠️ 下面沿用原来的 `agentResult` 形状 —— 于是它后面的
          * **时效过滤 / 交叉验证 / 退回原文**那三段一行都不用改。
