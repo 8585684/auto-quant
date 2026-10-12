@@ -26,8 +26,74 @@ import { api, setToken } from '../../lib/api';
 import { useApp } from '../../lib/store';
 import { usePolled } from '../../lib/hooks';
 import { Button, ErrorNote, Field, Panel, TextInput } from '../ui';
-import { Metric, MetricGroup, PageShell, SectionLabel } from '../shell';
+import { PageShell, SectionLabel } from '../shell';
 import { fmtDateTime } from '../../lib/format';
+
+/**
+ * 只读的「键 — 值」一行。
+ *
+ * ## 为什么这一页不用 `Metric` 卡
+ *
+ * 这一页原来在伴随栏里塞了两组 `MetricGroup`（身份 3 项 + 运行环境 1 项 +
+ * 版本与部署 3 项 + 运行时 2 项），每项都是一张 60px 高的卡：9 项 ≈ 540px。
+ * 而这一页**总共只有 4 个输入框**，却要滚动 262px 才能看到底 ——
+ * 用户的原话是「这个页面重新设计好，别出现滚动翻页，本身就没几个显示的东西」。
+ *
+ * `Metric` 那套排版是给**盯盘用的读数**设计的（大号数字、副行、贴底对齐），
+ * 而这里的值全是"我是谁 / 跑在什么版本上"这类**静态事实**，一眼扫过去就够，
+ * 不需要 2xl 的字号也不需要等高的卡片。换成一行 20px 的键值对之后，
+ * 同样的 9 项只占 180px 左右，整页因此能收进一屏。
+ *
+ * 值一律 `break-all` 且带 `title`：版本号、提交哈希这类长串在窄栏里会被
+ * 截断，而截掉的部分必须能从悬停读到（见 `Metric.subTitle` 那段说明）。
+ */
+function FactRow({
+  label,
+  value,
+  sub,
+  tone,
+}: {
+  label: string;
+  value: string;
+  sub?: string;
+  tone?: 'warn' | 'up';
+}) {
+  const toneClass = tone === 'warn' ? 'text-warn' : tone === 'up' ? 'text-up' : 'text-ink-hi';
+  return (
+    /*
+     * `py-0.5` 而不是 `py-1`：一行 25px，正好对上设计规范里"紧凑密度"的
+     * 表格行高（`--aq-row-h` 24px）。这一页有 9 行，每行省 4px 就是 36px ——
+     * 那 36px 正好是"一屏放得下"与"要多滚一下"的分界（实测 1405x722 下
+     * 差 10px）。行高再小就该看不清了，所以这里不再往下压。
+     */
+    <div className="flex items-baseline gap-2 border-b border-base-800 py-0.5 last:border-b-0">
+      <span className="shrink-0 text-xs text-ink-faint">{label}</span>
+      <span className="min-w-0 flex-1" />
+      <span className={`num min-w-0 break-all text-right text-base ${toneClass}`} title={sub ?? value}>
+        {value}
+      </span>
+    </div>
+  );
+}
+
+/**
+ * 一组 `FactRow`，带小标题。
+ *
+ * 标题用 `MetricGroup` 同一套排版（`text-xs` + 大写字距 + `ink-faint`），
+ * 让"身份 / 运行环境 / 版本与部署 / 运行时"四组在视觉上仍然分得开 ——
+ * 换成键值行省掉的是**卡片的体积**，不是分组本身。
+ *
+ * 组之间一条 `border-t`：两行数值挨着时，没有它读者会以为
+ * 「账户创建时间」下面那行还是身份信息。
+ */
+function FactGroup({ title, children }: { title: string; children: React.ReactNode }) {
+  return (
+    <section className="border-t border-base-800 pt-1.5 first:border-t-0 first:pt-0">
+      <h3 className="text-xs font-semibold uppercase tracking-[0.12em] text-ink-faint">{title}</h3>
+      {children}
+    </section>
+  );
+}
 
 export function AccountSection() {
   const user = useApp((s) => s.user);
@@ -151,54 +217,65 @@ export function AccountSection() {
    * 不再依赖"整宽"这件事，也就不需要占满整宽。
    *
    * ⚠️ **不要给这里的任何一组改回 3/4 列**：那是把同一次静默截断再犯一次。
+   *
+   * ## ⚠️ 2026-10-13：这里从 `Metric` 卡换成了 `FactRow`
+   *
+   * 用户的原话：「这个页面重新设计好，别出现滚动翻页，本身就没几个显示的东西」。
+   *
+   * 实测（1405x722）：页面总高 **776px**、视口只有 **542px**，溢出 **262px**。
+   * 高度全花在两处，而它们都不是用户来这一页要做的事：
+   *
+   *   · 右栏两张卡 9 项 `Metric`：356 + 350 = **706px**；
+   *   · 左栏表单 4 个输入框：410px。
+   *
+   * `Metric` 那套排版是给**盯盘读数**用的（2xl 数字、副行贴底、等高卡片），
+   * 而这里 9 项全是"我是谁 / 跑在什么版本上"的静态事实 —— 一眼扫过就够。
+   * 换成 20px 一行的 `FactRow` 之后，同样 9 项只占 180px 上下，
+   * 页面从 776px 收到 542px 以内，**一屏放得下**。
+   *
+   * 分组没有丢：`FactGroup` 仍然给每组一个小标题和上下分隔线，
+   * 读者依然知道"身份 / 运行环境 / 版本与部署 / 运行时"是四组不同的东西。
    */
   const rail = (
-    <div className="space-y-4">
-      <Panel title="当前账户" bodyClassName="p-4">
-        <MetricGroup title="身份" columns={1}>
-          <Metric label="用户名" value={user?.username ?? '—'} size="lg" tone="strong" />
-          <Metric
-            label="角色"
-            value={user?.role ? userRoleLabel(user.role) : '—'}
-            sub={user?.role ?? undefined}
-          />
-          <Metric label="账户创建时间" value={fmtDateTime(user?.createdAt)} />
-        </MetricGroup>
+    <div className="space-y-3">
+      <Panel title="当前账户" bodyClassName="px-4 py-2">
+        <FactGroup title="身份">
+          <FactRow label="用户名" value={user?.username ?? '—'} />
+          <FactRow label="角色" value={user?.role ? userRoleLabel(user.role) : '—'} sub={user?.role ?? undefined} />
+          <FactRow label="账户创建时间" value={fmtDateTime(user?.createdAt)} />
+        </FactGroup>
 
-        <MetricGroup title="运行环境" columns={1}>
-          <Metric
+        <FactGroup title="运行环境">
+          <FactRow
             label="模式"
             value={system?.dryRun ? '模拟' : '实盘'}
-            tone={system?.dryRun ? 'default' : 'warn'}
-            sub={system?.environmentLabel ?? system?.environment ?? '—'}
-            subTitle={system?.environmentLabel ?? system?.environment ?? undefined}
+            sub={system?.environmentLabel ?? system?.environment ?? undefined}
+            tone={system?.dryRun ? undefined : 'warn'}
           />
-        </MetricGroup>
+        </FactGroup>
       </Panel>
 
-      <Panel title="服务端" bodyClassName="p-4">
-        <MetricGroup title="版本与部署" columns={1}>
-          <Metric
+      <Panel title="服务端" bodyClassName="px-4 py-2">
+        <FactGroup title="版本与部署">
+          <FactRow
             label="服务端版本"
             value={build ? `${build.branch} @ ${build.commitShort}` : '未知'}
             sub={build?.subject || (build ? undefined : '本次部署没有写出版本信息')}
-            subTitle={build?.subject}
-            tone={build?.dirty ? 'warn' : 'default'}
+            tone={build?.dirty ? 'warn' : undefined}
           />
-          <Metric label="部署时间" value={build?.deployedAt ? fmtDateTime(build.deployedAt) : '—'} />
-          <Metric
+          <FactRow label="部署时间" value={build?.deployedAt ? fmtDateTime(build.deployedAt) : '—'} />
+          <FactRow
             label="与 GitHub"
             value={updateLabel}
-            tone={updateTone}
             sub={update.error ?? update.data?.message}
-            subTitle={update.error ?? update.data?.message}
+            tone={updateTone === 'up' ? 'up' : updateTone === 'warn' ? 'warn' : undefined}
           />
-        </MetricGroup>
+        </FactGroup>
 
-        <MetricGroup title="运行时" columns={2}>
-          <Metric label="产品版本" value={system?.version ?? health?.version ?? '—'} />
-          <Metric label="数据库" value={health?.db ?? '—'} />
-        </MetricGroup>
+        <FactGroup title="运行时">
+          <FactRow label="产品版本" value={system?.version ?? health?.version ?? '—'} />
+          <FactRow label="数据库" value={health?.db ?? '—'} />
+        </FactGroup>
       </Panel>
     </div>
   );
@@ -212,8 +289,8 @@ export function AccountSection() {
    * 这件事**，所以它跟着表单走，落在表单下面。
    */
   const notes = (
-    <Panel title="账户说明">
-      <div className="space-y-2 text-xs leading-relaxed text-ink-mid">
+    <Panel title="账户说明" bodyClassName="px-4 py-2.5">
+      <div className="space-y-1.5 text-xs leading-snug text-ink-mid">
         <p>
           本系统面向单人部署：管理员账号在服务首次启动时自动创建，<strong>不提供注册入口</strong>
           ，也没有找回密码的流程 —— 修改只能在这里做，且必须验证当前密码。
@@ -236,6 +313,19 @@ export function AccountSection() {
    * `fillHeight={false}`：这一页内容少，撑满视口只会在最下面空出半屏纯黑。
    * 表单也不再自己限宽（原来 `max-w-xl` + 外层再套列宽，结果左边空出四百多
    * 像素）：它现在只占主内容列，输入框横跨这一列正是该有的宽度。
+   *
+   * ## 四个输入框改成 2x2 栅格（2026-10-13）
+   *
+   * 原来是单列 `space-y-3`：4 个字段各占一整行（标签 17 + 输入 38 + 说明 16
+   * + 间距 12 ≈ 83px），合计 **410px** —— 这一栏里最贵的一块，而它只装了
+   * 四个输入框。用户要的是"别出现滚动翻页，本身就没几个显示的东西"。
+   *
+   * 换成 `sm:grid-cols-2` 之后同样的字段只占两行（约 242px），省下 168px。
+   * 语义上也更顺：**新用户名 / 当前密码** 是第一行（"改成什么" + "凭什么"），
+   * **新密码 / 确认新密码** 是第二行（一对必须一致的字段并排，比对更直观）。
+   *
+   * 窄屏（`< sm`）仍然退回单列 —— 320px 宽的屏幕上两个密码框并排会各剩
+   * 不到 140px，输入的圆点根本看不清。
    */
   return (
     <PageShell aside={rail} fillHeight={false}>
@@ -256,47 +346,49 @@ export function AccountSection() {
               if (event.key === 'Escape') reset();
             }}
           >
-            <Field label="新用户名" hint="留空则不修改。">
-              <TextInput
-                value={newUsername}
-                onChange={(event) => setNewUsername(event.target.value)}
-                autoComplete="username"
-                placeholder={user?.username ? `留空则保持 ${user.username}` : '留空则不修改'}
-              />
-            </Field>
+            <div className="grid grid-cols-1 gap-x-4 gap-y-3 sm:grid-cols-2">
+              <Field label="新用户名" hint="留空则不修改。">
+                <TextInput
+                  value={newUsername}
+                  onChange={(event) => setNewUsername(event.target.value)}
+                  autoComplete="username"
+                  placeholder={user?.username ? `留空则保持 ${user.username}` : '留空则不修改'}
+                />
+              </Field>
 
-            <Field
-              label="当前密码"
-              hint="修改任何一项都必须验证当前密码 —— 服务端会拒绝没有它的请求。"
-            >
-              <TextInput
-                type="password"
-                value={currentPassword}
-                onChange={(event) => setCurrentPassword(event.target.value)}
-                autoComplete="current-password"
-                placeholder="修改任何一项都需要验证"
-              />
-            </Field>
+              <Field
+                label="当前密码"
+                hint="修改任何一项都必须验证当前密码 —— 服务端会拒绝没有它的请求。"
+              >
+                <TextInput
+                  type="password"
+                  value={currentPassword}
+                  onChange={(event) => setCurrentPassword(event.target.value)}
+                  autoComplete="current-password"
+                  placeholder="修改任何一项都需要验证"
+                />
+              </Field>
 
-            <Field label="新密码" hint="留空则不修改，至少 8 个字符。">
-              <TextInput
-                type="password"
-                value={newPassword}
-                onChange={(event) => setNewPassword(event.target.value)}
-                autoComplete="new-password"
-                placeholder="留空则不修改"
-              />
-            </Field>
+              <Field label="新密码" hint="留空则不修改，至少 8 个字符。">
+                <TextInput
+                  type="password"
+                  value={newPassword}
+                  onChange={(event) => setNewPassword(event.target.value)}
+                  autoComplete="new-password"
+                  placeholder="留空则不修改"
+                />
+              </Field>
 
-            <Field label="确认新密码" hint="与新密码完全一致。">
-              <TextInput
-                type="password"
-                value={confirm}
-                onChange={(event) => setConfirm(event.target.value)}
-                autoComplete="new-password"
-                placeholder="与新密码一致"
-              />
-            </Field>
+              <Field label="确认新密码" hint="与新密码完全一致。">
+                <TextInput
+                  type="password"
+                  value={confirm}
+                  onChange={(event) => setConfirm(event.target.value)}
+                  autoComplete="new-password"
+                  placeholder="与新密码一致"
+                />
+              </Field>
+            </div>
 
             {error && <ErrorNote>{error}</ErrorNote>}
             {done && (

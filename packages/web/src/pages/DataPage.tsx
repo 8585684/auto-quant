@@ -254,8 +254,40 @@ export function DataPage() {
   const hasLines = shown.length > 0;
 
   return (
-    <div className="page-fill gap-3">
-      <div className="flex flex-wrap items-end justify-between gap-3">
+    /*
+     * ## ⚠️ 日志面板要**顶满到滚动区底部**，说明卡让到下一屏
+     *
+     * 用户的原话：「这一块直接钉满底部啊，各种窗口大小下这一块都是默认顶满、
+     * 对齐底部的，下面那个文字说明用户不滚动页面就不显示」。
+     *
+     * 这是**第二次**说同一件事（上一次的浏览器批注：「这一块直接自动订满页面
+     * 底部，不滚动就不展示下面那一块」）。上一轮的修法只把日志体改成
+     * `flex-1`，但「本页数据来源」那张说明卡**还留在同一个 flex 列里**，
+     * 于是它永远占住一块高度（实测 185px），日志面板只能拿剩下的 ——
+     * 在 1405x722 下日志面板只有 160px，底部离滚动区下沿还差 211px，
+     * 而日志恰恰是这一页要看的东西。
+     *
+     * 所以把说明卡移到 flex 列**外面**：日志面板吃满「视口 − 页头 − 指标带」
+     * 之后的全部高度，底边正好落在滚动区下沿；说明卡排在它下面，页面因此
+     * 比视口高一截，往下滚才看到 —— 这正是用户要的次序（日志是正文，
+     * 说明是排查时才翻的参考）。
+     *
+     * ⚠️ `page-fill` 必须配 **`h-full`**，不能只靠它自己那条
+     * `@media (min-width: 80em) { height: 100% }`：窄屏下那条规则不生效，
+     * 没有确定高度时 `flex-1` 会退化成"按内容撑高"，日志面板反而被 31 行日志
+     * 顶到 958px、页面溢出 799px（实测过）。内容区（`#main-scroll`）本身是
+     * 确定高度的 flex 子项，`h-full` 在两种宽度、两套模板下都成立。
+     *
+     * 页头与指标带标 `shrink-0`：窗口再矮也只压缩日志面板（它有 `min-h-0`
+     * 和内部滚动条），不挤压标题与读数。
+     *
+     * 最外层用 `Fragment`（而不是再包一层 div）：日志面板的 `flex-1` 需要
+     * 直接看见 `.page-fill` 这个 flex 容器，中间多一层普通 div 会把
+     * `height:100%` 的链断掉（实测会退化成按内容撑高）。
+     */
+    <>
+      <div className="page-fill h-full gap-3">
+      <div className="flex shrink-0 flex-wrap items-end justify-between gap-3">
         <div className="min-w-0">
           <h1 className="text-xl font-semibold tracking-wide text-ink-hi">数据与日志</h1>
           <p className="mt-0.5 text-xs text-ink-faint">
@@ -275,7 +307,7 @@ export function DataPage() {
         </div>
       </div>
 
-      <div className="grid grid-cols-2 gap-2 md:grid-cols-3 xl:grid-cols-6">
+      <div className="grid shrink-0 grid-cols-2 gap-2 md:grid-cols-3 xl:grid-cols-6">
         {/*
                   显示**中文**，不是 `production`。
                   `environment` 是机器码，由 `tradingEnvironmentLabel` 翻译；
@@ -593,9 +625,10 @@ export function DataPage() {
           <FeedClock lastEventAt={lastEventAt} />
         </div>
       </Panel>
+      </div>
 
       {/* 折叠说明：排查时用得到，平时不该占版面 */}
-      <Panel title="本页数据来源">
+      <Panel title="本页数据来源" className="mt-3">
         <ul className="space-y-1.5 text-base leading-relaxed text-ink-lo">
           <li>
             • <span className="text-ink-mid">实时</span>：渲染 WebSocket 缓冲 —— 服务端推送的每条{' '}
@@ -615,7 +648,7 @@ export function DataPage() {
           </li>
         </ul>
       </Panel>
-    </div>
+    </>
   );
 }
 
