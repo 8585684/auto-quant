@@ -49,31 +49,37 @@ export function BalanceCell({
   /** Ticking clock, so the relative read time stays honest between renders. */
   now: number;
 }) {
+  /*
+   * 提到变量里是因为**两个渲染分支都要用它**：第一次只加在"有实时读数"
+   * 那个分支里，而机器人停止时走的是另一个分支，于是它一次都没显示过。
+   */
   const env = <Badge tone={testnet ? 'muted' : 'warn'}>{testnet ? '测试网' : '主网'}</Badge>;
 
   if (!balance) {
     const message = error ?? '尚未读取到余额。';
-    /*
-   * 账户上非本机器人的交易 —— 一句**安静的事实说明**。
-   *
-   * 提到变量里是因为**两个渲染分支都要用它**：第一次只加在"有实时读数"
-   * 那个分支里，而机器人停止时走的是另一个分支，于是它一次都没显示过。
-   */
-  return (
+    return (
       <div className="w-[196px] max-w-full space-y-1 whitespace-normal">
-        <div className="flex items-start gap-1.5">
+        <div className="flex items-center gap-1.5">
           {/*
            * An icon rather than a `⚠` character: the font fallback for that
            * glyph is a different width on every platform, so the wrapped second
            * line of the message used to indent differently on Windows and macOS.
            */}
-          <TriangleAlert aria-hidden className="mt-0.5 h-3.5 w-3.5 shrink-0 text-warn" />
-          <span className="min-w-0 flex-1 text-xs text-warn" title={`余额读取失败：${message}`}>
-            余额读取失败：{message}
-          </span>
-          {env}
+          <TriangleAlert aria-hidden className="h-3.5 w-3.5 shrink-0 text-warn" />
+          <span className="text-xs font-semibold text-warn">余额读取失败</span>
+          {/*
+           * 徽章推到标题行右端，正文因此拿到整宽。
+           *
+           * 它原来和正文同处一个 flex 行：196px 的格子减去图标、两处间距和
+           * 徽章之后，正文只剩约 124px —— 一句完整的中文警告被折成三行，
+           * 而它右边还空着一块。抬到标题行后，同样的句子只占两行。
+           */}
+          <span className="ml-auto shrink-0">{env}</span>
         </div>
-        <div className="pl-5 text-xs text-ink-faint">点右侧刷新按钮重试。</div>
+        <p className="text-xs text-warn" title={`余额读取失败：${message}`}>
+          {message}
+        </p>
+        <div className="text-xs text-ink-faint">点右侧刷新按钮重试。</div>
       </div>
     );
   }
