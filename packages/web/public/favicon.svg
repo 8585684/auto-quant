@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="32" height="32" role="img" aria-label="AutoQuant">
+  <!--
+    站点图标：和两套外壳里的品牌标记（ConsoleShell 的 <Brand />）用的是同一条
+    走势线。深底 + 青绿强调色，和默认深色主题一致 —— 标签页在深色浏览器主题下
+    不会是一块刺眼的白。
+
+    这个文件之前**不存在**，而 index.html 引用了它：每次加载都会多一条 404，
+    被 ui:check 记成客观异常。图标本身没有信息量，但"一直报红"的工具会让人
+    忽略真正的红。
+  -->
+  <rect x="0" y="0" width="32" height="32" rx="7" fill="#0d1117" />
+  <path
+    d="M5 23 L12 15.5 L18 20 L27 7.5"
+    fill="none"
+    stroke="#2ed3a3"
+    stroke-width="3.2"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+  />
+  <circle cx="27" cy="7.5" r="3" fill="#2ed3a3" />
+</svg>

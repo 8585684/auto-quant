@@ -49,6 +49,7 @@ const ROUTES = [
   ['/models', 'AI 模型'],
   ['/exchanges', '交易所'],
   ['/account', '操作员账户'],
+  ['/appearance', '外观'],
   ['/faq', '帮助'],
 ];
 

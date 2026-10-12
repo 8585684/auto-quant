@@ -7,6 +7,7 @@
  */
 import { RefreshCw, TriangleAlert } from 'lucide-react';
 import { Badge, Button } from './ui';
+import { Metric } from './shell';
 import {
   BALANCE_LABEL,
   DEFAULT_SETTLE_ASSET,
@@ -14,7 +15,6 @@ import {
   fmtInt,
   fmtNum,
   fmtSigned,
-  pnlColor,
   timeAgo,
   fmtTime,
 } from '../lib/format';
@@ -25,14 +25,20 @@ import type { ExchangeBalance } from '../lib/api';
 /* -------------------------------------------------------------------------- */
 
 /**
- * The 余额 cell of the credentials table.
+ * 一把凭证的实时读数。
  *
- * Three lines, in the order an operator reads them:
+ * ## ⚠️ 为什么不再是 `w-[196px]` 的一小格
  *
- *   1. 权益 — the margin balance, i.e. what the bot actually trades with;
- *   2. 钱包 / 可用 — the settled balance the exchange's own app calls
- *      “钱包余额”, plus what is still free;
- *   3. 未实现 — only when there is one, coloured by sign.
+ * 这个组件原本是**凭证表格**里的一格，所以宽度钉死在 196px。表格退场、改成
+ * 整宽的凭证卡之后，那个宽度留了下来 —— 后果是卡片有 1100px 宽，读数只占
+ * 左边 196px，**右边空出一大片**，而页脚的「刷新」按钮被 `ml-auto` 推到最右，
+ * 中间隔了半个屏幕。用户报的「上面一堆显示 BUG」指的就是这个。
+ *
+ * 现在按**整宽**排版：权益 / 钱包 / 可用 / 未实现 四列并排，宽度跟着卡片走。
+ * 读失败时给一条整宽的警告 —— 它比读数更吃横向空间（那句话本来就长）。
+ *
+ * 顺序就是操作员读它的顺序：权益（真正在用来交易的钱）→ 钱包与可用（交易所
+ * App 里的口径）→ 未实现（浮动的部分）。
  *
  * A failed read is rendered as a warning here rather than as an empty cell:
  * “we could not read this” is information, a blank is not.
@@ -49,31 +55,32 @@ export function BalanceCell({
   /** Ticking clock, so the relative read time stays honest between renders. */
   now: number;
 }) {
+  /*
+   * 提到变量里是因为**两个渲染分支都要用它**：第一次只加在"有实时读数"
+   * 那个分支里，而机器人停止时走的是另一个分支，于是它一次都没显示过。
+   */
   const env = <Badge tone={testnet ? 'muted' : 'warn'}>{testnet ? '测试网' : '主网'}</Badge>;
 
   if (!balance) {
     const message = error ?? '尚未读取到余额。';
-    /*
-   * 账户上非本机器人的交易 —— 一句**安静的事实说明**。
-   *
-   * 提到变量里是因为**两个渲染分支都要用它**：第一次只加在"有实时读数"
-   * 那个分支里，而机器人停止时走的是另一个分支，于是它一次都没显示过。
-   */
-  return (
-      <div className="w-[196px] max-w-full space-y-1 whitespace-normal">
-        <div className="flex items-start gap-1.5">
+    return (
+      <div className="space-y-1 whitespace-normal">
+        <p className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs">
           {/*
            * An icon rather than a `⚠` character: the font fallback for that
            * glyph is a different width on every platform, so the wrapped second
            * line of the message used to indent differently on Windows and macOS.
            */}
-          <TriangleAlert aria-hidden className="mt-0.5 h-3.5 w-3.5 shrink-0 text-warn" />
-          <span className="min-w-0 flex-1 text-xs text-warn" title={`余额读取失败：${message}`}>
-            余额读取失败：{message}
+          <span className="flex items-center gap-1.5 font-semibold text-warn">
+            <TriangleAlert aria-hidden className="h-3.5 w-3.5 shrink-0" />
+            余额读取失败
+          </span>
+          <span className="text-warn" title={`余额读取失败：${message}`}>
+            {message}
           </span>
           {env}
-        </div>
-        <div className="pl-5 text-xs text-ink-faint">点右侧刷新按钮重试。</div>
+        </p>
+        <p className="text-xs text-ink-faint">点右侧刷新按钮重试。</p>
       </div>
     );
   }
@@ -81,29 +88,36 @@ export function BalanceCell({
   const asset = balance.asset?.trim() || DEFAULT_SETTLE_ASSET;
 
   return (
-    <div className="num w-[196px] max-w-full space-y-0.5 whitespace-normal">
-      <div className="flex items-center gap-1.5">
-        <span
-          className="text-xs font-semibold text-ink-hi"
-          title={`${BALANCE_LABEL.equity}（保证金余额 = 钱包 + 未实现盈亏）。这是「交易所账户」的权益，同一账户下的所有机器人共用这一个钱包。`}
-        >
-          {fmtAsset(balance.equity, asset)}
-        </span>
-        <span className="text-xs text-ink-faint">{BALANCE_LABEL.short.equity}</span>
+    <div className="space-y-1.5 whitespace-normal">
+      <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+        <h3 className="text-xs font-semibold uppercase tracking-[0.12em] text-ink-faint">实时余额</h3>
         {env}
       </div>
-      <div className="text-xs text-ink-lo">
-        {BALANCE_LABEL.short.wallet} {fmtNum(balance.walletBalance)} · {BALANCE_LABEL.short.available}{' '}
-        {fmtNum(balance.availableBalance)}
+      {/*
+       * 列数跟着卡片宽度走。凭证卡窄屏时是整宽一列，宽屏可以到 1100px 以上 ——
+       * 2 → 3 → 4 列让四个读数始终铺满，而不是缩在左上角。
+       */}
+      <div className="grid grid-cols-2 gap-x-6 gap-y-2.5 sm:grid-cols-3 xl:grid-cols-4">
+        <Metric
+          label={BALANCE_LABEL.equity}
+          value={fmtAsset(balance.equity, asset)}
+          size="lg"
+          tone="strong"
+          sub="保证金余额 = 钱包 + 未实现盈亏"
+          subTitle="保证金余额 = 钱包余额 + 未实现盈亏"
+          title={`${BALANCE_LABEL.equity}（保证金余额 = 钱包 + 未实现盈亏）。这是「交易所账户」的权益，同一账户下的所有机器人共用这一个钱包。`}
+        />
+        <Metric label={BALANCE_LABEL.wallet} value={fmtNum(balance.walletBalance)} />
+        <Metric label={BALANCE_LABEL.available} value={fmtNum(balance.availableBalance)} />
+        <Metric
+          label={BALANCE_LABEL.unrealized}
+          value={fmtSigned(balance.unrealizedPnl)}
+          tone={balance.unrealizedPnl > 0 ? 'up' : balance.unrealizedPnl < 0 ? 'down' : 'default'}
+        />
       </div>
-      {balance.unrealizedPnl !== 0 && (
-        <div className={`text-xs ${pnlColor(balance.unrealizedPnl)}`}>
-          {BALANCE_LABEL.unrealized} {fmtSigned(balance.unrealizedPnl)}
-        </div>
-      )}
-      <div className="text-xs text-ink-faint" title={`读取于 ${fmtTime(balance.readAt)}`}>
+      <p className="num text-xs text-ink-faint" title={`读取于 ${fmtTime(balance.readAt)}`}>
         读取于 {timeAgo(balance.readAt)}
-      </div>
+      </p>
     </div>
   );
 }

@@ -31,6 +31,9 @@ const ExchangesPage = lazy(() => import('./pages/ExchangesPage').then((m) => ({ 
 const AccountPage = lazy(() => import('./pages/AccountPage').then((m) => ({ default: m.AccountPage })));
 const SettingsPage = lazy(() => import('./pages/SettingsPage').then((m) => ({ default: m.SettingsPage })));
 const DataPage = lazy(() => import('./pages/DataPage').then((m) => ({ default: m.DataPage })));
+const AppearancePage = lazy(() =>
+  import('./pages/AppearancePage').then((m) => ({ default: m.AppearancePage })),
+);
 const FaqPage = lazy(() => import('./pages/FaqPage').then((m) => ({ default: m.FaqPage })));
 const NotFoundPage = lazy(() => import('./pages/NotFoundPage').then((m) => ({ default: m.NotFoundPage })));
 
@@ -160,6 +163,14 @@ export function App() {
           element={
             <Lazy>
               <SettingsPage />
+            </Lazy>
+          }
+        />
+        <Route
+          path="/appearance"
+          element={
+            <Lazy>
+              <AppearancePage />
             </Lazy>
           }
         />

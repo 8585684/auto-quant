@@ -17,9 +17,17 @@
  */
 
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import test from 'node:test';
 
-import { axisTicks, hasEquityVariation, rangeSpanMs, EQUITY_BUCKET_MS, CHART_INK } from './equityCurve';
+import {
+  axisTicks,
+  hasEquityVariation,
+  rangeSpanMs,
+  EQUITY_BUCKET_MS,
+  CHART_INK,
+  CHART_INK_VARS,
+} from './equityCurve';
 import { leverageRatio } from './LeverageArc';
 import { equityShape } from '../pages/overviewParts';
 import tailwindConfig from '../../tailwind.config.js';
@@ -120,49 +128,72 @@ test('★ 杠杆表盘的比例：上限不可用时画空槽，而不是画满'
 /*  CHART_INK 与 tailwind 的 token 必须逐位一致                                 */
 /* -------------------------------------------------------------------------- */
 
-test('★ CHART_INK 里的每个十六进制值都必须等于 tailwind 里对应的 token', () => {
+test('★ CHART_INK 的每个键都要有一份 CSS 变量映射，且值等于该变量的兜底色', () => {
   /*
-   * `CHART_INK` 的注释写着它们 *"are kept **identical to the tokens** in
-   * tailwind.config.js"* —— 而**这句话此前没有任何东西在检查**。
+   * ## 这条用例原来钉的是"字面量必须等于 tailwind 的 token"
    *
-   * 它为什么值得钉住：SVG 的 `stroke` / `fill` 吃不了 Tailwind 类，所以曲线、
-   * K 线、杠杆仪表、比例条的底色全是从这里取的字面量。改了 `tailwind.config.js`
-   * 却漏了这个文件，界面会变成**两套配色拼在一起** —— 面板换了、图表还是旧的，
-   * 而**编译、类型检查、构建全都不会报错**。
+   * 现在**那个判据本身过期了**：界面支持两套模板（见 `src/templates/`），
+   * Tailwind 的 token 与 `CHART_INK` 都改成了 CSS 变量的引用 ——
+   * 图上真正取色的是 `readChartInk()`（从 `<html>` 上读**此刻生效**的变量），
+   * 而 `CHART_INK` 退化成"读不到时的兜底"，也就是**原版配色**。
+   *
+   * 于是要钉的东西换了一件：**每个键都必须能被翻译成一个存在的 CSS 变量**。
+   * 漏一个键的表现是那个键永远用兜底色 —— 换模板后别处都变了、只有图表
+   * 的某一个颜色没变（例如网格线还是旧的深灰），而**编译、类型检查、
+   * 构建全都不会报错**。
+   *
+   * 另外钉住"兜底值本身就是原版配色"：`CHART_INK` 的注释说它是
+   * *原版外观*，而下面对每个键断言"首尾是合法的 3/6 位十六进制"——
+   * 一个拼错的兜底色会让 canvas 安静地画不出东西。
    */
-  type Colors = {
-    up: string;
-    down: string;
-    warn: string;
-    accent: string;
-    base: Record<string, string>;
-    ink: Record<string, string>;
-  };
-  const colors = (tailwindConfig as { theme: { extend: { colors: Colors } } }).theme.extend.colors;
+
+  const keys = Object.keys(CHART_INK) as Array<keyof typeof CHART_INK>;
+
+  /* 1. 键集一致：漏一个键 = 那个颜色永远不跟着模板走。 */
+  assert.deepEqual(
+    keys.slice().sort(),
+    (Object.keys(CHART_INK_VARS) as Array<keyof typeof CHART_INK>).slice().sort(),
+    'CHART_INK 与 CHART_INK_VARS 的键必须一一对应 —— 漏掉的键会永远停在兜底色上。',
+  );
 
   /*
-   * 右边写的是**路径**而不是值 —— 这条用例要回答的问题是"两处有没有一起改"，
-   * 把值抄进来只会让它变成"值有没有变"（那是另一件事，而且会在改配色时变成噪音）。
+   * 2. 每个变量名都必须真的在 `index.css` 的 `:root` 里定义。
+   *
+   * 读的是**源码文本**而不是运行时：这条用例在 Node 里跑，没有 DOM 可以
+   * `getComputedStyle`。一个拼错的变量名（`--aq-ink-midd`）在浏览器里
+   * `getPropertyValue` 返回空串、静默回落到兜底色 —— 同样是"别的都变了、
+   * 只有这一个没变"，而这条断言能在 CI 里就把它挡下来。
    */
-  const pairs: Array<[keyof typeof CHART_INK, string, string]> = [
-    ['up', colors.up, 'up'],
-    ['down', colors.down, 'down'],
-    ['warn', colors.warn, 'warn'],
-    ['accent', colors.accent, 'accent'],
-    ['grid', colors.base['750']!, 'base-750'],
-    ['axis', colors.ink.lo!, 'ink-lo'],
-    ['rule', colors.base['600']!, 'base-600'],
-    ['track', colors.base['700']!, 'base-700'],
-    ['surface', colors.base['900']!, 'base-900'],
-    ['inkHi', colors.ink.hi!, 'ink-hi'],
-  ];
+  const css = readFileSync(new URL('../index.css', import.meta.url), 'utf8');
+  for (const key of keys) {
+    const name = CHART_INK_VARS[key];
+    assert.ok(
+      new RegExp(`${name}\\s*:`).test(css),
+      `CHART_INK_VARS.${key} 指向 ${name}，而 index.css 里没有这个变量。` +
+        '—— 在浏览器里它读到空串、静默用兜底色，页面上只会"有一个颜色不跟着换"。',
+    );
 
-  for (const [chartKey, expected, tokenPath] of pairs) {
-    assert.equal(
-      CHART_INK[chartKey],
-      expected,
-      `CHART_INK.${chartKey} 是 ${CHART_INK[chartKey]}，而 tailwind 的 ${tokenPath} 是 ${expected}。` +
-        '—— 两处必须一起改；只改一处会让图表与面板变成两套配色，且不会有任何报错。',
+    /* 3. 兜底色必须是合法的十六进制 —— canvas 拿到非法值不会报错，只是不画。 */
+    assert.match(
+      CHART_INK[key],
+      /^#[0-9a-f]{6}$/i,
+      `CHART_INK.${key} = ${CHART_INK[key]} 不是 6 位十六进制颜色。`,
+    );
+  }
+
+  /*
+   * 4. 控制台模板的 `theme.css` 必须把这些变量**全部覆盖**。
+   *
+   * 这是"两套模板互不影响"的底线：漏掉一个变量，那个颜色在两套模板下
+   * 是同一个色 —— 属于"看起来对、其实没换"，而没有人会去数变量。
+   */
+  const consoleCss = readFileSync(new URL('../templates/console/theme.css', import.meta.url), 'utf8');
+  for (const key of keys) {
+    const name = CHART_INK_VARS[key];
+    assert.ok(
+      new RegExp(`${name}\\s*:`).test(consoleCss),
+      `控制台模板没有覆盖 ${name}（CHART_INK.${key} 用它取色）。` +
+        '—— 漏掉的变量会让那个颜色在换模板时留在原版配色上。',
     );
   }
 });

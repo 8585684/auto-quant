@@ -72,23 +72,39 @@ const TONE_SURFACE: Record<Tone, string> = {
   muted: 'bg-ink-faint',
 };
 
-export function Badge({
-  tone = 'neutral',
-  children,
-  className,
-  title,
-}: {
-  tone?: Tone;
-  children: ReactNode;
-  className?: string;
-  title?: string;
-}) {
+/**
+ * 徽章。
+ *
+ * ## ⚠️ `forwardRef` 在这里**不是装饰**
+ *
+ * 它一直被当作 `<Tooltip>` 的子元素用（两套外壳顶栏的「模拟 / 实盘」、
+ * 时钟偏差、API 权重那几处），而 `Tooltip` 内部是
+ * `<TooltipPrimitive.Trigger asChild>{children}</TooltipPrimitive.Trigger>` ——
+ * Radix 的 `asChild` 会给子元素**挂一个 ref**，靠它定位气泡。
+ *
+ * 普通函数组件没有 ref 通道，React 于是打印
+ * 「Function components cannot be given refs」，**并且把 ref 丢掉**：
+ * 气泡失去锚点、位置不再跟着徽章走。这个过程的界面看起来完全正常，
+ * 只有控制台里那一条警告 —— 属于"没人会去查"的故障。
+ *
+ * 加 `forwardRef` 之后这些用法才真正成立（`Button` 早就是这么写的，
+ * 见本文件下方那段关于 `asChild` 的注释）。
+ */
+export const Badge = forwardRef<
+  HTMLSpanElement,
+  {
+    tone?: Tone;
+    children: ReactNode;
+    className?: string;
+    title?: string;
+  }
+>(function Badge({ tone = 'neutral', children, className, title }, ref) {
   return (
-    <span title={title} className={cn('chip', TONE_CLASS[tone], className)}>
+    <span ref={ref} title={title} className={cn('chip', TONE_CLASS[tone], className)}>
       {children}
     </span>
   );
-}
+});
 
 /**
  * 状态圆点。
@@ -97,19 +113,22 @@ export function Badge({
  * 注意不是 `animate-pulseSoft` —— 那个类名不存在，Tailwind 对不存在的类不报错，
  * 只会**静默不生成样式**：圆点看着没问题，但永远不会闪。
  */
-export function Dot({
-  tone = 'neutral',
-  pulse = false,
-  title,
-  className,
-}: {
-  tone?: Tone;
-  pulse?: boolean;
-  title?: string;
-  className?: string;
-}) {
+/*
+ * 理由同 `Badge`：圆点是纯图标元素，最自然的用法就是塞进 `<Tooltip>` 里 ——
+ * 一旦那样用，没有 ref 通道就会丢掉气泡锚点。
+ */
+export const Dot = forwardRef<
+  HTMLSpanElement,
+  {
+    tone?: Tone;
+    pulse?: boolean;
+    title?: string;
+    className?: string;
+  }
+>(function Dot({ tone = 'neutral', pulse = false, title, className }, ref) {
   return (
     <span
+      ref={ref}
       title={title}
       className={cn(
         'inline-block h-1.5 w-1.5 shrink-0 rounded-full',
@@ -119,7 +138,7 @@ export function Dot({
       )}
     />
   );
-}
+});
 
 /* -------------------------------------------------------------------------- */
 /*  Buttons                                                                    */

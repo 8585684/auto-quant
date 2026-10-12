@@ -195,6 +195,7 @@ packages/
 | [架构文档](docs/ARCHITECTURE.md) | 设计取舍与关键工程决策 |
 | [API 参考](docs/API.md) | 全部 HTTP 端点契约 |
 | [控制台视觉规范](packages/web/DESIGN.md) | 色板、字号、间距、布局与响应式断点 |
+| [模板开发指南](packages/web/TEMPLATES.md) | 换一套外壳/配色：接口、自动发现、契约测试、常见坑 |
 | [部署指南](docs/DEPLOYMENT.md) | 上线流程、反向代理、安全检查清单 |
 | [发布手册](docs/RELEASING.md) | 维护者的发版流程 |
 | [AI 代理指南](docs/AGENTS.md) | 面向自动化编码代理的工作约束 |

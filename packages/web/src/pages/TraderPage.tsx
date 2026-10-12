@@ -30,7 +30,6 @@ import { LeverageArc } from '../components/LeverageArc';
 import {
   EQUITY_RANGES,
   filterByRange,
-  hasEquityVariation,
   type EquityRange,
 } from '../components/equityCurve';
 import { CandlestickChart } from '../components/CandlestickChart';
@@ -59,13 +58,72 @@ type ChartTab = 'equity' | 'candles';
 /**
  * 展开后的权益曲线高度。
  *
- * 220px 在 900px 视口上约 24% 屏高：有形状时够看清趋势，没形状时根本不会画出来
- * （见 `EquityMiniStrip`，`LAYOUT.md` §3「图表只在有数据可看时才占大块」）。
+ * 220px 在 900px 视口上约 24% 屏高。
+ *
+ * ⚠️ **这个高度不再随数据变化。** 曲线以前会在"数据太薄"时塌成
+ * `EquityMiniStrip` 的 36px 细条，于是同一块版面会随数据变高变矮 ——
+ * 用户明确要求"不管有没有数据都保持展开状态一致"（总览页那条的同一句话）。
+ * 细条现在只在**用户自己点了「收起」**时出现，那是显式动作，不是数据决定的。
  *
  * 决策流**不再有对应的常量**：它住在右栏，高度由外壳那份"可视区 − 顶栏"给，
  * 页面手算一个视口高度必然算错（见 `DecisionFeed` 顶部注释）。
  */
-const EQUITY_CHART_HEIGHT = 220;
+/*
+ * 权益曲线的高度：**跟随视口，而不是写死 220px**。
+ *
+ * ## 为什么
+ *
+ * 用户的原话：「这一整块区域，内容你想办法压缩一下，尽最大可能让用户不翻页
+ * 就能看完整信息（尽量不出现滚动条翻页）」。
+ *
+ * 实测 1405x722（主栏可视高度只有 322px，而内容有 622px）：
+ *
+ *     header 62 + 指标卡 90 + 账户条 37 + 图表面板 321 + 间距 112 = 622
+ *
+ * 图表面板里的 220px 是写死的，而主栏在 722 高的窗口下只剩这么点地方 ——
+ * 它必须能被压。改成 `clamp(120px, 22vh, 260px)` 之后：
+ *
+ *   · 722 高的窗口 → 115px
+ *   · 900 高的窗口 → 144px
+ *   · 1080 高的窗口 → 173px（大屏上仍然是一张像样的图）
+ *
+ * 下限 110px 保证曲线还看得出走势（扣掉 X 轴标签后绘图区约 70px）；
+ * 上限 260px 防止 4K 屏上图表变成一块占满半屏的空白。
+ *
+ * ⚠️ **必须是数字，不能是 `clamp(...)` 这种 CSS 字符串。**
+ *
+ * 第一版写成 `clamp(110px, 16vh, 260px)`：recharts 的 `ResponsiveContainer`
+ * 把 `height` 原样写进内联样式（浏览器认），但它**内部还要把这个值解析成
+ * 数字**去算画布尺寸 —— 解析失败就什么都不画。实测症状是容器高度 116px、
+ * 里面 `<svg>` 为 `null`、`path` 数量 0：一块**空白的框**，看起来像"没有数据"。
+ * 所以改由 `useEquityChartHeight()` 在 JS 里算出像素值。
+ */
+const EQUITY_CHART_MIN = 110;
+const EQUITY_CHART_MAX = 260;
+const EQUITY_CHART_RATIO = 0.16;
+
+/**
+ * 图表高度 = `clamp(110, 16vh, 260)`，但**在 JS 里算**。
+ *
+ * 监听 `resize`（而不是 `ResizeObserver` 盯某个容器）：图表高度只跟视口有关，
+ * 而视口变化一定会触发 `resize`。初始值直接读 `window.innerHeight`，
+ * 所以首帧就是对的，不会先画一个错的高度再跳。
+ */
+function useEquityChartHeight(): number {
+  const compute = () =>
+    Math.round(
+      Math.min(EQUITY_CHART_MAX, Math.max(EQUITY_CHART_MIN, window.innerHeight * EQUITY_CHART_RATIO)),
+    );
+  const [height, setHeight] = useState(compute);
+
+  useEffect(() => {
+    const onResize = () => setHeight(compute());
+    window.addEventListener('resize', onResize);
+    return () => window.removeEventListener('resize', onResize);
+  }, []);
+
+  return height;
+}
 
 function num(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
@@ -175,12 +233,21 @@ export function TraderPage() {
   const [tableTab, setTableTab] = useState<TraderTabId>('positions');
   const [chartTab, setChartTab] = useState<ChartTab>('equity');
   const [range, setRange] = useState<EquityRange>('ALL');
+  /* 权益曲线高度跟随视口（见 `useEquityChartHeight` 的说明）。 */
+  const equityChartHeight = useEquityChartHeight();
   /**
-   * 手动覆盖"要不要展开曲线"。
+   * 手动覆盖"要不要收起曲线"。
    *
-   * `null` = 交给数据判断（有形状就展开，平线就收起）；`true` = 操作者自己点开了
-   * 一条平线；`false` = 自己收起了有形状的曲线。切区间时清空覆盖，重新按数据判断 ——
-   * 换一段窗口本来就该重新看一眼。
+   * ⚠️ **默认永远是展开的**（`null` 就走展开），不再由数据形状决定。
+   *
+   * 原来的规则是"有形状（≥3 点且有波动）才展开，否则塌成 36px 的缩略条"。
+   * 那条规则让**同一块版面随数据变高变矮**：机器人刚开始跑时是一行细条，
+   * 跑够两个周期后突然长成 220px 图表，下面的持仓表和决策流跟着上下跳。
+   * 用户的原话是「也是同理」—— 与总览页那条同一个要求：**不管有没有数据，
+   * 展开状态都要一致**。
+   *
+   * 保留手动开关：`true` = 用户自己点开（现在等于默认），`false` = 用户自己
+   * 收起。那是个**显式动作**，与"数据一变版面就跳"是两回事。
    */
   const [chartOverride, setChartOverride] = useState<boolean | null>(null);
   const { runOnce, busyId: runOnceBusyId } = useRunOnce();
@@ -699,19 +766,19 @@ export function TraderPage() {
   /*
    * 图表与缩略条共用同一份"可见区间"数据。
    *
-   * `filterByRange` 必须在这里调用一次，而不是让图表自己筛：收起与否取决于
-   * **当前区间**里有没有形状，两处各筛一次就会出现"图表画的是 7D、判断用的是全部"
-   * 这种自相矛盾的状态。
+   * `filterByRange` 在这里调用一次，而不是让图表自己筛：图表与缩略条用的是
+   * **当前区间**的同一份数据，两处各筛一次会出现"图表画的是 7D、另一处用的是
+   * 全部"这种自相矛盾的状态。
    */
   const windowed = useMemo(() => filterByRange(snapshots, range), [snapshots, range]);
   const windowFirst = windowed[0]?.equity ?? equity;
   const windowDelta = equity - windowFirst;
   const windowPercent = windowFirst !== 0 ? (windowDelta / Math.abs(windowFirst)) * 100 : 0;
-  const curveHasShape = useMemo(
-    () => hasEquityVariation(windowed.map((snapshot) => snapshot.equity)),
-    [windowed],
-  );
-  const curveCollapsed = chartOverride ?? !curveHasShape;
+  /*
+   * 默认展开（`chartOverride === null`）—— 不再看 `windowed` 有没有形状。
+   * 理由见上面 `chartOverride` 的声明。
+   */
+  const curveCollapsed = chartOverride ?? false;
 
   const model = modelsQuery.data?.find((row) => row.id === trader?.aiModelId) ?? null;
   const strategy = strategiesQuery.data?.find((row) => row.id === trader?.strategyId) ?? null;
@@ -1154,6 +1221,13 @@ export function TraderPage() {
             size="lg"
             title="这个机器人还没有完成过任何一次开仓—平仓回合，所以胜率与盈亏比都没有意义。"
             sub={stats ? '完成第一个回合后这里会显示胜率与盈亏比' : '等待统计'}
+            /*
+             * `sub` 带 `truncate`，在窄栏里这句话会被切掉尾巴 —— 而没有 `title`
+             * 时切掉的部分**永远看不到**（`ui:check` 在真实浏览器里抓到过这一条）。
+             * 用 `subTitle` 而不是 `title`：卡片的 `title` 已经在解释"为什么没有
+             * 胜率"，两个提示挤在同一个属性上会互相盖掉。
+             */
+            subTitle={stats ? '完成第一个回合后这里会显示胜率与盈亏比' : '等待统计'}
           />
         )}
       </MetricCard>
@@ -1255,9 +1329,78 @@ export function TraderPage() {
      * 于是 `flex-1` 失效、高度链断掉，决策流拿不到确定高度、内部滚动条随之消失。
      * 这条链是：这里 → `PageShell` 的 `xl:h-full` → 右栏 `max-h-full` → 决策流 `h-full`。
      */
-    <div className="flex h-full min-h-0 flex-col gap-4">
-      <div className="min-h-0 flex-1">
+    /*
+     * ## 主栏与表格区的高度分配（2026-10-13）
+     *
+     * 用户的原话：「这一整块区域，内容你想办法压缩一下，尽最大可能让用户不翻页
+     * 就能看完整信息（尽量不出现滚动条翻页）」。
+     *
+     * 实测 1405x722（内容区 514px）：
+     *
+     *     主栏（PageShell）  322px，装 481px 内容 → 自己内部滚 239px
+     *     表格区             177px（`max-h-[46vh]`）
+     *
+     * 主栏是**盯盘要看的东西**（指标、账户、图表），表格是**参考材料**
+     * （11 列的成交明细）—— 而原来表格先按 46vh 占走一块，主栏只能拿剩下的。
+     * 两者的优先级反了。
+     *
+     * 现在反过来：主栏按**内容**要高度（`shrink-0` 不参与压缩），表格区
+     * `flex-1` 吃掉剩下的、并允许被压到很矮（它内部本来就有滚动条）。
+     * 于是窗口越矮，先被压缩的是表格，主栏始终完整 —— 这正是用户要的次序。
+     *
+     * 上限仍是 46vh：表格在宽屏上不该无限长高，否则同一屏里主栏会显得很短。
+     * 下限交给 `min-h-0` + 内部滚动，不给硬下限 —— 722 高的窗口下它大约
+     * 只剩 130px（够看到表头 + 一行），需要细看时用户点开表格自己滚。
+     */
+    <div className="flex h-full min-h-0 flex-col gap-3">
+      {/*
+        高度分配：**主栏优先**，表格吃剩下的。
+
+        ## 为什么不是平分
+
+        第一版写成两边各 `flex-1`（平分）。1405x722 下内容区 514px，于是主栏
+        251px —— 而它里面的固定内容（页头 62 + 配置摘要 16 + 指标卡 82 +
+        模型策略 16 + 账户条 37 + 间距）就要 213px，留给图表只剩 38px，
+        图表基本不可读；反过来表格那边 251px 里有 122px 是空的。
+
+        主栏是**盯盘要看的东西**（指标、账户、图表），表格是**参考材料**
+        （11 列成交明细）。所以主栏按内容要高度（`flex-none`），表格区
+        `flex-1 min-h-0` 吃剩下的、并且可以被压得很扁 —— 它内部本来就有
+        滚动条（`max-h-[34vh]`），压扁的代价只是"一次少看几行"。
+
+        极端情况下表格会被压到很矮（1405x722 下约 100px，够看到表头 + 一行）。
+        这是**有意的取舍**：要看成交明细时用户自己点开表格滚，
+        而不是让图表长期缩在角落里。
+      */}
+      {/*
+        **主栏按内容要高度**（`flex-none`），表格区吃剩下的（`flex-1`）。
+
+        主栏里的图表高度是 `clamp(110, 16vh, 260)` 算出来的**像素值**，
+        所以主栏的内容高度是确定的 —— `flex-none` 不会出现循环依赖
+        （早先用 `fill` 模式时才会有那个问题，见 `useEquityChartHeight`）。
+
+        表格区 `flex-1 min-h-0`：它在 1405x722 下会被压到一百来像素
+        （够看到标签栏 + 表头 + 一行），内部本来就有滚动条。这是**有意的
+        取舍** —— 用户的原话是「这一整块区域，内容你想办法压缩一下，
+        尽最大可能让用户不翻页就能看完整信息」，而"这一整块"指的是主栏。
+      */}
+      <div className="min-h-0 flex-none">
       <PageShell
+        /*
+         * 主栏区块间距收到 10px（默认 16px）：这一页在主栏里有五个区块，
+         * 五个 16px 就是 80px —— 相当于一整张指标卡。见 `mainClassName` 的说明。
+         */
+        /*
+         * `space-y-2`（8px）+ `flex flex-col`：这一页主栏有五个区块，
+         * 默认的 16px 间距合计 80px —— 在 722 高的窗口下那就是"要不要滚动"
+         * 的全部差距。8px 仍然分得开（区块本身都有边框或底色），
+         * 但省下 40px。
+         *
+         * ⚠️ `flex flex-col` 与 `space-y-2` 并用是有意的：`space-y` 负责
+         * 间距，`flex` 让下面的图表面板能用 `flex-1` 吃掉剩余高度
+         * （`space-y-*` 本身不影响 flex 布局）。
+         */
+        mainClassName="flex flex-col space-y-2"
         aside={
           <DecisionFeed
             traderId={traderId}
@@ -1274,7 +1417,22 @@ export function TraderPage() {
         }
       >
         {/* A. 页头：我是谁 + 什么状态 + 能做什么，常驻一行 --------------- */}
-        <header className="flex flex-wrap items-center gap-x-3 gap-y-2">
+        {/*
+          ⚠️ 宽屏 `xl:flex-nowrap`：这一行有七个元素（返回链接、标题、#id、
+          状态、账户、两个按钮），在 674px 的主栏里总宽约 707px —— 差 37px
+          就放不下，于是 `flex-wrap` 把「启动 / 配置」推到第二行，
+          页头从 28px 变成 62px。那 34px 在 722 高的窗口下正是"图表还剩多少"
+          的分界（实测图表被压到 61px，基本不可读）。
+
+          该被压缩的是**标题**（它本来就 `truncate`），不是把动作挪到另一行：
+          把 `max-w-[24rem]` 换成 `min-w-0 flex-1` 之后标题自己让位，
+          其余元素各就各位，页头稳定一行。窄屏仍保留换行。
+
+          `gap-x-2`（原来 3）：这一行有七个元素、六个间隙，收 4px 就是 24px
+          —— 正好是"[DEMO] 决策审计示例"被截成"[DEMO] 决策审..."的那点差距
+          （标题需要 191px，收窄前只剩 174px）。8px 的间距在徽章之间仍然清楚。
+        */}
+        <header className="flex flex-wrap items-center gap-x-2 gap-y-2 xl:flex-nowrap">
           <Link
             to="/traders"
             className="inline-flex items-center gap-1 text-base text-ink-lo transition hover:text-accent"
@@ -1285,7 +1443,20 @@ export function TraderPage() {
 
           <span className="h-4 w-px bg-base-700" aria-hidden />
 
-          <h1 className="min-w-0 max-w-[24rem] truncate text-xl font-semibold tracking-wide text-ink-hi">
+          <h1
+            /*
+             * `text-lg`（原来 `text-xl`）：主栏宽 674px，这一行七个元素合计
+             * 683px —— 差 9px，标题被截成「[DEMO] 决策审计...」。
+             * 20px → 18px 省下约 19px，正好让标题完整显示。
+             *
+             * 这一页的标题是**数据驱动的机器人名**（可能是任意长度），
+             * 而它旁边的徽章（#id、状态、账户）都是定长的 —— 该让的是标题，
+             * 但也没必要让到"看不清自己打开的是哪个机器人"。
+             */
+            className="min-w-0 flex-1 truncate text-lg font-semibold tracking-wide text-ink-hi"
+            /* 极窄窗口下标题仍可能被截，完整名字必须能从悬停读到。 */
+            title={trader.name}
+          >
             {trader.name}
           </h1>
           <Badge tone="muted">#{trader.id}</Badge>
@@ -1506,6 +1677,17 @@ export function TraderPage() {
         <Panel
           padded={false}
           bodyClassName="p-0"
+          /*
+           * 图表高度由 `EQUITY_CHART_HEIGHT` 的 `clamp(110px, 16vh, 260px)`
+           * 决定，**不再用 `flex-1` 吃剩余高度**。
+           *
+           * 试过 `flex-1` + `fill`（让 recharts 撑满父级）：主栏的高度是
+           * flex 算出来的，而 `height:100%` 需要父级有一个**已解析的**像素
+           * 高度 —— 实测图表在 1405x722 下只拿到 6px（`.recharts-responsive-
+           * container` 的实际高度），曲线整块消失。`clamp()` 给出的是一个
+           * 确定的像素值，recharts 能照用，四种窗口尺寸下都画得出来。
+           */
+          className="shrink-0"
           title={
             <span className="flex items-center gap-1">
               <ChartTabButton active={chartTab === 'equity'} onClick={() => setChartTab('equity')}>
@@ -1587,7 +1769,7 @@ export function TraderPage() {
                   snapshots={snapshots}
                   range={range}
                   baseline={trader.initialEquity}
-                  height={EQUITY_CHART_HEIGHT}
+                  height={equityChartHeight}
                 />
               </div>
             )
@@ -1621,8 +1803,16 @@ export function TraderPage() {
         表格内部本来就有 `max-h-[34vh] overflow-y-auto`（见 `TraderTables`），
         所以这里只需给外层一个上限，让整块（标签栏 + 表体 + 净额桥）
         不超视口的四成半 —— **上面那两块（指标卡与图表）才是盯盘要看的东西。**
+
+        `flex-1` + `min-h-0`：表格区**吃剩下的高度**而不是先占一块
+        （见上面主栏那段的说明）。窗口矮的时候它可以被压得很扁 —— 内部有
+        滚动条，压扁的代价只是"一次少看几行"，而不是"整块消失"。
+
+        `max-h-[30vh]`（原来是 46vh）：主栏优先之后，表格在 722 高的窗口下
+        只剩一百来像素，这个上限只在**高窗口**（≥ 900px）下才起作用 ——
+        那时表格最多占 30vh，多出来的高度留给主栏的图表。
       */}
-      <div className="max-h-[46vh] space-y-4 overflow-y-auto">
+      <div className="min-h-0 max-h-[30vh] flex-1 space-y-4 overflow-y-auto">
         <TraderTables
           traderId={traderId}
           tab={tableTab}
@@ -1825,9 +2015,13 @@ function MetricCard({ children }: { children: ReactNode }) {
   /*
    * `h-full` 是**必须**的，不是装饰：grid 子项默认 `stretch` 只让外层 div 等高，
    * 里面的 `Metric` 想用 `mt-auto` 把 footer 推到底，就得让高度真的传下去。
+   *
+   * `py-2`（原来 `py-3`）：这一页在 722 高的窗口下主栏只有三百来像素，
+   * 五张卡各 90px 里每张有 24px 是上下内边距。收到 16px 之后每张 82px，
+   * 五张省下 40px —— 正好是"要不要滚动"的那点差距。
    */
   return (
-    <div className="h-full min-w-0 rounded-lg border border-base-750 bg-base-900 px-3.5 py-3">{children}</div>
+    <div className="h-full min-w-0 rounded-lg border border-base-750 bg-base-900 px-3.5 py-2">{children}</div>
   );
 }
 

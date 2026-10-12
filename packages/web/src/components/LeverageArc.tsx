@@ -22,7 +22,7 @@
  * `DESIGN.md` §2：状态不能只靠颜色表达。弧长、颜色、以及旁边的 `0.00x / 10x`
  * 三个通道各自都能独立说明"现在用了多少"，红绿色盲用户与看不清细弧的人都不吃亏。
  */
-import { CHART_INK } from './equityCurve';
+import { useChartInk } from './useChartInk';
 
 /** 弧的粗细（px）。细一档：它是卡片内的小图形，不该和主数字抢注意力。 */
 const STROKE = 4;
@@ -52,6 +52,11 @@ export function LeverageArc({
   max: number;
   size?: number;
 }) {
+  /*
+   * 当前外观下的配色。hook 必须在任何提前 return **之前**调用 ——
+   * 这个组件目前没有提前 return，但把 hook 写在第一行是这条规则最容易记住的形式。
+   */
+  const ink = useChartInk();
   const usable = Number.isFinite(leverage) && Number.isFinite(max) && max > 0;
   const ratio = leverageRatio(leverage, max);
 
@@ -66,7 +71,7 @@ export function LeverageArc({
   const half = Math.PI * r;
 
   /* 接近上限时换色：`DESIGN.md` 里 `warn` 是"正在变热"，不是错误。 */
-  const stroke = ratio >= 0.85 ? CHART_INK.warn : ratio >= 0.6 ? CHART_INK.accent : CHART_INK.up;
+  const stroke = ratio >= 0.85 ? ink.warn : ratio >= 0.6 ? ink.accent : ink.up;
 
   return (
     <span className="inline-flex items-center gap-1.5">
@@ -79,7 +84,7 @@ export function LeverageArc({
         className="shrink-0 overflow-visible"
       >
         {/* 空槽 */}
-        <path d={d} fill="none" stroke={CHART_INK.track} strokeWidth={STROKE} strokeLinecap="round" />
+        <path d={d} fill="none" stroke={ink.track} strokeWidth={STROKE} strokeLinecap="round" />
         {/* 填充：用 dasharray 取半圆弧长的一段 */}
         {ratio > 0 && (
           <path
