@@ -439,3 +439,55 @@ test('★ T1 档仍然保留免费兜底（速度优先不等于不要免费）'
   /* 免费信息只从配置来 —— 这里没配，所以两者都是 unknown（不可比）。 */
   assert.ok(cat.byTier.T1_fast.length > 0, 'T1 档不该为空');
 });
+test('★★★ 元数据缺失的模型必须排在最后（实测：一个角色 242 秒）', () => {
+  /*
+   * ## 实测（2026-10-12）
+   *
+   * 网关的 `/v1/models` 里：
+   *
+   * ```
+   *   opencode-go/omen-alpha  context=- maxOut=- reasoning=false levels=0
+   * ```
+   *
+   * 它**既没有上下文长度也没有输出上限**，却因为"不思考"被排到了 **T1 首选**。
+   * 后果链：
+   *   ① 返回空内容（`finish_reason=length`，输出被截断）；
+   *   ② 重试 2 次仍空；
+   *   ③ 降级到思维链模型（慢）；
+   *   ④ **一个角色 242 秒** → 整轮跑不完。
+   *
+   * ## 为什么"缺元数据"该降权
+   *
+   * 整套预算逻辑（`budgetFor`）建立在 `max_output_tokens` 上 ——
+   * 它缺失时**算不出安全的输出预算**，而"算不出来"的表现就是**输出被截断**。
+   *
+   * 所以判据是：**缺元数据 = 不可预测 = 不该当首选**。
+   */
+  const cat = buildCatalog(
+    wirePayload([
+      /*
+       * ⚠️ `ctx: 0` 是"网关没报上下文长度"的模拟 ——
+       * `wirePayload` 的默认值是 200_000，不显式传 0 就测不出这个场景。
+       */
+      { id: 'p/no-meta', reasoning: false, ctx: 0, out: 0 },
+      { id: 'p/has-meta', reasoning: false, ctx: 200_000, out: 32_000 },
+    ]),
+    null,
+    null,
+  );
+  const t1 = cat.byTier.T1_fast;
+  assert.ok(t1.includes('p/no-meta') && t1.includes('p/has-meta'), '两个都该在 T1');
+  assert.ok(
+    t1.indexOf('p/has-meta') < t1.indexOf('p/no-meta'),
+    '★ 元数据完整的必须排在缺元数据的【前面】',
+  );
+});
+
+test('★ 元数据缺失的模型不会被直接剔除（还能当兜底）', () => {
+  /*
+   * 降权而不是剔除：万一所有候选都缺元数据，剔除会让档位**空掉**，
+   * 那比"用一个不可预测的模型"更糟（直接停摆）。
+   */
+  const cat = buildCatalog(wirePayload([{ id: 'p/only-one', reasoning: false, ctx: 0, out: 0 }]), null, null);
+  assert.ok(cat.byTier.T1_fast.includes('p/only-one'), '★ 唯一候选不该被剔除');
+});

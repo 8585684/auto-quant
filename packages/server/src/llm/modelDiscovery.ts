@@ -476,6 +476,34 @@ export function buildCatalog(
   const ctxOf = new Map(models.map((m) => [m.id, m.contextTokens]));
   const reasoningOf = new Map(models.map((m) => [m.id, m.reasoning]));
 
+  /*
+   * ⚠️ **元数据缺失的模型要降权**（2026-10-12 实测踩到）。
+   *
+   * 实测：`opencode-go/omen-alpha` 在网关的 `/v1/models` 里
+   * **既没有 `context_length` 也没有 `max_output_tokens`**：
+   *
+   * ```
+   *   opencode-go/omen-alpha  context=- maxOut=- reasoning=false levels=0
+   * ```
+   *
+   * 而它因为"不思考"被排到了 **T1 首选**，然后：
+   *   ① 返回空内容（`finish_reason=length`，输出被长度上限截断）；
+   *   ② 重试 2 次仍空；
+   *   ③ 降级到思维链模型（慢）；
+   *   ④ **一个角色耗时 242 秒** —— 整轮因此跑不完。
+   *
+   * ## 为什么"缺元数据"该降权
+   *
+   * 我们的整套预算逻辑（`budgetFor`）建立在 `max_output_tokens` 上 ——
+   * 它缺失时我们**无法为这个模型算出一个安全的输出预算**，
+   * 而"算不出来"的表现就是**输出被截断**（空内容）。
+   *
+   * 换句话说：**缺元数据 = 不可预测**。不可预测的模型不该当首选。
+   *
+   * 判据用 `contextTokens > 0`：网关给了上下文长度说明它**至少报了基本能力**。
+   */
+  const metaOf = new Map(models.map((m) => [m.id, m.contextTokens > 0]));
+
   /* `all`（全免费）→ `some`（有免费容量）→ `unknown` → `none`。 */
   const rank: Record<FreeStatus, number> = { all: 0, some: 1, unknown: 2, none: 3 };
 
@@ -485,6 +513,16 @@ export function buildCatalog(
       const rb = reasoningOf.get(b) === true ? 1 : 0;
       const fa = rank[freeOf.get(a) ?? 'unknown'];
       const fb = rank[freeOf.get(b) ?? 'unknown'];
+      /*
+       * ⚠️ **元数据缺失的一律排最后** —— 见上面 `metaOf` 的说明。
+       *
+       * 放在所有其它判据**之前**：一个连上下文长度都不报的模型，
+       * 无论它"看起来"多快、多免费，都**不可预测** ——
+       * 而实测代价是"一个角色 242 秒 + 整轮跑不完"。
+       */
+      const ma = metaOf.get(a) === true ? 0 : 1;
+      const mb = metaOf.get(b) === true ? 0 : 1;
+      if (ma !== mb) return ma - mb;
 
       if (tier === 'T1_fast') {
         /* 体力活：**速度优先** —— 不会思考的排前面。 */
