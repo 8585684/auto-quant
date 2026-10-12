@@ -1384,6 +1384,13 @@ export function TraderPage() {
             mode={trader?.mode ?? 'strategy'}
             /* 下一轮决策的预定时刻 —— 由服务端给出，界面只显示倒计时（见 CycleCountdown）。 */
             nextCycleAt={trader?.nextCycleAt ?? null}
+            /*
+             * ⚠️ **必须传它**（2026-10-13 实测踩到）：`DecisionFeed` 只在
+             * `onToggleFocus !== undefined` 时渲染「全屏」按钮 ——
+             * 我第一版只在聚焦分支传了它，于是**常规视图里根本没有那个按钮**，
+             * 用户**无法进入全屏**（而"进不去全屏"正是他抱怨的那件事）。
+             */
+            onToggleFocus={() => setFeedFocus(true)}
             actions={
               <>
                 {runNowAction}

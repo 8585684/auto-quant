@@ -1115,10 +1115,27 @@ export function DecisionFeed({
                *
                * ⚠️ 窄屏（`lg` 以下）仍然纵向堆叠 —— 两栏在手机上会挤成两条缝。
                */
-              className="flex max-h-[45%] min-h-0 shrink-0 flex-col gap-2 border-b border-base-800 p-2.5 lg:flex-row"
+              className={cn(
+                'flex max-h-[45%] min-h-0 shrink-0 flex-col gap-2 border-b border-base-800 p-2.5',
+                /*
+                 * ⚠️ **两栏只在全屏时用**（2026-10-13 实测修正）。
+                 *
+                 * 第一版无条件两栏 —— 而常规视图的右栏只有 40% 宽
+                 *（实测 723px），拆成两栏后工作流只剩 **295px**，
+                 * **比改动前更窄**。那与用户"展示区域太小"的抱怨正好相反。
+                 *
+                 * 所以：
+                 * ```
+                 *   常规视图（右栏 40%）→ 单列（结论在上、工作流在下）
+                 *   全屏视图（整页宽）  → 两栏（结论在左、工作流在右）
+                 * ```
+                 */
+                focusMode && 'lg:flex-row',
+              )}
             >
               {/*
-                左栏：**结论**（本轮决定）。窄屏在上、宽屏在左。
+                左栏：**结论**（本轮决定）。
+                ⚠️ 全屏时在左，常规时在上 —— 顺序由 `flex-col` / `lg:flex-row` 决定。
                 ⚠️ 它自己也滚 —— 一轮可能有十几条决策。
               */}
               <div className="min-h-0 min-w-0 flex-1 overflow-y-auto lg:max-h-full">
@@ -1130,9 +1147,14 @@ export function DecisionFeed({
               </div>
               {/*
                 右栏：**工作流**（谁在干什么）。
-                ⚠️ `shrink-0` + 固定比例：让它的宽度稳定，不随结论长短跳动。
+                ⚠️ 全屏时才固定宽度；常规视图下它按内容（单列里占满宽度）。
               */}
-              <div className="flex min-h-0 shrink-0 flex-col lg:w-[42%]">
+              <div
+                className={cn(
+                  'flex min-h-0 shrink-0 flex-col',
+                  focusMode && 'lg:w-[42%]',
+                )}
+              >
                 <TeamBoard
                   steps={liveCycle?.steps ?? latestTeamSteps}
                   cycleNumber={liveCycle?.cycleNumber ?? records[0]?.cycleNumber ?? 0}
