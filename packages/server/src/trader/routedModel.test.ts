@@ -262,3 +262,41 @@ test('★ 可以用环境变量关掉（出问题能立刻回到旧行为）', (
   assert.ok(src.includes("AQ_ROLE_GROUPS"), '★ 必须有这个开关');
   assert.ok(src.includes("=== 'off'"), '★ 且 off 时真的不传 ladder');
 });
+test('★★★ T1 的候选链必须【多于一个组】—— 单组一次 5xx 就让整档不可用', () => {
+  /*
+   * ## 实测踩到（2026-10-12）
+   *
+   * 我第一版只写 `['group/team-grunt']`，于是线上出现：
+   * ```
+   *   technical：失败：档位 T1_fast 的候选链全部处于冷却期（1 个模型）
+   *             —— group/team-grunt(上游 5xx，先重试一次，仍失败则换)
+   * ```
+   * **三个 T1 角色共用这一个组** → 一次 5xx → **三个同时不可用**。
+   *
+   * ## 为什么"组内还有 3 个模型"救不了
+   *
+   * 组是**网关侧的一个入口**：网关返回 5xx 时，路由器看到的是
+   * "**这个候选失败了**"，它**不知道组内还有别的**，于是把整组标成冷却。
+   *
+   * ## 所以链上必须多挂几个组
+   *
+   * 它们分属不同供应商组合，**同时挂掉的概率远低于单个组**。
+   */
+  for (const role of ['technical', 'newscaster', 'sentiment', 'market_analyst']) {
+    const chain = ROLE_GROUP_LADDERS[role];
+    assert.ok(chain !== undefined, `★ ${role} 应当绑了路由组`);
+    assert.ok(
+      chain!.length >= 2,
+      `★ ${role} 的链必须 ≥2 个组（当前 ${chain!.length}：${chain!.join(' → ')}）—— ` +
+        '单组一次 5xx 就会让整个档位不可用',
+    );
+    /* 顺序有意义：最快的排第一。 */
+    assert.equal(chain![0], role === 'market_analyst' ? 'group/team-analyst' : 'group/team-grunt');
+  }
+});
+
+test('★ 兜底链里不能有重复项（重复 = 白试一次）', () => {
+  for (const [role, chain] of Object.entries(ROLE_GROUP_LADDERS)) {
+    assert.equal(new Set(chain).size, chain!.length, `★ ${role} 的链里有重复：${chain!.join(' → ')}`);
+  }
+});

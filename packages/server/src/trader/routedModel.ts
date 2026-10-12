@@ -103,7 +103,19 @@ export function tierForRole(role: string): ModelTier {
  *
  * 这些组是第 43 轮按"工种"建的（`magpie group add`），当时**建了却没接线** ——
  * 于是角色走的是发现层自动排的链，实测 `market_analyst` 撞上
- * `group/auto-hy3`（思维链）→ 耗时 39s/121s/**>180s** → 超时 → 零决策。
+ * `group/auto-hy3`（思维链）→ 耗时 39s/121s/**
+ * T1（体力活）的候选链 —— **组 + 兜底组**。
+ *
+ * 见 `ROLE_GROUP_LADDERS` 里"实测踩到"那段：单组一次 5xx 就让整档不可用。
+ */
+const T1_LADDER: readonly string[] = [
+  'group/team-grunt',
+  /* 兜底：分析组里也有快模型，能用就用（有产出好过没有）。 */
+  'group/team-analyst',
+  /* 再兜一层：新闻组是 3 对同名模型跨供应商配对，可用性最高。 */
+  'group/team-news',
+];
+/**>180s** → 超时 → 零决策。
  *
  * ⚠️ **只列我验证过的三个**。其余角色保持原样（发现层自动排序）——
  * 一次全换会让我分不清"哪一处改动导致了什么"。
@@ -115,13 +127,43 @@ export const ROLE_GROUP_LADDERS: Readonly<Record<string, readonly string[]>> = {
    *
    * **关键：不用思维链模型** —— 实测 `group/auto-hy3` 的耗时波动太大
    *（39s / 121s / >180s），而它有 180 秒的硬超时。
+   *
+   * ⚠️ 后面挂了 `team-grunt` 作为**兜底** —— 见下面 `T1_LADDER` 的说明。
    */
-  market_analyst: ['group/team-analyst'],
-  /* 体力活：要快 + 免费。 */
-  technical: ['group/team-grunt'],
-  newscaster: ['group/team-grunt'],
-  sentiment: ['group/team-grunt'],
+  market_analyst: ['group/team-analyst', 'group/team-grunt'],
+  /*
+   * ── 体力活：要快 + 免费。**必须有兜底** ──────────────────────────────
+   *
+   * ## 实测踩到（2026-10-12）
+   *
+   * 我第一版只写 `['group/team-grunt']`，于是实测出现：
+   * ```
+   *   technical：失败：档位 T1_fast 的候选链全部处于冷却期（1 个模型）
+   *             —— group/team-grunt(上游 5xx，先重试一次，仍失败则换)
+   * ```
+   *
+   * **一个组 = 一个候选**，而**一次上游 5xx 就会让它进冷却** ——
+   * 于是三个 T1 角色**同时**不可用（它们共用这一个组）。
+   *
+   * ## 为什么"组内还有模型"救不了
+   *
+   * `group/team-grunt` 组内确实有 3 个模型，但**组是网关侧的一个入口** ——
+   * 网关返回 5xx 时，路由器看到的是"**这个候选失败了**"，
+   * 它**不知道组内还有别的**，于是把整个组标成冷却。
+   *
+   * ## 修法：链上多挂几个组
+   *
+   * 依次尝试：`team-grunt` → `team-analyst` → `team-news`。
+   * 它们分属不同供应商组合，**同时挂掉的概率远低于单个组**。
+   *
+   * ⚠️ 顺序有意义：`team-grunt` 最快最便宜，所以放第一；
+   * 后面两个是"快慢不一但可用"的兜底 —— **有产出永远好过没有产出**。
+   */
+  technical: T1_LADDER,
+  newscaster: T1_LADDER,
+  sentiment: T1_LADDER,
 };
+
 
 /**
  * **档位 → 路由组**（角色没单独指定时的兜底）。
