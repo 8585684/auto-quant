@@ -510,11 +510,11 @@ export function defaultAiTeamConfig(): StrategyConfig {
       /* 动态池 + 成交额排序：最主流、流动性最好的那些。 */
       sourceType: 'coinpool',
       useCoinPool: true,
-      coinPoolLimit: 20,
+      coinPoolLimit: 8,
       coinPoolRank: 'quote_volume',
       /* 同时看持仓量增长最快的 —— 那往往是"有新资金进来"的信号。 */
       useOITop: true,
-      oiTopLimit: 10,
+      oiTopLimit: 4,
       /* 过滤掉稳定币与成交额太小的（滑点会把利润吃光）。 */
       excludeStablecoins: true,
       /* ⚠️ 字段名必须是 minQuoteVolume24h —— 写成 minQuoteVolume 会被 schema 静默丢弃。 */
@@ -681,7 +681,7 @@ export const STRATEGY_PRESETS: StrategyPreset[] = [
         coinPoolRank: 'volatility',
         minQuoteVolume24h: 50_000_000,
         minOpenInterestUsd: 5_000_000,
-        oiTopLimit: 10,
+        oiTopLimit: 4,
         oiTopWindowHours: 1,
       },
       indicators: {

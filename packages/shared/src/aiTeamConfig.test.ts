@@ -104,7 +104,7 @@ test('★★ 动态池的参数都真的生效（同类陷阱的批量检查）'
    */
   const cfg = defaultAiTeamConfig();
   assert.equal(cfg.coinSource.useOITop, true, 'useOITop 要真的生效（默认 false）');
-  assert.equal(cfg.coinSource.oiTopLimit, 10, 'oiTopLimit 要真的生效（默认不是 10）');
-  assert.equal(cfg.coinSource.coinPoolLimit, 20, 'coinPoolLimit 要真的生效');
+  assert.equal(cfg.coinSource.oiTopLimit, 4, 'oiTopLimit 要真的生效（默认不是 4）');
+  assert.equal(cfg.coinSource.coinPoolLimit, 8, 'coinPoolLimit 要真的生效（2026-10-12 从 20 降到 8：20 个候选=15万token提示词，整轮跑不完）');
   assert.equal(cfg.coinSource.coinPoolRank, 'quote_volume');
 });
