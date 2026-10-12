@@ -121,7 +121,10 @@ test('★★ 失败优先于完成（失败过的角色不能被显示成"已完
    * 那会让操作员以为结论是完整的。
    */
   assert.equal(
-    stateOfLastStep([step('newscaster', '失败：新闻数据源不可用', 'analysis', 'error'), step('newscaster', '完成', 'analysis')]),
+    stateOfLastStep([
+      step('newscaster', '失败：新闻数据源不可用', 'analysis', 'error'),
+      step('newscaster', '完成', 'analysis'),
+    ]),
     'failed',
     '★ error 级别必须赢过"完成"措辞',
   );
@@ -167,7 +170,10 @@ test('★★ 编制表之外的新角色不会被丢掉（后端加岗位、前�
 test('★ 用自定义编制表时结果只包含那张表里的岗位（可注入 = 可测）', () => {
   const tiny: FirmRole[] = [firmRoleOf('bull')!, firmRoleOf('bear')!];
   const entries = rosterEntries([step('bull', '第 1 轮：构建做多论证', 'debate')], tiny);
-  assert.deepEqual(entries.map((e) => e.role.id), ['bull', 'bear']);
+  assert.deepEqual(
+    entries.map((e) => e.role.id),
+    ['bull', 'bear'],
+  );
 });
 
 /* -------------------------------------------------------------------------- */

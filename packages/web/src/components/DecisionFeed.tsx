@@ -141,11 +141,24 @@ import {
 import { exchangeErrorLabel, type DecisionRecord, type Decision, type ExecutionLogEntry, type TraderMode } from '@aq/shared';
 import { api, type MarketSymbol } from '../lib/api';
 import { useLiveCycle, useEvents, type LiveCycle } from '../lib/store';
-import { TeamRoster } from './TeamRoster';
-import { FirmRoster } from './FirmRoster';
 import { FeedErrorBoundary } from './FeedErrorBoundary';
 import { parseTeamTrace } from '../lib/teamTrace';
 import { DebateView } from './DebateView';
+/**
+ * **团队看板**（2026-10-12 重做）。
+ *
+ * ⚠️ **只在 `mode === 'ai_team'` 时渲染** —— 另两种模式的界面必须逐字节不变。
+ * 新组件放在 `./TeamBoard/` 下，与旧的那三个（`TeamRoster` / `FirmRoster` /
+ * `DebateView`）并存：旧三个仍在团队模式下用于「组织架构」等既有内容，
+ * 而 `TeamBoard` 替换的是**实时工作流区**与**决策行**这两个主视图。
+ *
+ * 为什么另起一套而不是继续改旧组件：旧那三个用了一整批**本项目 Tailwind
+ * 配置里根本不存在**的类（`border-line` / `bg-surface-2` / `bg-ok`…），
+ * 实测渲染出来没有边框、没有底色、状态灯没有颜色 —— 见 `TeamBoard/roster.ts`
+ * 文件头的完整对照表。那是"改不动"的，只能重写。
+ */
+import { TeamBoard } from './TeamBoard/TeamBoard';
+import { TeamCycleBlock } from './TeamBoard/TeamCycleBlock';
 import { usePolled } from '../lib/hooks';
 import { Badge, Empty, Panel, Spinner3, cn } from './ui';
 import { ActionBadge, STATUS_LABELS, actionLabel, isOpenAction } from './DecisionAudit';
@@ -702,6 +715,47 @@ export function DecisionFeed({
   const listMounted = records.length > 0 || showLive;
 
   /**
+   * **最近一轮里各岗位的步骤** —— 没有在途轮次时，固定工作流区显示这个。
+   *
+   * ## 为什么需要它
+   *
+   * `liveCycle` 只在周期**进行中**存在。若工作流区只在那一刻显示，
+   * 操作员在绝大部分时间里看到的是一个空白的头 —— 而那正是
+   * 「**看不清 AI 运行状态**」的成因之一。
+   *
+   * ## 为什么从 `rawResponse` 解析、而不是读 `cycle_step`
+   *
+   * `cycle_step` **不落库**（见 `domain.ts` 的说明），所以页面刷新之后就没了。
+   * 而每一轮的 `<team>` 块**已经落库**在 `decision_records.raw_response` 里，
+   * 里面有每个角色的产出摘要与模型名（见 `deskOutput.ts` 的 `renderDeskOutcome`）。
+   *
+   * 所以"最近一轮谁做了什么"可以从**任意一条已落库的团队记录**里重建 ——
+   * 不需要给数据库加列、不需要迁移（迁移要动挂着实盘的 `traders` 表，风险不值得）。
+   *
+   * ⚠️ **只取团队记录**：普通/智能托管模式的 `rawResponse` 里没有 `<team>` 块，
+   * `parseTeamTrace` 返回 `null` → 跳过。不然会把别家模式的记录当成团队产出。
+   */
+  const latestTeamSteps = useMemo(() => {
+    for (const record of records) {
+      const trace = parseTeamTrace(record.rawResponse);
+      if (trace === null || trace.members.length === 0) continue;
+      return trace.members.map((member) => ({
+        at: record.timestamp,
+        level: 'info',
+        message: member.text,
+        role: member.role,
+        /*
+         * 阶段：`<team>` 块里没有记阶段，所以**不编造** ——
+         * 传 `null`，界面上那一格就不显示。编一个"分析"出来会让
+         * "这个岗位在哪个阶段"变成一个不可信的数。
+         */
+        phase: null,
+      }));
+    }
+    return [];
+  }, [records]);
+
+  /**
    * 取下一页（更早的 20 条），追加到下面。
    *
    * 游标是"手里最小的 id"，不是偏移量，所以**不会**因为这会儿又跑完了一轮而错位：
@@ -895,104 +949,134 @@ export function DecisionFeed({
           hint="每个周期都会连同完整提示词与原始响应一起持久化 — 运行一次后这里就会填满。"
         />
       ) : (
-        // One scroll container. 每轮 = 元数据行 + 盒子 + 两个文字按钮。
-        //
-        // `flex-1 min-h-0`：高度来自右栏（`h-full` 的确定高度），不是 `max-height`。
-        // `min-h-0` 不能省 —— flex 子项默认 `min-height: auto`，那一项会让滚动区
-        // 永远不肯比内容矮，于是滚动条跑到整栏外面去。
-        //
-        // `max-h-[calc(100dvh-16rem)]` 只在 `xl` 以下生效：那时右栏塌到主内容下面，
-        // 高度是内容高度，没有这个上限就会把整页撑长。
-        //
-        // `space-y-2.5` 而不是相邻的 `border-b`：40 个周期用一条接一条的分隔线排下来，
-        // 会连成一整片、分不清哪里是上一个周期的结尾。
-        <div
-          /*
-           * `ref` + `onScroll` 是**分页与滚动位置**要的两样东西：
-           * 前者给 `IntersectionObserver` 当 `root`（哨兵必须在容器里比较，不能和窗口比），
-           * 也给那个把视口钉住的 `useLayoutEffect` 当测量对象；
-           * 后者维护"提交前"的 `scrollTop`（滚动不触发 React 重渲染，只能自己记）。
-           */
-          ref={scrollerRef}
-          onScroll={(event) => {
-            scrollTopRef.current = event.currentTarget.scrollTop;
-          }}
-          className="min-h-0 flex-1 space-y-2.5 overflow-y-auto p-2.5 max-h-[calc(100dvh-16rem)] xl:max-h-none"
-        >
+        <>
           {/*
-            在途周期钉在**最上面**，早于最新的成品（列表是按周期号倒序的）。
-            它是"现在正在发生的事"，扫视时的第一落点必须是它 ——
-            放在下面等于要操作者先划过一整盒已经结束的决策才看见"它在动"。
-            它不受分页影响：它不属于任何一页，只是钉在这个列表的顶部。
+            ══════════════════════════════════════════════════════════════════
+             **AI 工作流（固定区）** —— 团队模式专属（2026-10-12 用户要求）
+            ══════════════════════════════════════════════════════════════════
+
+            用户原话：
+            > 「在我想象中应该是**固定展示 AI 工作流**，一部分**滚动展示最终决策**
+            >  等关键信息」
+            > 「应该是上面固定展示**各智能体工作状态和摘要**，用户有需要可以手动点击
+            >  打开查看详情」
+
+            ## 为什么是"真正固定"，而不是 `sticky`
+
+            上一版把编制表放在滚动容器**内部**、靠 `sticky top-0` 钉住。那不够：
+            `sticky` 元素仍然是滚动内容的一部分，它参与 `space-y` 布局、
+            会跟着容器一起被裁切，而且它的可用高度会随内容变化 ——
+            工作流区越高，下面的决策区就越矮，而"最高的那一轮"恰好最该看得清。
+
+            现在的工作流区是滚动容器**外面**的兄弟节点（`shrink-0`）：
+            它有自己的高度，决策区拿**剩下**的高度自己滚。
+            于是"上面固定、下面滚动"是布局事实，不是视觉巧合。
+
+            ## 为什么没有在途轮次时**也显示**它
+
+            `liveCycle` 只在周期进行中存在。如果只在那一会儿显示，操作员在
+            绝大部分时间里看到的是一个**空白的头** —— 而这正是"看不清 AI 运行状态"
+            的成因之一。所以：
+              · 有在途轮次 → 显示这一轮的实时状态（谁在进行中/已完成/失败）；
+              · 没有在途轮次 → 仍然显示**完整编制表**（谁在岗、谁规划中、
+                以及最近一轮各岗位的产出摘要），只是时间轴停在最后一轮。
+
+            这样"这家公司有哪些人、各自在干什么"是**常驻**信息，
+            而不是"碰巧抓到了才有"。
           */}
-          {showLive && liveCycle && mode === 'ai_team' && (
+          {mode === 'ai_team' && (
             /*
-             * **团队模式：显示编制表，而不是线性步骤列表。**
+             * ⚠️ **固定区的高度上限用【百分比】，不能用 `vh`**（2026-10-12 实测）。
              *
-             * 用户原话：「团队模式下，决策看板应该很大区别于前两种了，
-             * 看板应该直观显示**有哪些智能体，都是什么分工，都在做什么**」。
+             * 第一版给编制表写了 `max-h-[38vh]`。在 900px 高的视口上那是 342px，
+             * 但固定区还要加上看板头（45px）与外层内边距（20px）——
+             * **实测整块变成 429px，而决策区只剩 123px**。
              *
-             * 为什么不能沿用 `LiveCycleBlock`：它是**按时间**排的一串步骤，
-             * 而团队是**并行**的 —— 按时间排会让 4 个分析师的步骤互相交错，
-             * 看不出"谁在干什么"。编制表按**角色**归并，才是团队的样子。
+             * 123px 装不下一轮决策，于是"上面固定工作流、下面滚动决策"这条
+             * 需求实际上**没有成立**：决策区被压成了装饰。
              *
-             * ── ⚠️ `sticky top-0 z-20`：**工作流固定，决策滚动**（2026-10-12）──
+             * 而 `vh` 在这里本来就是个错的量：决策面板的高度来自右栏
+             * （`h-full` 那条高度链），**不是**视口高度。视口很矮时
+             * （右栏被 `max-h` 截断）`38vh` 会大过整个面板。
              *
-             * 用户原话：
-             * > 「在我想象中应该是**固定展示 AI 工作流**，一部分**滚动展示最终决策**
-             * >  等关键信息」
+             * 改成 `max-h-[45%]`：百分比解析的正是**面板内容区的确定高度**
+             * （上面那个 `min-h-0 flex-1` 的 div），于是决策区**至少**拿到 55%。
+             * 这个上限与视口无关，与面板实际多高有关 —— 那才是对的量。
              *
-             * **他说得对，而且这是团队模式与前两种模式的关键形态差别**：
-             * · 前两种模式是"一轮一轮往下堆"，看历史就是往下滚；
-             * · 团队模式是**常驻的工作台** —— 操作者要一直看得见"现在谁在干什么"，
-             *   而决策是**流水**，滚过去就滚过去了。
-             *
-             * 所以这一块**钉在滚动容器顶部**（`sticky` + 与容器一致的背景色，
-             * 否则下面的决策会从它背后透出来），决策列表在它下面滚。
+             * 面板高度不确定时（`xl` 以下整页流式布局）百分比 max-height 不解析，
+             * 等价于没有上限；那种形态下页面本来就整页滚，不会互相挤。
              */
-            <div className="sticky top-0 z-20 -mx-2.5 -mt-2.5 mb-1 border-b border-line/60 bg-surface-1/95 px-2.5 pb-2 pt-2.5 backdrop-blur-sm">
-              <TeamRoster
-                key={`team-${liveCycle.cycleNumber}`}
-                steps={liveCycle.steps}
-                cycleNumber={liveCycle.cycleNumber}
-                startedAt={liveCycle.startedAt}
+            <div className="flex max-h-[45%] min-h-0 shrink-0 flex-col border-b border-base-800 p-2.5">
+              <TeamBoard
+                steps={liveCycle?.steps ?? latestTeamSteps}
+                cycleNumber={liveCycle?.cycleNumber ?? records[0]?.cycleNumber ?? 0}
+                /*
+                 * ⚠️ **没有在途轮次时传 `null`**，不传 `Date.now()`：
+                 * 计时器从 0 开始跳会因为拿不到真实起点而显示一个编造的时长，
+                 * 而"这一轮跑了 50000 秒"会把操作员引去查一个不存在的事故。
+                 */
+                startedAt={liveCycle?.startedAt ?? null}
               />
             </div>
           )}
+
           {/*
-            **组织架构**（用户 2026-10-12 要求「看板应该直观显示**有哪些智能体、
-            都是什么分工**」）。
+            ══════════════════════════════════════════════════════════════════
+             **决策流水（滚动区）** —— 只有这一块滚
+            ══════════════════════════════════════════════════════════════════
 
-            与 `TeamRoster` 的分工：
-              · `TeamRoster`  —— **这一轮**谁在干什么（实时）；
-              · `FirmRoster`  —— **这家公司有哪些岗位**（参考材料，默认收起）。
+            `flex-1 min-h-0`：高度来自右栏（`h-full` 的确定高度）减去上面的固定区，
+            不是 `max-height`。
+            `min-h-0` 不能省 —— flex 子项默认 `min-height: auto`，那一项会让滚动区
+            永远不肯比内容矮，于是滚动条跑到整栏外面去。
 
-            两者都需要，因为只看实时看不出"还有哪些岗位没人干"——
-            而那正是用户列理想组织时的关切（社区监控、系统工程师等）。
+            `max-h-[calc(100dvh-16rem)]` 只在 `xl` 以下生效：那时右栏塌到主内容下面，
+            高度是内容高度，没有这个上限就会把整页撑长。
 
-            ⚠️ **只在团队模式渲染**：另两种模式没有"团队编制"这个概念，
-            给它们显示组织架构是**语义错误**（用户要求三种模式的看板分开）。
+            `space-y-2.5` 而不是相邻的 `border-b`：40 个周期用一条接一条的分隔线排下来，
+            会连成一整片、分不清哪里是上一个周期的结尾。
           */}
-          {mode === 'ai_team' && (
-            <FirmRoster
-              activeRoles={
-                new Set(
-                  /*
-                   * ⚠️ 显式取值而不是直接 `.role`：`liveCycle.steps` 的**声明类型**
-                   * 只有 `{ at, level, message }` —— `role`/`phase` 是团队模式才推的
-                   * 字段（见 `store.ts` 的 `cycle_step` 摄入分支）。
-                   * 直接访问过不了类型检查，而运行时它们确实存在。
-                   */
-                  (liveCycle?.steps ?? [])
-                    .map((s) => (s as { role?: string | null }).role)
-                    .filter((r): r is string => typeof r === 'string'),
-                )
-              }
-            />
-          )}
+          <div
+            /*
+             * `ref` + `onScroll` 是**分页与滚动位置**要的两样东西：
+             * 前者给 `IntersectionObserver` 当 `root`（哨兵必须在容器里比较，不能和窗口比），
+             * 也给那个把视口钉住的 `useLayoutEffect` 当测量对象；
+             * 后者维护"提交前"的 `scrollTop`（滚动不触发 React 重渲染，只能自己记）。
+             */
+            ref={scrollerRef}
+            onScroll={(event) => {
+              scrollTopRef.current = event.currentTarget.scrollTop;
+            }}
+            className="min-h-0 flex-1 space-y-2.5 overflow-y-auto p-2.5 max-h-[calc(100dvh-16rem)] xl:max-h-none"
+          >
+          {/*
+            非团队模式的在途周期条。
+            团队模式**不再**渲染它 —— 那一轮的状态已经由上面的固定工作流区
+            按岗位摊开了，再插一条线性步骤列表就是同一个事实说两遍
+            （用户对重复信息的容忍度很低，见 `LiveCycleBlock` 里那段注释）。
+          */}
           {showLive && liveCycle && mode !== 'ai_team' && (
             <LiveCycleBlock key={liveCycle.cycleNumber} live={liveCycle} />
           )}
+          {/*
+            ══════════════════════════════════════════════════════════════════
+             **组织架构** —— ⚠️ 团队模式下**已删除**（2026-10-12 重做）
+            ══════════════════════════════════════════════════════════════════
+
+            原来这里挂着一个 `FirmRoster`（20 个岗位按部门展开，默认收起）。
+
+            现在它**合并进上面的固定工作流区**了 —— `TeamBoard` 的编制表已经
+            把同一批岗位按部门摊开，并且**每个岗位都带实时状态**
+            （进行中 / 已完成 / 失败 / 在岗未参与 / 规划中）。
+
+            保留两份的后果是用户已经抱怨过的那种：
+            > 「**为什么还原封不动保留**了…（这模式不是团队了吗？…）」
+            同一个事实在屏幕上出现两次，操作员就要花时间判断"这两处说的是一回事吗"。
+            而 `FirmRoster` 那份**没有实时状态**，它只会让"谁在干活"更难看清。
+
+            ⚠️ 另两种模式本来就不渲染它（`mode === 'ai_team'` 才渲染），
+            所以删掉这段对 `strategy` / `ai_managed` **没有任何影响**。
+          */}
 
           {runs.map((run) => (
             <div key={run.record.id}>
@@ -1008,7 +1092,24 @@ export function DecisionFeed({
                 其余决策与页面照常可用。
               */}
               <FeedErrorBoundary>
-                <CycleBlock record={run.record} symbols={symbolsQuery.data ?? []} mode={mode} />
+                {/*
+                  ⚠️ **团队模式用另一套决策块**（2026-10-12 重做）。
+
+                  差别不只是排版，而是"一轮的答案是什么"：
+                  · `CycleBlock`（前两种模式）—— 一轮的元数据行是
+                    `in/out token │ 缓存 │ 思考占比 │ 耗时`，点开看**一个模型的**
+                    思考过程与提示词；
+                  · `TeamCycleBlock`（团队模式）—— 元数据行是
+                    `时刻 │ 周期 │ **结论**`（六个成本数字进悬停说明，一个都没丢），
+                    点开看**风控官结论 → 各角色产出 → 原始材料**。
+
+                  另两种模式**逐字节不变**（`mode === 'ai_team'` 才走新分支）。
+                */}
+                {mode === 'ai_team' ? (
+                  <TeamCycleBlock record={run.record} symbols={symbolsQuery.data ?? []} />
+                ) : (
+                  <CycleBlock record={run.record} symbols={symbolsQuery.data ?? []} mode={mode} />
+                )}
                 {run.repeats.length > 0 && <RepeatedCycles repeats={run.repeats} />}
               </FeedErrorBoundary>
             </div>
@@ -1061,7 +1162,8 @@ export function DecisionFeed({
           {records.length > 0 && !hasMore && (
             <p className="pt-1 text-center text-xs text-ink-faint">已到最早一轮</p>
           )}
-        </div>
+          </div>
+        </>
       )}
     </Panel>
   );
@@ -1314,31 +1416,26 @@ export function CycleBlock({ record, symbols, mode = 'strategy' }: { record: Dec
       <CycleMeta record={record} />
 
       {/*
-        **团队审计**（只有团队模式才有）—— 用户 2026-10-12 要求
-        「看板应该直观显示**有哪些智能体，都是什么分工，都在做什么**」。
+        ══════════════════════════════════════════════════════════════════════
+         ⚠️ **团队模式不再走 `CycleBlock`**（2026-10-12 重做）
+         ══════════════════════════════════════════════════════════════════════
 
-        数据来源是 `rawResponse` 里本来就有的 `<team>` 块（见 `deskOutput.ts`），
-        所以**不需要给数据库加列**（迁移要动挂着实盘的 `traders` 表，风险不值得）。
-        普通/智能托管模式没有这个块 → `parseTeamTrace` 返回 `null` → 这里不渲染，
-        **另两种模式的界面逐字节不变**。
+         `DecisionFeed` 里那个分支是
+         `mode === 'ai_team' ? <TeamCycleBlock/> : <CycleBlock/>` ——
+         所以团队模式下这三块（`TeamTraceBlock` / `DebateView` / 下面那对
+         「思考过程 · 提示词」按钮）**都不会被渲染**。
+
+         它们没有丢，职责被 `TeamCycleBlock` + `TeamDecisionRow` 接过去了，
+         而且**换了位置**：
+         · `<team>` 块的各角色产出 → 团队决策行展开后的「各角色产出」
+           （带中文角色名与模型名，比这里原来显示 role id 更可读）；
+         · 多空辩论 → 同上（多头/空头/裁决就是三个角色）；
+         · 思考过程 / 提示词 → 团队决策行展开后的「原始材料」，
+           而且要**再点一次**才取（懒加载）—— 它们是排查用的原料，不是主视图。
+
+         留在 `CycleBlock` 里是因为**另两种模式仍然用它**，
+         删掉会破坏 `strategy` / `ai_managed` 的现有界面（用户要求旧模式完全不变）。
       */}
-      <TeamTraceBlock rawResponse={record.rawResponse} />
-
-      {/*
-        **多空辩论视图**（团队模式）。
-
-        用户要求看板「**很大区别于前两种模式**」，而辩论是这个架构里
-        **最该被看住的一环** —— 调研有硬证据：
-
-          · 谄媚（sycophancy）会让辩论的准确率**低于**单智能体基线
-            （arXiv:2509.23055）：两边说着说着就附和了；
-          · agent 是**低方差**的，一个犯错的很可能许多个都错。
-
-        角色列表只显示"已完成"，看不出**多空两边是不是真的对立** ——
-        所以辩论单独一块视图。与 `TeamTraceBlock` 同一个数据源（`<team>` 块），
-        **不需要新增数据库列**，另两种模式不渲染。
-      */}
-      <DebateView members={parseTeamTrace(record.rawResponse)?.members ?? []} />
 
       {/*
         决策盒子：**一轮只有这一个**边框。每条决策只是里面的一段，没有自己的边框。

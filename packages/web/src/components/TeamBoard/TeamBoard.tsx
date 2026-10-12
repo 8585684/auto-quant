@@ -122,6 +122,23 @@ export function TeamBoard({
   const [allOpen, setAllOpen] = useState(false);
   /** 单独展开的岗位（与 `allOpen` 取并集，这样"展开全部"之后再单点收起是可行的）。 */
   const [closed, setClosed] = useState<ReadonlySet<string>>(() => new Set());
+  /**
+   * 「在岗未参与 / 规划中」那批要不要摊开。
+   *
+   * ## 为什么默认收起（这是本组件最重要的一条取舍）
+   *
+   * 编制表有 20 个岗位，而**真正干活的通常只有 7–9 个**。全部摊开时：
+   *
+   *   · 固定区会占掉 ~700px，而决策区只有约 600px —— **滚动决策区被挤到看不见**，
+   *     而那正是用户要的"一部分滚动展示最终决策"（两者会互相毁掉）；
+   *   · 更糟的是**信噪比**：9 行"本轮未参与"会把 7 行真正在干活的压在里面，
+   *     而"谁在干活"才是这个区存在的理由。
+   *
+   * 所以默认只摊开**这一轮真的动过的岗位**，其余压成一行计数 + 可展开。
+   * 计数本身就把"这家公司还有多少人没上场"说清楚了 —— 那是诚实、
+   * 而且不需要占 400px 的诚实。
+   */
+  const [showRest, setShowRest] = useState(false);
 
   const isOpen = (id: string): boolean => (allOpen && !closed.has(id)) || (!allOpen && closed.has(id));
 
@@ -137,16 +154,26 @@ export function TeamBoard({
     return set;
   }, [steps]);
 
-  const byDept = useMemo(() => {
+  /*
+   * 分成"本轮动过的"与"没动的"两批。
+   *
+   * `active` / `done` / `failed` 三种都算**动过**（失败也是一种工作状态，
+   * 而且是最该被看见的一种）。
+   */
+  const participated = entries.filter((e) => e.latest !== null);
+  const rest = entries.filter((e) => e.latest === null);
+
+  /** 按部门分组（只对要显示的那一批做，保证部门顺序稳定）。 */
+  const byDept = (list: RosterEntry[]): Array<[string, RosterEntry[]]> => {
     const map = new Map<string, RosterEntry[]>();
     for (const dept of DEPARTMENT_ORDER) map.set(dept, []);
-    for (const entry of entries) {
+    for (const entry of list) {
       const bucket = map.get(entry.role.department);
       if (bucket) bucket.push(entry);
       else map.set(entry.role.department, [entry]);
     }
-    return [...map.entries()].filter(([, list]) => list.length > 0);
-  }, [entries]);
+    return [...map.entries()].filter(([, items]) => items.length > 0);
+  };
 
   const working = entries.filter((e) => e.state === 'active' || e.state === 'done').length;
   const failed = entries.filter((e) => e.state === 'failed').length;
@@ -159,10 +186,26 @@ export function TeamBoard({
   return (
     <section
       aria-label="AI 工作流"
-      className="overflow-hidden rounded-lg border border-base-700 bg-base-900 shadow-panel"
+      /*
+       * ⚠️ **`flex-1 min-h-0` + 纵向 flex**：这个看板要**填满**外层给它的那份高度，
+       * 而不是按内容长高。
+       *
+       * ## 为什么不是 `h-full`
+       *
+       * 外层固定区的高度是**内容高度被 `max-h-[45%]` 夹住**的结果 ——
+       * 对 `height: 100%` 来说那是"未定义高度"，百分比会退回 `auto`，
+       * 于是这个看板按内容长高、把固定区撑破，`max-h` 形同虚设。
+       *
+       * `flex-1` 走的是另一条路：外层高度被 `max-h` 夹到小于内容时，
+       * 自由空间为负，`flex-shrink` 把这一项压回去 —— 高度链才真正成立。
+       *
+       * `min-h-0` 不能省：flex 子项默认 `min-height: auto`，那一项会让它
+       * 永远不肯比内容矮，下面那个编制表的 `overflow-y-auto` 就永远不会滚。
+       */
+      className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-lg border border-base-700 bg-base-900 shadow-panel"
     >
       {/* ── 头：这一轮是谁、跑了多久、走到哪一步 ───────────────────────── */}
-      <header className="flex flex-wrap items-center gap-x-3 gap-y-1.5 border-b border-base-750 bg-base-850 px-3 py-2">
+      <header className="flex shrink-0 flex-wrap items-center gap-x-3 gap-y-1.5 border-b border-base-750 bg-base-850 px-3 py-2">
         <span className="flex items-center gap-1.5 text-base font-semibold text-ink-hi">
           <span aria-hidden className="h-1.5 w-1.5 rounded-full bg-accent animate-pulse-soft" />
           AI 工作流
@@ -228,37 +271,128 @@ export function TeamBoard({
       {entries.length === 0 ? (
         <p className="px-3 py-4 text-xs text-ink-faint">团队正在组建 —— 还没有任何岗位登记。</p>
       ) : (
-        <div className="space-y-2 p-2.5">
-          {byDept.map(([dept, list]) => (
-            <div key={dept} className="overflow-hidden rounded-md border border-base-750">
-              <div className="flex items-center gap-2 border-b border-base-750 bg-base-850 px-2.5 py-1">
-                <span className="text-xs font-semibold text-ink-mid">{dept}</span>
-                <span className="num text-[11px] text-ink-faint">{list.length} 个岗位</span>
-              </div>
-              <ul className="divide-y divide-base-800">
-                {list.map((entry) => (
-                  <li key={entry.role.id}>
-                    <AgentRow
-                      entry={entry}
-                      open={isOpen(entry.role.id)}
-                      onToggle={() =>
+        <div
+          /*
+           * ⚠️ **`flex-1 min-h-0` —— 高度由外层固定区给，不是又一层 `max-h`。**
+           *
+           * 上一版这里写的是 `max-h-[38vh] overflow-y-auto`，那是错的：
+           * `38vh` 是**视口**的 38%，而决定这里该多高的是**面板**的高度
+           * （右栏那条 `h-full` 链）。900px 视口上 38vh = 342px 看着还行，
+           * 可它上面还有看板头与外层内边距 —— 实测整块固定区到 429px，
+           * 决策区只剩 123px，**装不下一轮决策**。
+           *
+           * 现在：外层是 `max-h-[45%]` 的 flex 容器，这里 `flex-1 min-h-0`
+           * 拿"剩下的高度"并自己滚。`min-h-0` 不能省 —— flex 子项默认
+           * `min-height: auto`，那一项会让它永远不肯比内容矮，滚动条就消失了。
+           */
+          className="min-h-0 flex-1 space-y-2 overflow-y-auto p-2.5"
+        >
+          {byDept(participated).map(([dept, list]) => (
+            <DeptGroup
+              key={dept}
+              dept={dept}
+              list={list}
+              steps={steps}
+              isOpen={isOpen}
+              onToggle={(id) =>
+                setClosed((prev) => {
+                  const next = new Set(prev);
+                  if (next.has(id)) next.delete(id);
+                  else next.add(id);
+                  return next;
+                })
+              }
+            />
+          ))}
+
+          {/*
+            其余岗位（在岗未参与 / 规划中）—— **压成一行**。
+            计数本身就说清了"这家公司还有多少人没上场"，那是诚实，
+            而且不需要占 400px 的诚实（见上面 `showRest` 的说明）。
+          */}
+          {rest.length > 0 && (
+            <div className="overflow-hidden rounded-md border border-base-750">
+              <button
+                type="button"
+                onClick={() => setShowRest((v) => !v)}
+                aria-expanded={showRest}
+                className="flex w-full items-center gap-2 bg-base-850 px-2.5 py-1.5 text-left transition hover:bg-base-800"
+              >
+                <ChevronRight
+                  aria-hidden
+                  className={`h-3.5 w-3.5 shrink-0 text-ink-faint transition-transform ${showRest ? 'rotate-90' : ''}`}
+                />
+                <span className="text-xs font-semibold text-ink-mid">其余岗位</span>
+                <span className="num text-[11px] text-ink-faint">{rest.length} 个</span>
+                <span className="min-w-0 flex-1 truncate text-[11px] text-ink-faint">
+                  {idleStaffed > 0 && `在岗未参与 ${idleStaffed}`}
+                  {idleStaffed > 0 && planned > 0 && ' · '}
+                  {planned > 0 && `规划中 ${planned}（还没实现）`}
+                </span>
+                <span className="shrink-0 text-[11px] text-ink-lo">{showRest ? '收起' : '展开'}</span>
+              </button>
+              {showRest && (
+                <div className="space-y-2 p-2.5">
+                  {byDept(rest).map(([dept, list]) => (
+                    <DeptGroup
+                      key={dept}
+                      dept={dept}
+                      list={list}
+                      steps={steps}
+                      isOpen={isOpen}
+                      onToggle={(id) =>
                         setClosed((prev) => {
                           const next = new Set(prev);
-                          if (next.has(entry.role.id)) next.delete(entry.role.id);
-                          else next.add(entry.role.id);
+                          if (next.has(id)) next.delete(id);
+                          else next.add(id);
                           return next;
                         })
                       }
-                      steps={steps.filter((s) => s.role === entry.role.id)}
                     />
-                  </li>
-                ))}
-              </ul>
+                  ))}
+                </div>
+              )}
             </div>
-          ))}
+          )}
         </div>
       )}
     </section>
+  );
+}
+
+/** 一个部门一组岗位。抽出来是因为"参与过的"与"其余"两处都要用同一套渲染。 */
+function DeptGroup({
+  dept,
+  list,
+  steps,
+  isOpen,
+  onToggle,
+}: {
+  dept: string;
+  list: RosterEntry[];
+  steps: readonly TeamStep[];
+  isOpen: (id: string) => boolean;
+  onToggle: (id: string) => void;
+}): React.ReactElement {
+  return (
+    <div className="overflow-hidden rounded-md border border-base-750">
+      <div className="flex items-center gap-2 border-b border-base-750 bg-base-850 px-2.5 py-1">
+        <span className="text-xs font-semibold text-ink-mid">{dept}</span>
+        <span className="num text-[11px] text-ink-faint">{list.length} 个岗位</span>
+      </div>
+      <ul className="divide-y divide-base-800">
+        {list.map((entry) => (
+          <li key={entry.role.id}>
+            <AgentRow
+              entry={entry}
+              open={isOpen(entry.role.id)}
+              onToggle={() => onToggle(entry.role.id)}
+              steps={steps.filter((s) => s.role === entry.role.id)}
+            />
+          </li>
+        ))}
+      </ul>
+    </div>
   );
 }
 

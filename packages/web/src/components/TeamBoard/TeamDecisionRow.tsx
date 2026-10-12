@@ -129,6 +129,28 @@ export function roleLabel(role: string): string | null {
   return ROLE_LABEL[role] ?? null;
 }
 
+/**
+ * 取一个**真的有值**的数值，否则 `null`。
+ *
+ * ## ⚠️ 为什么不能写 `x !== null`（2026-10-12 实测抓到的真 BUG）
+ *
+ * `Decision` 的字段在**类型上**是 `number | null`，但决策记录是**跨版本累积**的、
+ * 而且是从模型输出解析来的 —— 运行时完全可能是 `undefined`
+ *（老记录缺字段、模型没给那个键）。
+ *
+ * `undefined !== null` 是 **`true`**，于是判据放行、渲染一个 `undefined`：
+ * 屏幕上出现的是 `置信度 %`（数字没了、百分号还在）、
+ * `名义 —`、`止损 —` —— 而它们看起来像"这个数据是空的"，
+ * 掩盖了真正的真相"**这个字段根本不存在**"。
+ *
+ * 同一个 bug 在 `DecisionFeed.tsx` 的 `num()` 里也犯过，本仓库已经修过一次。
+ * 这里用 `typeof` + `Number.isFinite` 一并挡掉 `null` / `undefined` / `NaN`
+ * （`NaN` 同样会让 `fmtUsd` 输出 `—`，而 `—` 会被读成"没有这个数据"）。
+ */
+function numOrNull(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
 /* -------------------------------------------------------------------------- */
 /*  决策行                                                                     */
 /* -------------------------------------------------------------------------- */
@@ -166,12 +188,12 @@ export function TeamDecisionRow({
         */}
         <span className="text-xs text-ink-lo">
           置信度{' '}
-          {decision.confidence === null ? (
+          {numOrNull(decision.confidence) === null ? (
             <span className="text-ink-faint" title="模型这一条决策里没有给出 confidence 字段。">
               未给出
             </span>
           ) : (
-            <span className="num text-accent">{decision.confidence}%</span>
+            <span className="num text-accent">{numOrNull(decision.confidence)}%</span>
           )}
         </span>
 
@@ -276,33 +298,49 @@ function KeyFigures({ decision, price }: { decision: Decision; price: number | n
   const parts: Array<{ label: string; value: string; title: string }> = [];
   const isOpen = decision.action.startsWith('open_');
 
+  /*
+   * ⚠️ **全部经 `numOrNull` 收口**（2026-10-12 实测抓到的真 BUG）。
+   *
+   * 这里原来写的是 `decision.stopLoss !== null`。而运行时 `stopLoss` 可能是
+   * **`undefined`**（老记录缺字段 / 模型没给那个键），`undefined !== null` 为真 ——
+   * 于是判据放行，`fmtPriceUsd(undefined)` 渲染出一个 `—`。
+   *
+   * **屏幕上的后果是**：`名义 — · 现价 83,554.90 · 止损 — · 止盈 —`
+   * 看起来像"这一单没有设止损止盈"，而真相是"这几个字段根本不存在"。
+   * 对一个会动用真金的系统来说，这两种情况**必须可区分**。
+   */
+  const size = numOrNull(decision.positionSizeUsd);
+  const stop = numOrNull(decision.stopLoss);
+  const target = numOrNull(decision.takeProfit);
+  const leverage = numOrNull(decision.leverage);
+  const livePrice = numOrNull(price);
+
   if (isOpen) {
-    parts.push({ label: '名义', value: fmtUsd(decision.positionSizeUsd, 2), title: '名义价值（USDT）' });
-    if (price !== null) parts.push({ label: '现价', value: fmtPriceUsd(price), title: '当前价格' });
-    if (decision.stopLoss !== null)
-      parts.push({ label: '止损', value: fmtPriceUsd(decision.stopLoss), title: '止损价' });
-    if (decision.takeProfit !== null)
-      parts.push({ label: '止盈', value: fmtPriceUsd(decision.takeProfit), title: '止盈价' });
-    if (price !== null && decision.stopLoss !== null && decision.takeProfit !== null) {
+    if (size !== null) parts.push({ label: '名义', value: fmtUsd(size, 2), title: '名义价值（USDT）' });
+    if (livePrice !== null) parts.push({ label: '现价', value: fmtPriceUsd(livePrice), title: '当前价格' });
+    if (stop !== null) parts.push({ label: '止损', value: fmtPriceUsd(stop), title: '止损价' });
+    if (target !== null) parts.push({ label: '止盈', value: fmtPriceUsd(target), title: '止盈价' });
+    if (livePrice !== null && stop !== null && target !== null) {
       /* `Math.abs` 两侧：做空时价格在止损之上、止盈之下，直接相减会得到负的盈亏比。 */
-      const risk = Math.abs(price - decision.stopLoss);
-      const reward = Math.abs(price - decision.takeProfit);
+      const risk = Math.abs(livePrice - stop);
+      const reward = Math.abs(target - livePrice);
       if (risk > 0) parts.push({ label: '盈亏比', value: `1:${(reward / risk).toFixed(2)}`, title: '到止盈的距离 ÷ 到止损的距离' });
     }
-    if (decision.leverage > 0) parts.push({ label: '杠杆', value: `${decision.leverage}x`, title: '杠杆倍数' });
+    if (leverage !== null && leverage > 0) parts.push({ label: '杠杆', value: `${leverage}x`, title: '杠杆倍数' });
   } else if (decision.action === 'adjust_protection') {
-    if (decision.stopLoss !== null)
-      parts.push({ label: '止损 →', value: fmtPriceUsd(decision.stopLoss), title: '调整后的止损价' });
-    if (decision.takeProfit !== null)
-      parts.push({ label: '止盈 →', value: fmtPriceUsd(decision.takeProfit), title: '调整后的止盈价' });
+    if (stop !== null) parts.push({ label: '止损 →', value: fmtPriceUsd(stop), title: '调整后的止损价' });
+    if (target !== null) parts.push({ label: '止盈 →', value: fmtPriceUsd(target), title: '调整后的止盈价' });
   } else if (decision.action === 'reduce_position') {
-    if (decision.reducePercent !== null)
+    const percent = numOrNull(decision.reducePercent);
+    const quantity = numOrNull(decision.reduceQuantity);
+    if (percent !== null) {
       /* ⚠️ `reducePercent` 是**百分数**（服务端 `/100` 才是比例）—— 不要再除 100。 */
-      parts.push({ label: '减仓', value: `${decision.reducePercent.toFixed(1)}%`, title: '按持仓数量计的百分比' });
-    else if (decision.reduceQuantity !== null)
-      parts.push({ label: '减仓', value: String(decision.reduceQuantity), title: '要卖出的数量' });
+      parts.push({ label: '减仓', value: `${percent.toFixed(1)}%`, title: '按持仓数量计的百分比' });
+    } else if (quantity !== null) {
+      parts.push({ label: '减仓', value: String(quantity), title: '要卖出的数量' });
+    }
   } else if (decision.action === 'add_to_position') {
-    parts.push({ label: '加仓', value: fmtUsd(decision.positionSizeUsd, 2), title: '再投入的金额（USDT）' });
+    if (size !== null) parts.push({ label: '加仓', value: fmtUsd(size, 2), title: '再投入的金额（USDT）' });
   }
 
   if (parts.length === 0) return null;
