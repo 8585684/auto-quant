@@ -744,6 +744,34 @@ export function shouldEarlyWake(input: {
   return { wake: true, reason: 'ok' };
 }
 
+/**
+ * **安全解析 `positions.intel_keys`**（2026-10-12）。
+ *
+ * ## 为什么不能直接 `JSON.parse`
+ *
+ * 这个字段来自 DB，而 DB 里的内容**可能不是合法 JSON**：
+ * · 老行（M17 之前）默认 `'[]'` —— 那个没问题；
+ * · 但如果将来有人手改过、或某次写入被截断，`JSON.parse` 会**抛错**，
+ *   而它发生在**平仓路径**上 —— 一笔正常的平仓会因为一个附属字段而失败。
+ *
+ * **附属的统计字段绝不该让主流程失败。**
+ *
+ * ## 为什么坏值降级成 `[]`（而不是跳过这笔成交）
+ *
+ * `[]` 的语义是"**纯技术面成交**" —— 那是**保守且安全**的降级：
+ * 最坏结果是"这笔成交没被计入某个消息面信号的统计"，
+ * 而不是"这笔成交没被记账"。
+ */
+function parseIntelKeysOf(raw: string | null | undefined): string[] {
+  if (raw === null || raw === undefined || raw.length === 0) return [];
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((k): k is string => typeof k === 'string' && k.length > 0);
+  } catch {
+    return [];
+  }
+}
 export class AutoTrader {
   private timer: NodeJS.Timeout | null = null;
   private running = false;
@@ -5142,6 +5170,21 @@ export class AutoTrader {
       source: 'bot',
       entryOrderId: authoritative?.entryOrderId ?? null,
       exitOrderId: authoritative?.exitOrderId ?? null,
+      /*
+       * **把开仓时记下的情报归因搬到成交上**（归因链最后一环，2026-10-12）。
+       *
+       * `local` 就是那行**仓位记录** —— 开仓时（`positions.insert`）
+       * 已把 `decision.intelKeys` 存在它的 `intel_keys` 上。
+       * 平仓时**直接搬过来**，不需要回查决策记录
+       *（那需要靠 symbol + 时间猜，正是我拒绝过的"猜测式归因"）。
+       *
+       * ⚠️ 仓位行缺这个字段（老数据、收养的仓位）时 `?? []` ——
+       * 语义是"**纯技术面成交**"，与 225 笔历史成交一致。
+       *
+       * ⚠️ 对账路径（`reconcileTradeHistory`）从交易所历史重建时**拿不到**它 ——
+       * 那时为空是**正确的**：那条路径本来就没有决策上下文。
+       */
+      intelKeys: parseIntelKeysOf(local.intel_keys),
       // 这是一笔真实平仓：先查重，别把同一回合记两次（§2.5 的幂等）。
       idempotent: true,
     });
@@ -7350,6 +7393,13 @@ reduceQuantity: null,
         stopOrderId: null,
         tpOrderId: null,
         openReasoning: decision.reasoning,
+        /*
+         * **情报归因**（见 `db/schema.ts` M17）—— 归因链的中间一环。
+         *
+         * ⚠️ 这里存的是**裁决官标注并经 `filterKnownIntelKeys` 校验过**的键
+         *（编造的已被剔除）。`undefined` 时仓库层写 `[]` = 纯技术面。
+         */
+        ...(decision.intelKeys !== undefined ? { intelKeys: decision.intelKeys } : {}),
         status: 'pending',
         entryOrderId: placed.id,
         /* 模型为这一张指定的耐心（没给就是 null = 用配置值）。 */
@@ -8093,6 +8143,14 @@ reduceQuantity: null,
         stopOrderId: null as string | null,
         tpOrderId: null as string | null,
         openReasoning: decision.reasoning,
+        /*
+         * **情报归因**（见 `db/schema.ts` M17）—— 归因链的中间一环。
+         *
+         * 与限价那条路径同一个字段、同一个来源（裁决官标注 + 已校验）。
+         * **两条开仓路径都要写它** —— 否则市价开仓的成交会永远没有归因，
+         * 而 `signalHealth` 会以为"这个消息面信号从没被用过"。
+         */
+        ...(decision.intelKeys !== undefined ? { intelKeys: decision.intelKeys } : {}),
         /*
          * ⚠️ **入场单号必须落在这里**（2026-10-03 实测抓到）。
          *

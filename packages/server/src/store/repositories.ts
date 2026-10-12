@@ -722,6 +722,14 @@ interface PositionRow {
   entry_order_id: string | null;
   /** 模型为这一张挂单指定的耐心（分钟）；`null` = 用系统配置的基础时限。见 `M15_PENDING_WAIT_MINUTES`。 */
   wait_minutes: number | null;
+  /**
+   * **开仓决策依据的情报键**（JSON 数组字符串）。见 `M17_POSITION_INTEL_ATTRIBUTION`。
+   *
+   * ⚠️ 平仓时把它搬到 `trades.intel_keys` —— 那是 `signalHealth`
+   * 失效检测的数据来源。**解析必须容错**（见 `autoTrader.parseIntelKeysOf`）：
+   * 一个附属统计字段绝不该让平仓失败。
+   */
+  intel_keys: string;
 }
 
 /**
@@ -877,10 +885,24 @@ export const positions = {
     entryOrderId?: string | null;
     /** 模型为这一张挂单指定的耐心（分钟）；不传 = 用配置的基础时限。 */
     waitMinutes?: number | null;
+    /**
+     * **这条开仓决策依据了哪几条情报**（`<域名>|<方向>|<标的>`）。
+     *
+     * 见 `db/schema.ts` 的 M17 —— 它是**归因链的中间一环**：
+     * ```
+     *   开仓 → 存在 positions 上（此时决策在手边）
+     *   平仓 → 搬到 trades 上（signalHealth 的数据来源）
+     * ```
+     *
+     * ⚠️ 不传 = `[]` = **纯技术面开仓**（与改动前行为一致）。
+     * 这里存的是**已经过 `filterKnownIntelKeys` 校验**的键 ——
+     * 编造的不该走到这一层。
+     */
+    intelKeys?: readonly string[];
   }): number {
     const { lastInsertRowid } = getDb().run(
-      `INSERT INTO positions (trader_id, symbol, side, quantity, entry_price, leverage, liquidation_price, margin_used, peak_pnl_percent, stop_loss, take_profit, stop_order_id, tp_order_id, open_reasoning, opened_at, status, entry_order_id, wait_minutes)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO positions (trader_id, symbol, side, quantity, entry_price, leverage, liquidation_price, margin_used, peak_pnl_percent, stop_loss, take_profit, stop_order_id, tp_order_id, open_reasoning, opened_at, status, entry_order_id, wait_minutes, intel_keys)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       input.traderId,
       input.symbol,
       input.side,
@@ -898,6 +920,7 @@ export const positions = {
       input.status ?? 'open',
       input.entryOrderId ?? null,
       input.waitMinutes ?? null,
+      JSON.stringify(input.intelKeys ?? []),
     );
     return lastInsertRowid;
   },
@@ -2470,6 +2493,20 @@ export const trades = {
      * 见 `insert()` 内部的说明。
      */
     idempotent?: boolean;
+    /**
+     * **这笔成交的情报归因**（`<域名>|<方向>|<标的>`）。
+     *
+     * 见 `db/schema.ts` 的 M16 与 M17：
+     * ```
+     *   开仓 → 存在 positions.intel_keys（此时决策在手边）
+     *   平仓 → 搬到 trades.intel_keys（signalHealth 的数据来源）
+     * ```
+     *
+     * ⚠️ 不传 = `[]` = **纯技术面成交**（与改动前行为一致）。
+     * 对账路径（`reconcileTradeHistory`）从交易所历史重建时**拿不到**它 ——
+     * 那时为空是正确的（不是"丢了"，而是**那条路径本来就没有决策上下文**）。
+     */
+    intelKeys?: readonly string[];
   }): { id: number; created: boolean } {
     const closedAt = input.closedAt ?? now();
 
@@ -2532,8 +2569,8 @@ export const trades = {
       `INSERT INTO trades (
          trader_id, symbol, side, quantity, entry_price, exit_price, leverage,
          pnl, pnl_percent, fee, close_reason, opened_at, closed_at, hold_minutes,
-         entry_fee, funding_fee, net_pnl, source, entry_order_id, exit_order_id
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         entry_fee, funding_fee, net_pnl, source, entry_order_id, exit_order_id, intel_keys
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       input.traderId,
       input.symbol,
       input.side,
@@ -2554,6 +2591,13 @@ export const trades = {
       input.source ?? 'bot',
       input.entryOrderId ?? null,
       input.exitOrderId ?? null,
+      /*
+       * **这笔成交的情报归因**（见 `db/schema.ts` 的 M16）。
+       *
+       * ⚠️ 不传 = `[]` = **纯技术面成交** —— 与改动前行为一致，
+       * 也让 225 笔历史成交的语义保持一致（它们确实没有情报归因）。
+       */
+      JSON.stringify(input.intelKeys ?? []),
     );
     return { id: lastInsertRowid, created: true };
   },
