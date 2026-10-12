@@ -138,7 +138,7 @@ import {
   TriangleAlert,
   X,
 } from 'lucide-react';
-import { exchangeErrorLabel, type DecisionRecord, type Decision, type ExecutionLogEntry } from '@aq/shared';
+import { exchangeErrorLabel, type DecisionRecord, type Decision, type ExecutionLogEntry, type TraderMode } from '@aq/shared';
 import { api, type MarketSymbol } from '../lib/api';
 import { useLiveCycle, useEvents, type LiveCycle } from '../lib/store';
 import { TeamRoster } from './TeamRoster';
@@ -833,7 +833,20 @@ export function DecisionFeed({
    */
   const headerActions = (
     <span className="flex items-center gap-1.5">
-      <CycleCountdown nextCycleAt={nextCycleAt} />
+      {/*
+        ⚠️ **团队模式不显示"下一轮倒计时"**（用户 2026-10-12 的反馈）。
+
+        用户的原话：
+        > 「**为什么还有下一轮次倒计时，本模式应该是 7X24 不间断工作**，
+        >  不是之前那两种定时分析判断的了，是多 AI 全自动自动工作
+        >  那么这个**倒计时也不应该存在**」
+
+        **他是对的**，而且这不只是显示问题：
+        · 团队模式的运行方式是"有人有活就干"（成交后立即唤醒、AI 自己决定下次什么时候看），
+          而倒计时传达的是"**到点了才会干活**"—— 与它的实际行为矛盾；
+        · 另两种模式（普通 / 智能托管）确实是周期性的，倒计时对它们**仍然是准确信息**。
+        */}
+      {mode !== 'ai_team' && <CycleCountdown nextCycleAt={nextCycleAt} />}
       {actions}
       <button
         type="button"
@@ -979,7 +992,7 @@ export function DecisionFeed({
                 其余决策与页面照常可用。
               */}
               <FeedErrorBoundary>
-                <CycleBlock record={run.record} symbols={symbolsQuery.data ?? []} />
+                <CycleBlock record={run.record} symbols={symbolsQuery.data ?? []} mode={mode} />
                 {run.repeats.length > 0 && <RepeatedCycles repeats={run.repeats} />}
               </FeedErrorBoundary>
             </div>
@@ -1190,7 +1203,7 @@ function TeamTraceBlock({ rawResponse }: { rawResponse: string }): React.ReactEl
     </div>
   );
 }
-export function CycleBlock({ record, symbols }: { record: DecisionRecord; symbols: MarketSymbol[] }) {
+export function CycleBlock({ record, symbols, mode = 'strategy' }: { record: DecisionRecord; symbols: MarketSymbol[]; mode?: TraderMode }) {
   /*
    * 把执行日志按 `action` + `symbol` 配到各自的决策上。
    *
@@ -1427,10 +1440,27 @@ export function CycleBlock({ record, symbols }: { record: DecisionRecord; symbol
         )}
       </div>
 
-      <CycleDetails
-        record={record}
-        counts={{ failed, rejected, skipped }}
-      />
+      {/*
+        ⚠️ **团队模式不显示这两个按钮**（用户 2026-10-12 的反馈）。
+
+        用户的原话：
+        > 「为什么还原封不动保留了**思考过程、提示词查看功能**（这模式不是团队了吗？
+        >  这个就很莫名其妙，如之前我所说应该是**上面固定展示各智能体工作状态和摘要**，
+        >  用户**有需要可以手动点击打开查看详情**）」
+
+        **他说得对**：团队模式该看的是"谁在干什么、结论是什么"，
+        而"某个模型这一轮的思维链"是**排查用的原料**，不是主视图。
+
+        它并没有丢 —— 团队的 `<team>` 审计块里**每个角色都有自己的产出**
+        （见 `TeamTraceBlock`），那才是团队模式下"打开详情"该看到的东西。
+        融合两种模式的原料视图会让主视图永远停在"怎么做出来的"而不是"做了什么"。
+      */}
+      {mode !== 'ai_team' && (
+        <CycleDetails
+          record={record}
+          counts={{ failed, rejected, skipped }}
+        />
+      )}
     </article>
   );
 }
