@@ -1001,6 +1001,13 @@ export const COIN_SOURCE_TYPE_LABELS: Record<CoinSourceType, string> = {
   coinpool: '动态币种池',
   oi_top: '持仓量领先',
   mixed: '混合（并集）',
+  /*
+   * **团队模式专用**：分层漏斗（全市场 → 流动性 → 波动区间 → 交给 AI）。
+   *
+   * 与 `coinpool` 的区别在**层数**：`coinpool` 是一次排序取前 N（一层），
+   * 而漏斗是**多层**、且每层的淘汰都能解释（"你的币死在哪一层"）。
+   */
+  funnel: '分层漏斗（团队模式）',
 };
 
 export function coinSourceTypeLabel(sourceType: string): string {

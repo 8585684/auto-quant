@@ -12,7 +12,7 @@ import { z } from 'zod';
  * - `oi_top`  : symbols with the fastest open-interest growth
  * - `mixed`   : union of the above, de-duplicated, multi-source tags preserved
  */
-export const CoinSourceTypeSchema = z.enum(['static', 'coinpool', 'oi_top', 'mixed']);
+export const CoinSourceTypeSchema = z.enum(['static', 'coinpool', 'oi_top', 'mixed', 'funnel']);
 export type CoinSourceType = z.infer<typeof CoinSourceTypeSchema>;
 
 /** How the dynamic `coinpool` universe is ranked. */
@@ -36,6 +36,17 @@ export const CoinSourceConfigSchema = z.object({
 
   /** How many symbols the dynamic universe contributes. */
   coinPoolLimit: z.number().int().min(1).max(200).default(20),
+  /**
+   * **团队模式：漏斗的第一层要拉多少全市场候选**（`sourceType: 'funnel'` 用）。
+   *
+   * ⚠️ **这是"漏斗的入口宽度"，不是"最终候选数"** —— 最终数量由
+   * `market/funnel.ts` 的 `DEFAULT_FUNNEL` 每层 `keep` 决定（默认 60 → 30）。
+   *
+   * 为什么不复用 `coinPoolLimit`：那是**另两种模式**在用的（只做一层排序取前 N），
+   * 而漏斗需要**先拿到全市场** —— 否则"每层淘汰了多少"这个可解释性会失真
+   *（第一层会显示"淘汰 0"，因为上游已经砍过了）。
+   */
+  funnelUniverseLimit: z.number().int().min(1).max(1500).default(500),
   coinPoolRank: CoinPoolRankSchema.default('quote_volume'),
 
   /** Drop stablecoin pairs and anything below this 24h turnover (USDT). */
