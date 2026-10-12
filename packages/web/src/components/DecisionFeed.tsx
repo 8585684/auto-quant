@@ -935,13 +935,29 @@ export function DecisionFeed({
              * 为什么不能沿用 `LiveCycleBlock`：它是**按时间**排的一串步骤，
              * 而团队是**并行**的 —— 按时间排会让 4 个分析师的步骤互相交错，
              * 看不出"谁在干什么"。编制表按**角色**归并，才是团队的样子。
+             *
+             * ── ⚠️ `sticky top-0 z-20`：**工作流固定，决策滚动**（2026-10-12）──
+             *
+             * 用户原话：
+             * > 「在我想象中应该是**固定展示 AI 工作流**，一部分**滚动展示最终决策**
+             * >  等关键信息」
+             *
+             * **他说得对，而且这是团队模式与前两种模式的关键形态差别**：
+             * · 前两种模式是"一轮一轮往下堆"，看历史就是往下滚；
+             * · 团队模式是**常驻的工作台** —— 操作者要一直看得见"现在谁在干什么"，
+             *   而决策是**流水**，滚过去就滚过去了。
+             *
+             * 所以这一块**钉在滚动容器顶部**（`sticky` + 与容器一致的背景色，
+             * 否则下面的决策会从它背后透出来），决策列表在它下面滚。
              */
-            <TeamRoster
-              key={`team-${liveCycle.cycleNumber}`}
-              steps={liveCycle.steps}
-              cycleNumber={liveCycle.cycleNumber}
-              startedAt={liveCycle.startedAt}
-            />
+            <div className="sticky top-0 z-20 -mx-2.5 -mt-2.5 mb-1 border-b border-line/60 bg-surface-1/95 px-2.5 pb-2 pt-2.5 backdrop-blur-sm">
+              <TeamRoster
+                key={`team-${liveCycle.cycleNumber}`}
+                steps={liveCycle.steps}
+                cycleNumber={liveCycle.cycleNumber}
+                startedAt={liveCycle.startedAt}
+              />
+            </div>
           )}
           {/*
             **组织架构**（用户 2026-10-12 要求「看板应该直观显示**有哪些智能体、
@@ -1060,16 +1076,32 @@ export function DecisionFeed({
  *
  * 返回 `null` 表示这一轮不参与合并。
  */
-function cycleSignature(record: DecisionRecord): string | null {
+export function cycleSignature(record: DecisionRecord): string | null {
   // 失败的轮次永远单独显示：要读的是那一次具体的错误，不是"又失败了一次"。
   if (record.error !== null) return null;
 
+  /*
+   * ⚠️ **两个数组都要兜底**（2026-10-12 实测抓到的真 BUG）。
+   *
+   * 原来只有 `executionLog` 有 `?? []`，而 `decisions` 直接读 —— 于是
+   * 一条**缺 `decisions` 的历史记录**会让这里抛
+   * `Cannot read properties of undefined (reading 'length')`，
+   * 而这发生在**渲染路径**上：`FeedErrorBoundary` 于是把**整块决策看板**
+   * 换成一张错误卡（实测现象就是"最近决策"里出现"这一块渲染失败"，
+   * 团队看板完全不显示）。
+   *
+   * 为什么历史记录会缺字段：决策记录是**跨版本累积**的，
+   * 早先的写入路径/测试数据未必带全字段（实测本地库里就有一条
+   * `[{"symbol":"BTCUSDT","action":"open_long"}]` —— 缺 `confidence`）。
+   * **看板必须容忍旧数据**，否则一次版本升级就会让历史全部打不开。
+   */
   const log = record.executionLog ?? [];
+  const decisions = record.decisions ?? [];
   // 完全空白的一轮也不合并 —— 它本身信息就少，再折起来等于让它消失。
-  if (record.decisions.length === 0 && log.length === 0) return null;
+  if (decisions.length === 0 && log.length === 0) return null;
 
   return JSON.stringify([
-    record.decisions.map((decision) => [decision.action, decision.symbol, decision.confidence]),
+    decisions.map((decision) => [decision.action, decision.symbol, decision.confidence]),
     log.map((entry) => [entry.status, entry.action, entry.symbol, entry.detail]),
   ]);
 }
@@ -1359,12 +1391,12 @@ export function CycleBlock({ record, symbols, mode = 'strategy' }: { record: Dec
           说成了模型的沉默。
         */}
         {record.error === null &&
-          record.decisions.length === 0 &&
-          record.executionLog.length === 0 && (
+          (record.decisions ?? []).length === 0 &&
+          (record.executionLog ?? []).length === 0 && (
             <p className="text-xs text-ink-faint">本周期模型没有给出任何决策。</p>
           )}
 
-        {record.decisions.length > 0 && (
+        {(record.decisions ?? []).length > 0 && (
           // 决策之间只用**间距**分隔（§3），不加分隔线：一条细线在深色底上会
           // 变成第二层边框，而这个盒子里只该有一层。
           <div className="space-y-2.5">
