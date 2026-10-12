@@ -24,6 +24,7 @@
  */
 
 import { readFileSync } from 'node:fs';
+import { filterSuperseded } from './modelFamilies.js';
 
 /** 单个**成员**（某个供应商上的某个模型）的限额事实 —— 这里是布尔，因为成员是确定的。 */
 export interface MemberLimit {
@@ -414,6 +415,13 @@ export interface DiscoveredCatalog {
   appeared: string[];
   /** 这一轮消失的模型（相对上一次），用于告警。 */
   disappeared: string[];
+  /**
+   * **被判定为"过时/重复"而剔除的模型**（2026-10-13 加）。
+   *
+   * 用户报过「我看到很多这种**调用过时模型**的情况」——
+   * 所以"剔了谁、被谁取代、为什么"必须留痕，否则那件事仍然无法追溯。
+   */
+  superseded: Array<{ id: string; by: string; reason: string }>;
 }
 
 /**
@@ -566,14 +574,57 @@ export function buildCatalog(
     });
   }
 
+  /*
+   * ══════════════════════════════════════════════════════════════════════
+   *  ⭐ **剔除"过时版本"与"同供应商别名"**（2026-10-13）
+   * ══════════════════════════════════════════════════════════════════════
+   *
+   * ## 用户的要求（原话）
+   *
+   * > 「我看到很多这种**调用过时模型**的情况…**不能使用过时淘汰的模型**
+   * >  （这个功能需要**你自己想办法解决**，因为模型随时都会更新新版本，
+   * >  **我不可能一直盯着出新版本让你改，而是系统会自己发现，自己更改，自动替换淘汰**）」
+   *
+   * ## 为什么放在这里（而不是维护一份硬编码清单）
+   *
+   * 这个函数是**唯一的模型清单入口** —— 它每次从网关实时拉。
+   * 所以在这里按"清单里有什么"做判断，就**天然满足"系统自己发现"**：
+   * 模型一更新，下一次刷新就自动生效，**不需要任何人改代码**。
+   *
+   * 判据全部在 `modelFamilies.ts`（纯函数、10 条测试），规则是：
+   * ```
+   *   ① 同一供应商 + 同家族 + 同型号 → 只留最高版本
+   *   ② 同一供应商的无版本别名 → 与它的最高版本重复，剔掉
+   * ```
+   * ⚠️ **跨供应商不算重复** —— 它们是冗余（各有额度），必须都留。
+   *
+   * ## 为什么要过滤 `models` 与 `byTier` **两者**
+   *
+   * `byTier` 是候选链的实际来源；而 `models` 是"目录"（界面上会显示、
+   * 别处也会读）。**只过滤一个会导致"目录里看得到、候选链里没有"** 这种
+   * 自相矛盾 —— 而那正是本项目反复踩过的那类问题（说了但不生效）。
+   */
+  const { kept, removed } = filterSuperseded(models.map((m) => m.id));
+  const keptSet = new Set(kept);
+  const liveModels = models.filter((m) => keptSet.has(m.id));
+  for (const tier of Object.keys(byTier) as Array<keyof typeof byTier>) {
+    byTier[tier] = byTier[tier]!.filter((id) => keptSet.has(id));
+  }
+  /*
+   * ⚠️ **剔除明细要留痕** —— 否则"某个模型为什么不在候选链里"无法追溯，
+   * 而那正是用户这次报的问题（他只看到"调用了过时模型"，看不到原因）。
+   */
+  const superseded = removed.map((r) => ({ id: r.id, by: r.by, reason: r.reason }));
+
   const prevIds = new Set((previous?.models ?? []).map((m) => m.id));
-  const nowIds = new Set(models.map((m) => m.id));
+  const nowIds = new Set(liveModels.map((m) => m.id));
 
   return {
-    models,
+    models: liveModels,
     byTier,
     discoveredAt: Date.now(),
-    appeared: previous ? models.filter((m) => !prevIds.has(m.id)).map((m) => m.id) : [],
+    appeared: previous ? liveModels.filter((m) => !prevIds.has(m.id)).map((m) => m.id) : [],
     disappeared: previous ? [...prevIds].filter((id) => !nowIds.has(id)) : [],
+    superseded,
   };
 }
