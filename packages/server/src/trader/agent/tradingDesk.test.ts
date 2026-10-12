@@ -427,3 +427,69 @@ test('★★★ 超时按【输入规模】缩放（固定 60 秒砍掉了 13 �
   assert.equal(roleTimeoutMs('T2_mid', 10_000), 180_000, '10 万字符以内 T2 仍用 180 秒基准');
   assert.equal(roleTimeoutMs('T3_deep', 200_000), 200_000, '20 万字符时 T3 放宽到 200 秒');
 });
+test('★★★ 大材料角色必须拿到【压缩后】的材料，且候选一个都不能少', async () => {
+  /*
+   * ## 实测数据（这条接线的理由）
+   *
+   * ```
+   *   market_analyst  材料 = marketContext（130,917 字符）  ❌ 超时 180s
+   *   technical       材料 = marketContext（130,917 字符）  ❌ 超时 140s
+   *   newscaster      材料 = newsContext（小）              ✅ 完成 55s
+   *   sentiment       材料 = newsContext（小）              ✅ 完成 12s
+   * ```
+   * 而模型本身不慢（同一路由组小输入 2.2 / 5.2 秒）—— **慢的是输入规模**。
+   *
+   * ## ⚠️ 我第一版写错过，这条测试就是防它回来的
+   *
+   * 第一版我"只给第一个标的"（9,227 字符）—— 那**丢掉了其余 11 个候选**，
+   * 而 `market_analyst` 的任务正是"分析**整体**市场状态"。
+   * **那是用"解决超时"换"看不见的信息缺失"。**
+   */
+  const big = [
+    '# 账户',
+    '权益 20.75 USDT',
+    ...Array.from({ length: 6 }, (_, i) =>
+      `### ${i + 1}. SYM${i}USDT（coinpool）\n` +
+      `current_price = ${i}\n` +
+      `价格: [${Array.from({ length: 40 }, (_, j) => j).join(', ')}]`),
+  ].join('\n');
+
+  const seen: Array<{ role: string; ctx: string }> = [];
+  const ask: AskRole = async ({ role, context }) => {
+    seen.push({ role, ctx: context });
+    return { role, modelId: 'stub', data: null, raw: '[]', latencyMs: 1, ok: true };
+  };
+  await runTradingDesk({ ask, ...CTX, marketContext: big });
+
+  const ma = seen.find((s) => s.role === 'market_analyst');
+  const tech = seen.find((s) => s.role === 'technical');
+  assert.ok(ma !== undefined && tech !== undefined);
+
+  /* ① 压缩生效：K 线不再有 40 个点。 */
+  assert.ok(ma!.ctx.length < big.length, `★ 材料应当变小（${big.length} → ${ma!.ctx.length}）`);
+  assert.ok(ma!.ctx.includes('省略前'), '★ K 线序列应当被压缩（留最后 5 点）');
+  /* ② 候选一个都不能少 —— 这是决策依据。 */
+  for (let i = 0; i < 6; i++) {
+    assert.ok(ma!.ctx.includes(`SYM${i}USDT`), `★ 候选 SYM${i}USDT 不能丢`);
+  }
+  /* ③ 账户信息必须保留（角色据此算风险预算）。 */
+  assert.ok(ma!.ctx.includes('权益 20.75'), '★ 账户信息必须保留');
+  /* ④ 两个大材料角色用同一份压缩材料。 */
+  assert.equal(tech!.ctx, ma!.ctx);
+});
+
+test('★ 压缩切不出来时必须退回【原文】（绝不给残缺材料）', async () => {
+  /*
+   * ⚠️ 若切分失败却给一份"残缺材料"，角色会**正常完成**，
+   * 只是结论建立在不完整的信息上 —— **那是看不见的失败**。
+   */
+  const noHeadings = '只有散文，没有任何候选标题。权益 20.75 USDT';
+  const seen: Array<{ role: string; ctx: string }> = [];
+  const ask: AskRole = async ({ role, context }) => {
+    seen.push({ role, ctx: context });
+    return { role, modelId: 'stub', data: null, raw: '[]', latencyMs: 1, ok: true };
+  };
+  await runTradingDesk({ ask, ...CTX, marketContext: noHeadings });
+  const ma = seen.find((s) => s.role === 'market_analyst');
+  assert.equal(ma!.ctx, noHeadings, '★ 切不出来时必须是原文，一字不改');
+});

@@ -41,6 +41,7 @@
 
 import type { ModelTier } from '../../llm/modelCatalog.js';
 import { mapConcurrent } from './pool.js';
+import { compactMarketContext } from './symbolSlices.js';
 
 /** 一个角色的产出（结构化卡片）。 */
 export interface DeskRoleOutput {
@@ -216,17 +217,69 @@ export async function runTradingDesk(input: {
 
   /* ── ① 并行分析：四个分析师各看一个侧面（独立任务 → 可以并行）────────── */
   note('supervisor', 'dispatch', '派出 4 个分析师并行调研');
+  /*
+   * ── **给拿大材料的两个角色一份【紧凑材料】**（2026-10-12 接线）──────────
+   *
+   * ## 为什么（实测数据）
+   *
+   * `#11` 四个分析师里**只有拿大材料的两个超时**：
+   * ```
+   *   market_analyst  材料 = marketContext（130,917 字符）  ❌ 超时 180s
+   *   technical       材料 = marketContext（130,917 字符）  ❌ 超时 140s
+   *   newscaster      材料 = newsContext（小）              ✅ 完成 55s
+   *   sentiment       材料 = newsContext（小）              ✅ 完成 12s
+   * ```
+   * 而**模型本身不慢** —— 实测同一个路由组在小输入下只要 **2.2 / 5.2 秒**。
+   *
+   * ## ⚠️ 我第一版写错了（值得记下来）
+   *
+   * 第一版我写的是"**只给第一个标的**"（`composeSliceContext(shared, slices[0])`），
+   * 理由是"它最小（9,227 字符）"。
+   *
+   * **那是错的**：`market_analyst` 的任务是"分析当前市场的**整体状态**"，
+   * 而 `technical` 要"客观描述**指标与形态**" —— 只给一个标的，
+   * 它们**看不到其余 11 个候选**，于是裁决官拿到的是一份
+   * "只基于一个标的的市场判断"。
+   *
+   * **那是用"解决超时"换"信息缺失"，而且缺失是看不见的** ——
+   * 角色会"正常完成"，只是它的结论建立在一份不完整的材料上。
+   *
+   * ## 正确做法：压缩，但**保留全部候选**
+   *
+   * ```
+   *   原文                      130,917 字符
+   *   压缩后（12 个候选全保留）  ~46,000 字符（小 2.8 倍）
+   * ```
+   * 压缩的是**冗余**（K 线只留最后 5 点、525 行概览裁到 60 行），
+   * 而不是**候选数量** —— 后者是决策依据，不能动。
+   *
+   * ⚠️ **安全性质：切不出来时退回原文**（`compactMarketContext` 返回 `null`）——
+   * **绝不给空材料或残缺材料**（那会让 agent 编造，而操作员看到的是"正常完成"）。
+   *
+   * ⚠️ 可用 `AQ_COMPACT_CONTEXT=off` 关掉（回到改动前的行为）。
+   */
+  const analystContext = (() => {
+    if (process.env.AQ_COMPACT_CONTEXT === 'off') return input.marketContext;
+    const compacted = compactMarketContext(input.marketContext);
+    /*
+     * ⚠️ 切不出来（或一个标的都没有）时**退回原文** —— 不能给残缺材料。
+     */
+    if (compacted === null || compacted.slices.length === 0) return input.marketContext;
+    /* **共享部分 + 全部候选**（每个候选的 K 线已压到 5 点）。 */
+    return [compacted.shared, ...compacted.slices.map((s) => s.text)].join('\n\n');
+  })();
+
   const analysisRoles: Array<{ role: string; tier: ModelTier; context: string; task: string }> = [
     {
       role: 'market_analyst',
       tier: 'T2_mid',
-      context: input.marketContext,
+      context: analystContext,
       task: '分析当前市场的整体状态与值得关注的结构。',
     },
     {
       role: 'technical',
       tier: 'T1_fast',
-      context: input.marketContext,
+      context: analystContext,
       task: '只做指标与形态的客观描述，不要给交易建议。',
     },
     {
