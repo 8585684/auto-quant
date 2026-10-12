@@ -19,7 +19,7 @@
  * —— 不掩码、不截断、不放进 `title`。编辑框为空即"保持原样"。
  */
 import { useCallback, useMemo, useState } from 'react';
-import { Plus, RotateCw, Trash2 } from 'lucide-react';
+import { Landmark, Plus, RotateCw, Trash2 } from 'lucide-react';
 import { api, type ExchangeAccountInput, type ExchangeAccountRow, type ExchangeBalance, type ExchangeBalanceResult, type PreflightCheck } from '../../lib/api';
 import { useApp } from '../../lib/store';
 import { usePolled, useTicker } from '../../lib/hooks';
@@ -80,6 +80,11 @@ function checksPassed(checks: PreflightCheck[]): boolean {
 
 function severityOf(check: PreflightCheck): 'ok' | 'warn' | 'error' {
   return check.severity ?? (check.ok ? 'ok' : check.blocking ? 'error' : 'warn');
+}
+
+/** 按严重度数一项检查里各有几条 —— 结论行要一眼看出"通过 3 项、失败 1 项"。 */
+function countBy(checks: PreflightCheck[], severity: 'ok' | 'warn' | 'error'): number {
+  return checks.filter((check) => severityOf(check) === severity).length;
 }
 
 /** 一次连接测试的结果 + 它发生的时刻。时刻不能省：昨天的绿勾证明不了今天。 */
@@ -254,9 +259,17 @@ export function ExchangeAccountsSection() {
     }
   }, []);
 
-  const openCreate = () => {
+  /**
+   * 打开「添加凭证」。
+   *
+   * `exchangeId` 是可选的：主区那张「支持的交易所」里每一行都能直接进来，
+   * 并把该交易所预选好 —— 否则从那一行点进来，还要在对话框的下拉里
+   * 再找一次同一个交易所（那是纯粹的重复劳动）。
+   */
+  const openCreate = (exchangeId?: string) => {
     // 默认选中目录里第一个真正可用的交易所。
-    const usable = exchanges.find((row) => row.available) ?? exchanges[0];
+    const picked = exchangeId ? exchanges.find((row) => row.id === exchangeId) : undefined;
+    const usable = picked ?? exchanges.find((row) => row.available) ?? exchanges[0];
     setDraft({ ...EMPTY_ACCOUNT, exchange: usable?.id ?? 'binance' });
     setError(null);
     setDraftChecks(null);
@@ -420,8 +433,18 @@ export function ExchangeAccountsSection() {
         两套语言**。`MetricGroup` 自带的分隔线放在卡片内部正合适：它本来就是
         "紧贴上一块的续接块"的设计（`first:border-t-0` 就是照这个用的）。
       */}
-      <Panel bodyClassName="p-4">
-      <MetricGroup title="账户余额" columns={2}>
+      <Panel title="账户概览" bodyClassName="p-4">
+      {/*
+        ⚠️ **`columns={1}`，不是 2。**
+
+        这一栏是 `PageShell` 的伴随栏（视口宽度的 2/5）。`MetricGroup` 的列数是
+        按**视口断点**算的，不看容器宽度 —— `columns={2}` 在 1600px 的视口下
+        照样排两列，于是每列只剩约 200px：权益合计那种 `1,000.00 USDT` 会被
+        `truncate` 切掉，而"切掉"在界面上看不出来。
+
+        竖排一行一个指标也不浪费：这一栏是给人**确认**的，不是给人扫的。
+      */}
+      <MetricGroup title="账户余额" columns={1}>
         {query.loading && accounts.length === 0 ? (
           <p className="text-xs text-ink-lo">正在读取交易所余额…</p>
         ) : accounts.length === 0 ? (
@@ -429,14 +452,12 @@ export function ExchangeAccountsSection() {
             还没有凭证，因此没有余额可读。模拟模式不需要密钥。
           </p>
         ) : totals.counted === 0 ? (
-          <>
-            <Metric label={BALANCE_LABEL.equity} value="—" size="lg" />
-            <p className="text-xs leading-relaxed text-warn">
-              {failedReads > 0
-                ? `${failedReads} 个凭证读取失败，合计未知 —— 读不到不等于余额是 0。`
-                : '尚未读取到余额。点主区的「刷新全部」向交易所重新查询。'}
-            </p>
-          </>
+          /*
+           * 读不到就是读不到 —— 一张写着破折号的卡，理由在卡片下面的注脚里
+           * （见 `</Panel>` 之后那几段）。原来那句理由和这张卡**并排**挤在
+           * 两列网格里，于是一句二十来字的话被压成两行，紧挨着一个破折号。
+           */
+          <Metric label={BALANCE_LABEL.equity} value="—" size="lg" />
         ) : (
           <>
             {/* 这一屏的主数字：操作员的第一个问题就这一个答案 */}
@@ -460,16 +481,6 @@ export function ExchangeAccountsSection() {
                 tone={totals.unrealized > 0 ? 'up' : 'down'}
               />
             )}
-            {failedReads > 0 && (
-              <p className="text-xs leading-relaxed text-warn">
-                {failedReads} 个凭证读取失败，未计入合计。
-              </p>
-            )}
-            {totals.skippedAsset > 0 && (
-              <p className="text-xs leading-relaxed text-warn">
-                {totals.skippedAsset} 个凭证以其他币种计价，未计入合计（混币相加没有意义）。
-              </p>
-            )}
           </>
         )}
       </MetricGroup>
@@ -488,7 +499,7 @@ export function ExchangeAccountsSection() {
         />
       </MetricGroup>
 
-      <MetricGroup title="读取" columns={2}>
+      <MetricGroup title="读取" columns={1}>
         {/*
           只留一个时间，而且用**相对时间**。
           
@@ -515,7 +526,76 @@ export function ExchangeAccountsSection() {
         />
       </MetricGroup>
       </Panel>
+
+      {/*
+        指标卡放不下的**注脚**。
+
+        它们原来在 `MetricGroup` 里面，于是被网格排成了"指标卡旁边的一格" ——
+        一句中文被压成两行，紧挨着一张只有一个破折号的卡。注脚是**整栏**的话，
+        它读起来才像注脚。
+
+        三种情况互斥或叠加，所以分开判：读不到 / 部分失败 / 币种被跳过。
+      */}
+      {accounts.length > 0 && totals.counted === 0 && (
+        <p className="rounded-md border border-warn/40 bg-warn/10 px-3 py-2 text-xs leading-relaxed text-warn">
+          {failedReads > 0
+            ? `${failedReads} 个凭证读取失败，合计未知 —— 读不到不等于余额是 0。`
+            : '尚未读取到余额。点主区的「刷新全部」向交易所重新查询。'}
+        </p>
+      )}
+      {totals.counted > 0 && failedReads > 0 && (
+        <p className="rounded-md border border-warn/40 bg-warn/10 px-3 py-2 text-xs leading-relaxed text-warn">
+          {failedReads} 个凭证读取失败，未计入合计。
+        </p>
+      )}
+      {totals.skippedAsset > 0 && (
+        <p className="rounded-md border border-warn/40 bg-warn/10 px-3 py-2 text-xs leading-relaxed text-warn">
+          {totals.skippedAsset} 个凭证以其他币种计价，未计入合计（混币相加没有意义）。
+        </p>
+      )}
     </div>
+  );
+
+  /*
+   * 支持的交易所目录。
+   *
+   * 它回答的是"这把密钥该往哪加"：`exchanges` 目录此前只在「添加凭证」对话框的
+   * 下拉里露过一面，于是"除了币安还有谁"只能靠点开对话框试。每一行直接带一个
+   * 「添加」，点进去**预选好这一行的交易所**（`openCreate(id)`）。
+   *
+   * 尚未接入的那些也列出来 —— 一行"尚未支持"比"列表里根本没有它"更明确。
+   */
+  const supported = exchanges.length > 0 && (
+    <Panel title="支持的交易所" bodyClassName="p-0">
+      <ul className="divide-y divide-base-800">
+        {exchanges.map((row) => (
+          <li key={row.id} className="flex flex-wrap items-center gap-2 px-3 py-2">
+            <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded border border-base-700 bg-base-800 text-ink-lo">
+              <Landmark aria-hidden className="h-3 w-3" />
+            </span>
+            <span className="min-w-0 truncate text-base text-ink-hi">{row.label}</span>
+            <Badge tone="muted">{row.market}</Badge>
+            {!row.available && <Badge tone="warn">尚未支持</Badge>}
+            <span className="ml-auto">
+              <Button
+                size="sm"
+                variant="ghost"
+                disabled={!row.available}
+                title={
+                  row.available
+                    ? `添加一个「${row.label}」凭证 —— 对话框里会预选它`
+                    : `${row.label} 尚未接入，本终端还不能用它下单`
+                }
+                onClick={() => openCreate(row.id)}
+              >
+                <Plus aria-hidden className="h-3.5 w-3.5" />
+                添加
+              </Button>
+            </span>
+          </li>
+        ))}
+      </ul>
+    </Panel>
   );
 
   /* ------------------------------------------------------------------------ */
@@ -547,7 +627,13 @@ export function ExchangeAccountsSection() {
               message="还没有交易所凭证，因此没有余额可读。"
               hint="模拟模式不需要任何密钥。要接实盘，先添加一把测试网密钥，确认行情、签名与风控这条链路通了再换主网。"
               action={
-                <Button variant="primary" onClick={openCreate} disabled={exchanges.length === 0}>
+                /*
+                 * `() => openCreate()` 而不是 `onClick={openCreate}`：
+                 * `openCreate` 的入参是**交易所 id**，直接当事件处理函数传进去的话
+                 * React 会把 `MouseEvent` 递给它（类型上就报错，运行时更是把事件对象
+                 * 当成 id 查了一遍目录）。空态这里不需要预选，显式不传。
+                 */
+                <Button variant="primary" onClick={() => openCreate()} disabled={exchanges.length === 0}>
                   <Plus aria-hidden className="h-3.5 w-3.5" />
                   添加第一个凭证
                 </Button>
@@ -582,7 +668,7 @@ export function ExchangeAccountsSection() {
                       </Button>
                     }
                     end={
-                      <Button variant="primary" size="sm" onClick={openCreate} disabled={exchanges.length === 0}>
+                      <Button variant="primary" size="sm" onClick={() => openCreate()} disabled={exchanges.length === 0}>
                         <Plus aria-hidden className="h-3.5 w-3.5" />
                         添加凭证
                       </Button>
@@ -608,9 +694,21 @@ export function ExchangeAccountsSection() {
                 );
 
                 return (
-                  <li key={row.id} className="rounded-md border border-base-750 bg-base-850/40 p-3">
-                    {/* 标识行：名称 + 交易所 + 两枚不能看错的徽章 */}
-                    <div className="flex flex-wrap items-center gap-x-2 gap-y-1.5">
+                  /*
+                   * 一张凭证 = 一个**小窗口**：标题条（身份 + 徽章 + 动作）、
+                   * 主体（余额与连接两个读数并列）、页脚（元信息）。
+                   *
+                   * 改造前它是一整块灰底，从名称到时间戳五行文字全部左对齐堆在
+                   * 一起：没有层级，右侧还留着一大片空白。分成三条之后每行的
+                   * 职责一眼可辨，也与控制台外壳的窗口语言一致（`Panel` 的
+                   * `.panel-head` 就是同一个做法），两套模板下都成立。
+                   */
+                  <li key={row.id} className="overflow-hidden rounded-lg border border-base-750 bg-base-900 shadow-panel">
+                    {/* 标题条 */}
+                    <div className="flex flex-wrap items-center gap-x-2 gap-y-2 border-b border-base-800 bg-base-850/60 px-3 py-2">
+                      <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded border border-base-700 bg-base-800 text-ink-lo">
+                        <Landmark aria-hidden className="h-3 w-3" />
+                      </span>
                       <span className="min-w-0 truncate text-lg font-semibold text-ink-hi" title={row.label}>
                         {row.label}
                       </span>
@@ -655,7 +753,7 @@ export function ExchangeAccountsSection() {
                      * 第一行、用更亮的字色，并且读失败时给出可操作的警告 —— 保留它，
                      * 主次由左栏的合计承担。
                      */}
-                    <div className="mt-2 border-t border-base-800 pt-2">
+                    <div className="px-3 py-2.5">
                       <BalanceCell balance={balance} error={balanceError} testnet={row.testnet} now={now} />
                       {balance && asset !== DEFAULT_SETTLE_ASSET && (
                         // 交易所钱包不是 USDT 时，左栏合计不会把它加进去 —— 必须说清。
@@ -665,8 +763,11 @@ export function ExchangeAccountsSection() {
                       )}
                     </div>
 
-                    {/* 元信息：密钥只以服务端给出的掩码出现，且没有回退到原值 */}
-                    <div className="num mt-1.5 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-ink-lo">
+                    {/*
+                      元信息带：**下沉到浅一档的底**，与标题条同一个做法。
+                      密钥只以服务端给出的掩码出现，且没有回退到原值。
+                    */}
+                    <div className="num flex flex-wrap items-center gap-x-4 gap-y-1 border-t border-base-800 bg-base-850/40 px-3 py-2 text-xs text-ink-lo">
                       <span className="min-w-0">
                         API Key <span className="text-ink-mid">{row.apiKeyMasked || '—'}</span>
                       </span>
@@ -699,29 +800,29 @@ export function ExchangeAccountsSection() {
 
                     {/* 连接测试结果：结论、通过项、阻断项、时刻缺一不可 */}
                     {outcome && (
-                      <Collapsible
-                        className="mt-2"
-                        open={
-                          // 失败的结果必须自己展开：折叠起来等于把"密钥不能用了"藏了起来。
-                          openTests[row.id] ?? !passed
-                        }
-                        onOpenChange={(next) => setOpenTests((current) => ({ ...current, [row.id]: next }))}
-                        meta={testedAtLabel}
-                        title={
-                          <span className="flex flex-wrap items-center gap-2">
-                            <span>连接测试</span>
-                            <Badge tone={passed ? 'up' : 'down'}>{passed ? '通过' : '未通过'}</Badge>
-                            <span className="num text-xs text-ink-lo">
-                              {outcome.checks.filter((check) => severityOf(check) === 'ok').length} 项通过 ·{' '}
-                              {outcome.checks.filter((check) => severityOf(check) === 'error').length} 项失败 ·{' '}
-                              {outcome.checks.filter((check) => severityOf(check) === 'warn').length} 项待确认
+                      <div className="px-3 pb-3">
+                        <Collapsible
+                          open={
+                            // 失败的结果必须自己展开：折叠起来等于把"密钥不能用了"藏了起来。
+                            openTests[row.id] ?? !passed
+                          }
+                          onOpenChange={(next) => setOpenTests((current) => ({ ...current, [row.id]: next }))}
+                          meta={testedAtLabel}
+                          title={
+                            <span className="flex flex-wrap items-center gap-2">
+                              <span>连接测试</span>
+                              <Badge tone={passed ? 'up' : 'down'}>{passed ? '通过' : '未通过'}</Badge>
+                              <span className="num text-xs text-ink-lo">
+                                {countBy(outcome.checks, 'ok')} 项通过 · {countBy(outcome.checks, 'error')} 项失败 ·{' '}
+                                {countBy(outcome.checks, 'warn')} 项待确认
+                              </span>
                             </span>
-                          </span>
-                        }
-                      >
-                        {outcome.error && <ErrorNote className="mb-2">{outcome.error}</ErrorNote>}
-                        <CheckList checks={outcome.checks} />
-                      </Collapsible>
+                          }
+                        >
+                          {outcome.error && <ErrorNote className="mb-2">{outcome.error}</ErrorNote>}
+                          <CheckList checks={outcome.checks} />
+                        </Collapsible>
+                      </div>
                     )}
                   </li>
                 );
@@ -736,6 +837,8 @@ export function ExchangeAccountsSection() {
             )}
           </section>
         )}
+
+        {supported}
       </PageShell>
 
       {/* ------------------------------------------------------------------ */}

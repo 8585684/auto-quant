@@ -160,7 +160,21 @@ export function MarketPage() {
         </div>
       </div>
 
-      <div className="grid grid-cols-1 gap-3 md:grid-cols-[minmax(0,300px)_minmax(0,1fr)]">
+      {/*
+        ⚠️ **左栏在 xl 下是 440px，不是 300px。**
+
+        这一列装的是一张 4 列表（交易对 / 价格 / 24h 涨跌 / 24h 成交额）。实测
+        （1440px 视口、控制台模板）它的最小宽度是 **413px**，其中「交易对」一列
+        就被币安那种 `1000BONKUSDT` 这种名字撑到 128px。300px 的容器装不下它：
+        表格撑破容器、右两列滚出可视区，而深色底上那条横向滚动条几乎看不见 ——
+        看起来就是**数字被裁掉了**（用户报的就是这个）。
+
+        所以 xl（≥1280）给 440px：容器内宽 422px > 413px，四列全部露出来。
+        md–lg 之间**故意保持 300px** —— 那一档右列还是 `1fr` 的K线图，把 440px
+        让给左表会把图挤到 300px 上下；窄屏上让表格自己横滚（`scroll-x`）本来就是
+        这一栏的设计。单元格内边距同步收窄到 6px，见 `templates/console/theme.css`。
+      */}
+      <div className="grid grid-cols-1 gap-3 md:grid-cols-[minmax(0,300px)_minmax(0,1fr)] xl:grid-cols-[minmax(0,440px)_minmax(0,1fr)]">
         {/* ---------------------------------------------------------------- */}
         {/*  交易对清单                                                       */}
         {/* ---------------------------------------------------------------- */}
@@ -218,6 +232,12 @@ export function MarketPage() {
                * 而不是把整页顶出横向滚动条（Layout 的内容区会直接裁掉）。
                */}
               <div className="scroll-x max-h-[min(60vh,560px)] overflow-y-auto">
+                {/*
+                  单元格上显式写 `px-1.5`（6px）：两套模板的基础内边距不一样
+                  （经典 `px-3` = 12px、控制台 `0 6px`），而这张表在 440px 的列里
+                  只有 16px 余量 —— 按模板走的话经典那边会多出 48px 又溢出。
+                  宽度是这里最硬的约束，所以密度写成页面级的事实，不交给模板。
+                */}
                 <table className="w-full min-w-[276px] border-collapse">
                   <thead className="sticky top-0 z-10 bg-base-900">
                     <tr>
@@ -226,7 +246,7 @@ export function MarketPage() {
                           key={key}
                           scope="col"
                           aria-sort={sortKey === key ? (sortDir === 'asc' ? 'ascending' : 'descending') : 'none'}
-                          className={cn('th', key !== 'symbol' && 'text-right')}
+                          className={cn('th px-1.5', key !== 'symbol' && 'text-right')}
                         >
                           <button
                             type="button"
@@ -274,15 +294,15 @@ export function MarketPage() {
                             isActive && 'bg-accent/10',
                           )}
                         >
-                          <td className="td font-semibold text-ink-hi">
+                          <td className="td px-1.5 font-semibold text-ink-hi">
                             {row.baseAsset}
                             <span className="text-ink-faint">USDT</span>
                           </td>
-                          <td className="td num text-right">{fmtPriceUsd(row.price)}</td>
-                          <td className={cn('td num text-right', pnlColor(row.changePercent24h))}>
+                          <td className="td px-1.5 num text-right">{fmtPriceUsd(row.price)}</td>
+                          <td className={cn('td px-1.5 num text-right', pnlColor(row.changePercent24h))}>
                             {fmtPercent(row.changePercent24h)}
                           </td>
-                          <td className="td num text-right text-ink-lo">
+                          <td className="td px-1.5 num text-right text-ink-lo">
                             {fmtCompactAmount(row.quoteVolume24h, 'USDT')}
                           </td>
                         </tr>

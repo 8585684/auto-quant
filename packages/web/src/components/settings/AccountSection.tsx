@@ -26,7 +26,7 @@ import { api, setToken } from '../../lib/api';
 import { useApp } from '../../lib/store';
 import { usePolled } from '../../lib/hooks';
 import { Button, ErrorNote, Field, Panel, TextInput } from '../ui';
-import { Metric, MetricGroup, SectionLabel } from '../shell';
+import { Metric, MetricGroup, PageShell, SectionLabel } from '../shell';
 import { fmtDateTime } from '../../lib/format';
 
 export function AccountSection() {
@@ -133,234 +133,199 @@ export function AccountSection() {
   };
 
   /* ------------------------------------------------------------------------ */
-  /*  状态：**横排占整宽**，不放进窄栏                                        */
+  /*  伴随栏：只读状态与部署信息                                              */
   /* ------------------------------------------------------------------------ */
   /*
-   * 这一块原来在 `PageShell` 的右栏里（只占视口的 40%），而 `MetricGroup` 在 xl
-   * 下是 4 列网格 —— 每列只剩约 150px，而 `Metric` 的数值是 `truncate` 的：
-   * `main @ 222ae15`、`2026-09-20 03:33`、`autoquant.sqlite` 全被切掉，
-   * 界面上看起来只是"有点挤"，实际是**信息被静默丢掉了**。
+   * ## 为什么状态回到伴随栏，而不是"横排占整宽"
    *
-   * 状态信息需要的是宽度，不是"伴随信息"的位置。所以它横排占整宽。
+   * 这块指标**曾经**就在伴随栏里被截断过：`MetricGroup` 的列数是按**视口**
+   * 断点算的（不看容器宽度），伴随栏只占视口的 40%，`columns={4}` 却照样排
+   * 四列 —— 每列约 150px，而 `Metric` 的数值带 `truncate`：`main @ 222ae15`、
+   * `2026-09-20 03:33`、`autoquant.sqlite` 全被静默切掉。
+   *
+   * 当时的修法是"横排占整宽"。宽度是够了，但页面变成了**两张互不相干的表**：
+   * 上面一条占满整宽的大字指标带，下面左边一个表单、右边一段说明，中间大片空白。
+   *
+   * 现在回到伴随栏，但换一条思路解决截断：**列数跟着栏宽显式降下来**。
+   * 这一栏里所有指标都用 `columns={1}`（一行一个），于是长值天然放得下 ——
+   * 不再依赖"整宽"这件事，也就不需要占满整宽。
+   *
+   * ⚠️ **不要给这里的任何一组改回 3/4 列**：那是把同一次静默截断再犯一次。
    */
-  const status = (
-    <MetricGroup title="当前账户" columns={4}>
-      <Metric label="用户名" value={user?.username ?? '—'} size="lg" tone="strong" />
-      <Metric label="角色" value={user?.role ? userRoleLabel(user.role) : '—'} sub={user?.role ?? undefined} />
-      <Metric label="账户创建时间" value={fmtDateTime(user?.createdAt)} />
-      <Metric
-        label="运行环境"
-        value={system?.dryRun ? '模拟' : '实盘'}
-        tone={system?.dryRun ? 'default' : 'warn'}
-        sub={system?.environmentLabel ?? system?.environment ?? '—'}
-      />
-    </MetricGroup>
-  );
+  const rail = (
+    <div className="space-y-4">
+      <Panel title="当前账户" bodyClassName="p-4">
+        <MetricGroup title="身份" columns={1}>
+          <Metric label="用户名" value={user?.username ?? '—'} size="lg" tone="strong" />
+          <Metric
+            label="角色"
+            value={user?.role ? userRoleLabel(user.role) : '—'}
+            sub={user?.role ?? undefined}
+          />
+          <Metric label="账户创建时间" value={fmtDateTime(user?.createdAt)} />
+        </MetricGroup>
 
-  /*
-   * 服务端信息 —— **放在右栏，与说明卡同列**。
-   *
-   * ## 为什么它和「当前账户」分开
-   *
-   * 这两组回答的是不同的问题：「当前账户」是"我在改谁的凭据"，服务端信息是
-   * "这套东西跑在什么版本上"。把它们堆成一组九个数、横排占满整宽，结果是
-   * 上方一大条指标、下方左栏一个长表单而右栏一张短卡 —— 右下角那片空白。
-   *
-   * ## ⚠️ 列数必须跟着栏宽降下来
-   *
-   * 上面那段注释记着一次事故：这组指标曾经**就在右栏里**，而 `MetricGroup` 在
-   * `xl` 下是 4 列网格 —— 每列只剩约 150px，而 `Metric` 的值是 `truncate` 的，
-   * `main @ 222ae15`、`2026-09-20 03:33`、`autoquant.sqlite` 全被切掉，
-   * 界面上看起来只是"有点挤"，实际是**信息被静默丢掉了**。
-   *
-   * 所以这里显式给 `columns={2}`：右栏约 920px，两列各 460px，值是放得下的。
-   * **不要改回 4** —— 那是把同一个 bug 再犯一次。
-   */
-  const serverStatus = (
-    /*
-     * `columns={2}` 而**不加** `layout="vertical"`。
-     *
-     * 上一版我写的是 `layout="vertical"`（单列竖排），理由是"怕列数太多把值截断" ——
-     * 但那把一个 924px 宽的右栏变成了五行各占一行、每行右边空 600px 的清单。
-     * 2 列各约 460px，`main @ 7c37783`、`2026-09-20 12:28:06` 这些值都放得下
-     * （上面 `MetricGroup` 的说明里记着：**只有 3–4 列在窄栏里才会截断**）。
-     *
-     * 顺带：它只有 5 个指标，2 列排出来是三行（最后一行一个），比五行矮得多 ——
-     * 右栏下方那片空白也跟着小了一截。
-     */
-    <MetricGroup title="服务端" columns={2}>
-      <Metric
-        label="服务端版本"
-        value={build ? `${build.branch} @ ${build.commitShort}` : '未知'}
-        sub={build?.subject || (build ? undefined : '本次部署没有写出版本信息')}
-        tone={build?.dirty ? 'warn' : 'default'}
-      />
-      <Metric label="部署时间" value={build?.deployedAt ? fmtDateTime(build.deployedAt) : '—'} />
-      <Metric
-        label="与 GitHub"
-        value={updateLabel}
-        tone={updateTone}
-        sub={update.error ?? update.data?.message}
-      />
-      <Metric label="产品版本" value={system?.version ?? health?.version ?? '—'} />
-      <Metric label="数据库" value={health?.db ?? '—'} />
-    </MetricGroup>
-  );
-
-  /*
-   * 右栏 = 安全说明 + 服务端信息。
-   *
-   * 说明原来是一张孤零零的短卡，而左栏的表单有五个字段 —— 于是右下角空出一大块。
-   * 把「服务端」那组指标移到它下面之后，两栏高度接近，而"我改的这套东西跑在什么
-   * 版本上"也回到了它该在的位置：和"关于这个账户"是同一类**只读的背景信息**。
-   */
-  const notes = (
-    /*
-     * ⚠️ **外面这一层 `SectionLabel` 不只是标题，它是对齐用的。**
-     *
-     * 左栏的结构是「`SectionLabel` + 无标题 `Panel`」，而右栏原来直接就是
-     * 「带 `<h3>` 的 `Panel`」—— 两种模式。后果是同一行的两个区块**顶部差 28px**
-     * （`SectionLabel` 那一行的高度 + 它的 `mb-3`），实测左栏 `top=280`、
-     * 右栏 `top=252`。在 `items-start` 的网格里，这就是肉眼可见的错位。
-     *
-     * 现在两栏同构：都是「`SectionLabel` + 内容」。"关于这个账户"那个 `<h3>`
-     * 因此去掉了 —— 标题只能有一个，而 `SectionLabel` 的小字距样式才是全站统一的
-     * 那一套（`Metric` 的标签、表头 `.th` 都是它）。
-     */
-    <section className="min-w-0">
-      <SectionLabel title="账户说明" />
-      <div className="space-y-5">
-        <Panel>
-          {/* 标题由外层的 `SectionLabel` 承担，这里不再有 `<h3>`，所以也不需要上边距。 */}
-        <div className="space-y-2 text-xs leading-relaxed text-ink-mid">
-          <p>
-            本系统面向单人部署：管理员账号在服务首次启动时自动创建，<strong>不提供注册入口</strong>
-            ，也没有找回密码的流程 —— 修改只能在这里做，且必须验证当前密码。
-          </p>
-          <p>如果用户名与密码都忘了，只能到服务器上重置数据库里的凭据记录。</p>
-          {build?.dirty && (
-            <p className="text-warn">
-              ⚠ 打包时工作区有未提交改动 —— 线上跑的代码<strong>不等于</strong> {build.commitShort}{' '}
-              这个提交，它的行为无法用仓库里的任何一版解释。
-            </p>
-          )}
-        </div>
+        <MetricGroup title="运行环境" columns={1}>
+          <Metric
+            label="模式"
+            value={system?.dryRun ? '模拟' : '实盘'}
+            tone={system?.dryRun ? 'default' : 'warn'}
+            sub={system?.environmentLabel ?? system?.environment ?? '—'}
+            subTitle={system?.environmentLabel ?? system?.environment ?? undefined}
+          />
+        </MetricGroup>
       </Panel>
 
-        {serverStatus}
-      </div>
-    </section>
+      <Panel title="服务端" bodyClassName="p-4">
+        <MetricGroup title="版本与部署" columns={1}>
+          <Metric
+            label="服务端版本"
+            value={build ? `${build.branch} @ ${build.commitShort}` : '未知'}
+            sub={build?.subject || (build ? undefined : '本次部署没有写出版本信息')}
+            subTitle={build?.subject}
+            tone={build?.dirty ? 'warn' : 'default'}
+          />
+          <Metric label="部署时间" value={build?.deployedAt ? fmtDateTime(build.deployedAt) : '—'} />
+          <Metric
+            label="与 GitHub"
+            value={updateLabel}
+            tone={updateTone}
+            sub={update.error ?? update.data?.message}
+            subTitle={update.error ?? update.data?.message}
+          />
+        </MetricGroup>
+
+        <MetricGroup title="运行时" columns={2}>
+          <Metric label="产品版本" value={system?.version ?? health?.version ?? '—'} />
+          <Metric label="数据库" value={health?.db ?? '—'} />
+        </MetricGroup>
+      </Panel>
+    </div>
   );
 
   /*
-   * 布局：状态横排（整宽）→ 表单 / 说明两栏 → 供应商目录（整宽）。
+   * 账户说明 = 表单的注脚。
    *
-   * 供应商目录占整宽、而不是缩在表单下面：它是一张需要横向空间的网格，每个卡片的
-   * URL 动辄三四十个字符，放在窄栏里只能截断 —— 而 URL 恰恰是那一格最有用的信息。
+   * 它原来在右栏里、和「服务端」那些指标叠在一起，而左栏的表单比它高一截 ——
+   * 两栏底部对不齐，右下角空出半屏。这一段只说三件事（没有注册入口、忘记密码
+   * 只能去服务器、打包不干净时线上代码无法解释），而**读它的人正在做"改密码"
+   * 这件事**，所以它跟着表单走，落在表单下面。
+   */
+  const notes = (
+    <Panel title="账户说明">
+      <div className="space-y-2 text-xs leading-relaxed text-ink-mid">
+        <p>
+          本系统面向单人部署：管理员账号在服务首次启动时自动创建，<strong>不提供注册入口</strong>
+          ，也没有找回密码的流程 —— 修改只能在这里做，且必须验证当前密码。
+        </p>
+        <p>如果用户名与密码都忘了，只能到服务器上重置数据库里的凭据记录。</p>
+        {build?.dirty && (
+          <p className="text-warn">
+            ⚠ 打包时工作区有未提交改动 —— 线上跑的代码<strong>不等于</strong> {build.commitShort}{' '}
+            这个提交，它的行为无法用仓库里的任何一版解释。
+          </p>
+        )}
+      </div>
+    </Panel>
+  );
+
+  /*
+   * 版面：伴随栏放**只读的**（我是谁、跑在什么版本上），主区放**唯一的动作**
+   * （改凭据）—— 与「交易所」页同一套结构，两屏之间不用重新学怎么读。
    *
-   * ## ⚠️ 左列宽度必须**等于表单的限宽**
-   *
-   * 原来写的是 `2fr 1fr`（左列约占 2/3）而表单自己 `max-w-xl`（36rem）。
-   * 在 1600px 的屏上左列约 1000px、表单只占 576px —— **左边空出四百多像素**，
-   * 整页看起来像"内容缩在左上角"。两个数字各自都合理，问题在于它们是**两个**
-   * 数字：列宽不知道表单会自己限宽。
-   *
-   * 现在列宽就是 `36rem`，表单不再需要自己限宽（小屏单列时仍然保留 `max-w-xl`，
-   * 否则输入框会横跨整个手机屏之外）。
+   * `fillHeight={false}`：这一页内容少，撑满视口只会在最下面空出半屏纯黑。
+   * 表单也不再自己限宽（原来 `max-w-xl` + 外层再套列宽，结果左边空出四百多
+   * 像素）：它现在只占主内容列，输入框横跨这一列正是该有的宽度。
    */
   return (
-    <div className="min-w-0 space-y-5">
-      {status}
+    <PageShell aside={rail} fillHeight={false}>
+      <section className="min-w-0">
+        <SectionLabel
+          title="修改用户名与密码"
+          actions={<span className="text-xs text-ink-faint">Enter 提交 · Esc 清空</span>}
+        />
+        <Panel>
+          <form
+            className="space-y-3"
+            onSubmit={(event) => {
+              event.preventDefault();
+              void submit();
+            }}
+            onKeyDown={(event) => {
+              // Esc 清空表单：和对话框里的取消保持一致，别让半填的密码留在屏幕上
+              if (event.key === 'Escape') reset();
+            }}
+          >
+            <Field label="新用户名" hint="留空则不修改。">
+              <TextInput
+                value={newUsername}
+                onChange={(event) => setNewUsername(event.target.value)}
+                autoComplete="username"
+                placeholder={user?.username ? `留空则保持 ${user.username}` : '留空则不修改'}
+              />
+            </Field>
 
-      <div className="grid items-start gap-5 xl:grid-cols-[minmax(0,36rem)_minmax(0,1fr)]">
-        <section className="min-w-0 max-w-xl">
-          <SectionLabel
-            title="修改用户名与密码"
-            actions={<span className="text-xs text-ink-faint">Enter 提交 · Esc 清空</span>}
-          />
-          <Panel>
-            <form
-              className="space-y-3"
-              onSubmit={(event) => {
-                event.preventDefault();
-                void submit();
-              }}
-              onKeyDown={(event) => {
-                // Esc 清空表单：和对话框里的取消保持一致，别让半填的密码留在屏幕上
-                if (event.key === 'Escape') reset();
-              }}
+            <Field
+              label="当前密码"
+              hint="修改任何一项都必须验证当前密码 —— 服务端会拒绝没有它的请求。"
             >
-              <Field label="新用户名" hint="留空则不修改。">
-                <TextInput
-                  value={newUsername}
-                  onChange={(event) => setNewUsername(event.target.value)}
-                  autoComplete="username"
-                  placeholder={user?.username ? `留空则保持 ${user.username}` : '留空则不修改'}
-                />
-              </Field>
+              <TextInput
+                type="password"
+                value={currentPassword}
+                onChange={(event) => setCurrentPassword(event.target.value)}
+                autoComplete="current-password"
+                placeholder="修改任何一项都需要验证"
+              />
+            </Field>
 
-              <Field
-                label="当前密码"
-                hint="修改任何一项都必须验证当前密码 —— 服务端会拒绝没有它的请求。"
+            <Field label="新密码" hint="留空则不修改，至少 8 个字符。">
+              <TextInput
+                type="password"
+                value={newPassword}
+                onChange={(event) => setNewPassword(event.target.value)}
+                autoComplete="new-password"
+                placeholder="留空则不修改"
+              />
+            </Field>
+
+            <Field label="确认新密码" hint="与新密码完全一致。">
+              <TextInput
+                type="password"
+                value={confirm}
+                onChange={(event) => setConfirm(event.target.value)}
+                autoComplete="new-password"
+                placeholder="与新密码一致"
+              />
+            </Field>
+
+            {error && <ErrorNote>{error}</ErrorNote>}
+            {done && (
+              <div
+                role="status"
+                className="flex items-start gap-2 rounded-md border border-up/40 bg-up/10 px-3 py-2 text-base text-up"
               >
-                <TextInput
-                  type="password"
-                  value={currentPassword}
-                  onChange={(event) => setCurrentPassword(event.target.value)}
-                  autoComplete="current-password"
-                  placeholder="修改任何一项都需要验证"
-                />
-              </Field>
-
-              <Field label="新密码" hint="留空则不修改，至少 8 个字符。">
-                <TextInput
-                  type="password"
-                  value={newPassword}
-                  onChange={(event) => setNewPassword(event.target.value)}
-                  autoComplete="new-password"
-                  placeholder="留空则不修改"
-                />
-              </Field>
-
-              <Field label="确认新密码" hint="与新密码完全一致。">
-                <TextInput
-                  type="password"
-                  value={confirm}
-                  onChange={(event) => setConfirm(event.target.value)}
-                  autoComplete="new-password"
-                  placeholder="与新密码一致"
-                />
-              </Field>
-
-              {error && <ErrorNote>{error}</ErrorNote>}
-              {done && (
-                <div
-                  role="status"
-                  className="flex items-start gap-2 rounded-md border border-up/40 bg-up/10 px-3 py-2 text-base text-up"
-                >
-                  <span aria-hidden>✓</span>
-                  <span className="min-w-0">
-                    {done}
-                    {done.includes('用户名') && ' 服务端已重新签发令牌，当前会话继续有效。'}
-                  </span>
-                </div>
-              )}
-
-              <div className="flex flex-wrap items-center gap-2">
-                <Button type="submit" variant="primary" busy={busy}>
-                  <Save aria-hidden className="h-3.5 w-3.5" />
-                  保存修改
-                </Button>
-                <Button type="button" onClick={reset} disabled={busy}>
-                  清空
-                </Button>
+                <span aria-hidden>✓</span>
+                <span className="min-w-0">
+                  {done}
+                  {done.includes('用户名') && ' 服务端已重新签发令牌，当前会话继续有效。'}
+                </span>
               </div>
-            </form>
-          </Panel>
-        </section>
+            )}
 
-        {notes}
-      </div>
-    </div>
+            <div className="flex flex-wrap items-center gap-2">
+              <Button type="submit" variant="primary" busy={busy}>
+                <Save aria-hidden className="h-3.5 w-3.5" />
+                保存修改
+              </Button>
+              <Button type="button" onClick={reset} disabled={busy}>
+                清空
+              </Button>
+            </div>
+          </form>
+        </Panel>
+      </section>
+
+      {notes}
+    </PageShell>
   );
 }
