@@ -265,8 +265,43 @@ export async function runTradingDesk(input: {
      * ⚠️ 切不出来（或一个标的都没有）时**退回原文** —— 不能给残缺材料。
      */
     if (compacted === null || compacted.slices.length === 0) return input.marketContext;
-    /* **共享部分 + 全部候选**（每个候选的 K 线已压到 5 点）。 */
-    return [compacted.shared, ...compacted.slices.map((s) => s.text)].join('\n\n');
+    /*
+     * ── **限制分析角色看到的标的数**（2026-10-12，实测临界值）──────────────
+     *
+     * ## 决定性实测（同一模型、同一提示词，只变材料规模）
+     *
+     * ```
+     *    0 个标的（ 5,455 字符 /  2,182 token）→ 14.8s · content= 340 字  ✅
+     *    1 个标的（ 9,211 字符 /  3,684 token）→ 14.6s · content=1658 字  ✅ 最好
+     *    3 个标的（16,039 字符 /  6,416 token）→ 13.0s · content=1006 字  ✅
+     *    6 个标的（26,281 字符 / 10,512 token）→ 15.1s · content= 434 字  ✅
+     *   12 个标的（55,011 字符 / 22,004 token）→ 17.3s · content=   0 字  ❌ 【崩了】
+     * ```
+     *
+     * **临界点在 6–12 个标的之间。** 到 12 个时模型"只想不说"：
+     * `content = 0 字`，而 `reasoning = 2,887 字`，`finish = length`。
+     *
+     * ## 为什么"崩了"比"慢"更糟
+     *
+     * `content = 0 字` 会让角色**判定为失败**（`empty_content`）→
+     * 触发"加预算重试" → 重试本身要 47.5 秒 →
+     * **首次 15.7s + 重试 47.5s = 63s > T1 的 60 秒超时线**
+     * → **角色缺席 → 裁决官无行情依据 → 零决策**。
+     *
+     * ## 所以取 6（实测它能给出 434 字有效输出、15 秒完成）
+     *
+     * ⚠️ **这是有代价的**：分析角色看不到第 7 名之后的候选。
+     * 但**"看 6 个并给出有效分析"远好过"看 12 个但一个字都写不出"**。
+     *
+     * ⚠️ 而**裁决官仍然拿到完整的 12 个候选**（它的材料没被裁剪）——
+     * 决策依据没有变，变的只是"分析摘要基于前 6 个"。
+     *
+     * ⚠️ 可用 `AQ_ANALYST_UNIVERSE=12` 调回去（便于对照测试）。
+     */
+    const limit = Math.max(1, Number(process.env.AQ_ANALYST_UNIVERSE ?? '') || 6);
+    const useSlices = compacted.slices.slice(0, limit);
+    /* **共享部分 + 前 N 个候选**（每个候选的 K 线已压到 5 点）。 */
+    return [compacted.shared, ...useSlices.map((s) => s.text)].join('\n\n');
   })();
 
   const analysisRoles: Array<{ role: string; tier: ModelTier; context: string; task: string }> = [

@@ -493,3 +493,49 @@ test('★ 压缩切不出来时必须退回【原文】（绝不给残缺材料�
   const ma = seen.find((s) => s.role === 'market_analyst');
   assert.equal(ma!.ctx, noHeadings, '★ 切不出来时必须是原文，一字不改');
 });
+test('★★★ 分析角色的材料必须限在【临界规模内】—— 12 个标的会让模型只想不说', async () => {
+  /*
+   * ## 决定性实测（同一模型、同一提示词，只变材料规模）
+   *
+   * ```
+   *    0 个标的（ 5,455 字符）→ 14.8s · content= 340 字  ✅
+   *    1 个标的（ 9,211 字符）→ 14.6s · content=1658 字  ✅ 最好
+   *    3 个标的（16,039 字符）→ 13.0s · content=1006 字  ✅
+   *    6 个标的（26,281 字符）→ 15.1s · content= 434 字  ✅
+   *   12 个标的（55,011 字符）→ 17.3s · content=   0 字  ❌ 【崩了】
+   * ```
+   *
+   * **`content = 0 字`** → 角色判定失败 → 加预算重试（47.5s）→
+   * 首次 15.7s + 重试 47.5s = **63s > T1 的 60 秒超时线** → 角色缺席 → 零决策。
+   *
+   * ⚠️ **"看 6 个并给出有效分析"远好过"看 12 个但一个字都写不出"。**
+   */
+  const symbols = Array.from({ length: 12 }, (_, i) => `SYM${i}USDT`);
+  const big = [
+    '# 账户',
+    '权益 20.75 USDT',
+    ...symbols.map((s, i) =>
+      `### ${i + 1}. ${s}（coinpool）\ncurrent_price = ${i}\n` +
+      `价格: [${Array.from({ length: 40 }, (_, j) => j).join(', ')}]`),
+  ].join('\n');
+
+  const seen: Array<{ role: string; ctx: string }> = [];
+  const ask: AskRole = async ({ role, context }) => {
+    seen.push({ role, ctx: context });
+    return { role, modelId: 'stub', data: null, raw: '[]', latencyMs: 1, ok: true };
+  };
+  await runTradingDesk({ ask, ...CTX, marketContext: big });
+  const ma = seen.find((s) => s.role === 'market_analyst')!;
+
+  /* ① 材料必须显著小于原文（否则 12 个标的全给 = 必然 empty_content）。 */
+  assert.ok(
+    ma.ctx.length < big.length / 2,
+    `★ 分析材料应当显著变小（${big.length} → ${ma.ctx.length}）`,
+  );
+  /* ② 但不能一个标的都不给（那会让"整体市场状态"无从谈起）。 */
+  assert.ok(ma.ctx.includes('SYM0USDT'), '★ 至少要给第一个候选');
+  /* ③ 账户信息必须保留（角色据此算风险预算）。 */
+  assert.ok(ma.ctx.includes('权益 20.75'), '★ 账户信息必须保留');
+  /* ④ 最后那个候选不该出现在分析材料里（它超出了实测临界规模）。 */
+  assert.ok(!ma.ctx.includes('SYM11USDT'), '★ 超出临界规模的候选不该进来');
+});
