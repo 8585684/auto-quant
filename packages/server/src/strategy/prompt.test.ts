@@ -2372,3 +2372,63 @@ test('★ 系统选定的默认值要交代来历，而不是只陈述事实', (
     '★ 还要告诉它"止损自己动了是那条规则做的，不是你错了" —— 否则它会去"修正"',
   );
 });
+/**
+ * ★★★ **最低名义额必须用【真实交易所下限】，不能硬编码**（2026-10-12 修的真 BUG）。
+ *
+ * ## 现象
+ *
+ * `#11`（权益 20.75、`minPositionSize=12`）**连续 11+ 轮零决策**，模型推理原文：
+ * ```
+ *   止损上限 = 0.4150 / (名义 20 × 1.5) = 1.38%
+ *   而止损下限是 1.5 × ATR14（通常 2%+）
+ *   → 上限 < 下限 → 无解 → 输出 []
+ * ```
+ *
+ * ## 根因
+ *
+ * | | 真实风控（`risk/engine.ts`）| 提示词（原）|
+ * |---|---|---|
+ * | 最低名义 | `max(minPositionSize, **exchangeMin**)` | `max(minPositionSize, **20**)` |
+ *
+ * 硬编码 20 让**止损上限被低估 40%**（真实口径下是 2.31%，落在 ATR 常见范围里）。
+ * **那个硬编码很可能就是"空集"的直接原因。**
+ */
+test('★★★ 提示词的止损上限用【真实交易所下限】，不是硬编码 20', () => {
+  /*
+   * ⚠️ 需要 ≥5 个候选（提示词那段要求 `atrPcts.length >= 5` 才输出）。
+   */
+  const cands = Array.from({ length: 6 }, (_, i) => snapshot(`SYM${i}USDT`, 100));
+  const base = contextWith(emptyPromptMemory(defaultStrategyConfig()), cands);
+  const withReal: PromptContext = {
+    ...base,
+    account: { ...base.account, equity: 20.75 },
+    config: { ...base.config, riskControl: { ...base.config.riskControl, minPositionSize: 12 } },
+    minNotionalOf: () => 5,
+  };
+  const textReal = buildSystemPrompt(withReal);
+
+  /*
+   * 名义 12 时的止损上限 = (20.75 × 2%) / (12 × 1.5) = 2.31%
+   * 名义 20 时是 1.38% —— 两者必须能区分。
+   */
+  assert.ok(
+    textReal.includes('2.31') || !textReal.includes('1.38'),
+    '★ 用真实名义 12 算出的上限应当约 2.31%，而不是硬编码 20 得到的 1.38%',
+  );
+});
+
+test('★★★ 拿不到交易所下限时退回配置值（而不是编一个数）', () => {
+  /*
+   * ⚠️ 编数正是那个 BUG 的成因。所以 `minNotionalOf` 缺失时，
+   * 名义应当退回 `minPositionSize`（12），而不是 20。
+   */
+  const cands = Array.from({ length: 6 }, (_, i) => snapshot(`SYM${i}USDT`, 100));
+  const base = contextWith(emptyPromptMemory(defaultStrategyConfig()), cands);
+  const noExchange: PromptContext = {
+    ...base,
+    account: { ...base.account, equity: 20.75 },
+    config: { ...base.config, riskControl: { ...base.config.riskControl, minPositionSize: 12 } },
+  };
+  const text = buildSystemPrompt(noExchange);
+  assert.ok(!text.includes('名义 20'), '★ 不该再出现硬编码的"名义 20"');
+});

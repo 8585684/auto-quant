@@ -2930,6 +2930,24 @@ export class AutoTrader {
       now: new Date(),
       config,
       /*
+       * **交易所对这个标的的最小名义额**（2026-10-12 修一个真 BUG）。
+       *
+       * 提示词里有一段"帮你把风险规则联立算一遍"，它原来把最低名义
+       * **硬编码成 20** —— 而真实风控用的是
+       * `max(minPositionSize, minNotionalOf(symbol))`（交易所下限按 symbol 查）。
+       *
+       * 后果实测（`#11`，权益 20.75、`minPositionSize=12`）：
+       * ```
+       *   提示词算出 0.415 ÷ (20 × 1.5) = 止损上限 1.38%
+       *   真实口径   0.415 ÷ (12 × 1.5) = 止损上限 2.31%
+       * ```
+       * **低估 40%** → 模型得出"上限 < 下限（1.5×ATR）"→ **连续 11+ 轮零决策**。
+       *
+       * ⚠️ 用**与风控引擎同一个数据源**（`registry`）—— 两处口径必须一致，
+       * 否则又会分叉出同类 BUG（本项目在"两处各算一遍"上踩过多次）。
+       */
+      minNotionalOf: (symbol: string) => this.deps.registry.minNotional(symbol),
+      /*
        * ⚠️ **AI 托管时不能替它预设交易性格。**
        *
        * `buildSystemPrompt` 会按这个标志决定第 2 段写什么：非托管时注入写死的

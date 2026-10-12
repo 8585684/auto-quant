@@ -135,6 +135,26 @@ export interface PromptContext {
    */
   paused?: { at: string; reason: string } | null;
   candidates: MarketSnapshot[];
+  /**
+   * **交易所对这个标的的最小名义额**（USDT）。
+   *
+   * ## 为什么提示词需要它（2026-10-12 修一个真 BUG）
+   *
+   * 提示词里有一段"帮你把风险规则联立算一遍"，而它原来把最低名义**硬编码成 20**。
+   * 而真实风控用的是 `max(minPositionSize, minNotionalOf(symbol))` ——
+   * **交易所下限是按 symbol 查的，不是固定数**（常见是 5 USDT）。
+   *
+   * 后果实测：`#11`（权益 20.75、`minPositionSize=12`）——
+   * ```
+   *   提示词算出：0.415 ÷ (20 × 1.5) = 止损上限 1.38%
+   *   真实口径：  0.415 ÷ (12 × 1.5) = 止损上限 2.31%
+   * ```
+   * **低估 40%** → 模型得出"上限 < 下限（1.5×ATR）"→ **连续 11+ 轮零决策**。
+   *
+   * ⚠️ **拿不到时必须能表达"不知道"** —— 传 `undefined` 时提示词退回配置值，
+   * **而不是编一个数**（编数正是这个 BUG 的成因）。
+   */
+  minNotionalOf?: (symbol: string) => number;
   oiRanking: OiRankRow[];
   /**
    * 模型对自己历史的「记忆」（提案 §2 的三个区块）。
@@ -2873,8 +2893,51 @@ function renderUserPrompt(
         const riskPerTradePercent = 2; // 「单笔亏损 ≤ 权益 2%」
         const stopToRiskMultiple = 1.5; // 「实际亏损可达止损幅度的 1.5 倍」
         const atrToStopMultiple = 1.5; // 「止损 ≥ 1.5 × ATR14(15m)」
-        /* 名义：取它规则里的山寨币目标档，与交易所下限取大者。 */
-        const notional = Math.max(ctx.config.riskControl.minPositionSize, 20);
+        /*
+         * ── ⚠️ **这里原来是硬编码 `20`，那是个真 BUG**（2026-10-12 修）────────
+         *
+         * ## 现象
+         *
+         * `#11`（权益 20.75）**连续 11+ 轮零决策**，而模型给出的推理是：
+         * ```
+         *   止损上限 = 0.4150 / (名义 20 × 1.5) = 1.38%
+         *   而止损下限是 1.5 × ATR14（通常 2%+）
+         *   → 上限 < 下限 → 无解 → 输出 []
+         * ```
+         *
+         * ## 根因：提示词的口径与【真实风控】不一致
+         *
+         * | | 真实风控（`risk/engine.ts`）| 提示词（原）|
+         * |---|---|---|
+         * | 最低名义 | `max(minPositionSize, **exchangeMin**)` | `max(minPositionSize, **20**)` |
+         *
+         * 而 `#11` 的 `minPositionSize = 12` —— 于是：
+         * ```
+         *   提示词：max(12, 20) = 20  → 止损上限 1.38%
+         *   真实：  max(12, 交易所下限) ≈ 12 → 止损上限 2.31%
+         * ```
+         * **低估 40%**，而 2.31% 正好落在 ATR 的常见范围里 ——
+         * **那个硬编码很可能就是"空集"的直接原因。**
+         *
+         * ## 为什么硬编码 20 是错的
+         *
+         * 原注释写的是「与交易所下限取大者」—— 但**交易所下限是按 symbol 查的**
+         *（`minNotionalOf(symbol)`），**不是一个固定数**。写死 20 等于
+         * **假设所有标的的交易所下限都是 20**，而实际常见的下限是 5 USDT。
+         *
+         * ## 修法
+         *
+         * 取**本轮候选里最大的交易所下限**（保守：用最大的那个算出的上限最小，
+         * 于是不会把"其实做不了"的标的算成能做）。
+         * 拿不到交易所下限时**退回配置值**（而不是编一个数）。
+         */
+        const exchangeMins = ctx.minNotionalOf === undefined
+          ? []
+          : ctx.candidates
+            .map((c) => ctx.minNotionalOf!(c.symbol))
+            .filter((n) => Number.isFinite(n) && n > 0);
+        const exchangeMin = exchangeMins.length > 0 ? Math.max(...exchangeMins) : 0;
+        const notional = Math.max(ctx.config.riskControl.minPositionSize, exchangeMin);
         if (!Number.isFinite(equity) || equity <= 0 || atrPcts.length < 5) return [];
         const riskBudget = (equity * riskPerTradePercent) / 100;
         const stopCapPercent = (riskBudget / (notional * stopToRiskMultiple)) * 100;
