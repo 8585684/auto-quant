@@ -1134,25 +1134,64 @@ export function DecisionFeed({
               )}
             >
               {/*
-                左栏：**结论**（本轮决定）。
-                ⚠️ 全屏时在左，常规时在上 —— 顺序由 `flex-col` / `lg:flex-row` 决定。
-                ⚠️ 它自己也滚 —— 一轮可能有十几条决策。
+                ⚠️ **左栏（结论）只在全屏时渲染**（2026-10-13 实测修正）。
+
+                常规视图（右栏仅 40% 宽）里，如果把结论也放进来，两者就**各拿
+                一半的 45%** —— 实测工作流只剩 **226px**，比改动前的 308px 更矮，
+                与用户"展示区域太小"的抱怨正好相反。
+
+                而常规视图**本来就不缺结论**：下面的滚动列表里每一轮都有结论行。
+                所以：
+                ```
+                  常规视图：只有工作流（拿满 45%）+ 下面滚动的全部轮次
+                  全屏视图：左栏结论（常驻不滚走）+ 右栏工作流
+                ```
               */}
-              <div className="min-h-0 min-w-0 flex-1 overflow-y-auto lg:max-h-full">
-                <LatestConclusion
-                  record={records[0] ?? null}
-                  symbols={symbolsQuery.data ?? []}
-                  mode={mode}
-                />
-              </div>
+              {focusMode && (
+                <div className="min-h-0 min-w-0 flex-1 overflow-y-auto">
+                  <LatestConclusion
+                    record={records[0] ?? null}
+                    symbols={symbolsQuery.data ?? []}
+                    mode={mode}
+                  />
+                </div>
+              )}
               {/*
                 右栏：**工作流**（谁在干什么）。
-                ⚠️ 全屏时才固定宽度；常规视图下它按内容（单列里占满宽度）。
+
+                ⚠️⚠️ **这里必须是 `flex-1 min-h-0`，不能是 `shrink-0`**
+                （2026-10-13 实测抓到重叠 BUG）。
+
+                ## 事故现象
+
+                用户截图：工作流区**溢出并压住了下面的决策记录**
+                （"周期 #13"、"其余岗位 15 个"被盖住）。
+
+                ## 根因：`shrink-0` 让这一层**按内容长高**，高度链断掉
+
+                `TeamBoard` 内部是 `flex-1 min-h-0` —— 它要拿"父容器给它的那份高度"。
+                而这一层如果 `shrink-0`（且没有 `flex-1`），它的高度就等于**内容高度**：
+                ```
+                  外层 max-h-[45%]（有确定高度上限）
+                    └─ 右栏 div  shrink-0  → 高度 = 内容高度（不收缩！）
+                         └─ TeamBoard flex-1 → 父没有确定高度 → 也按内容长高
+                              → 整块溢出外层 max-h → 压住下面
+                ```
+                也就是说：**`shrink-0` 把"上限"变成了"没有上限"**。
+
+                ## 修法：让它参与 flex 分配
+
+                ```
+                  单列（常规）：左栏 flex-1 + 右栏 flex-1 → 各拿一半，各自滚
+                  两栏（全屏）：左栏 flex-1 + 右栏 固定 42% 宽（flex-none）
+                ```
+                `min-h-0` 两个都不能省 —— flex 子项默认 `min-height: auto`，
+                那一项会让它们永远不肯比内容矮，滚动条与 `max-h` 都会失效。
               */}
               <div
                 className={cn(
-                  'flex min-h-0 shrink-0 flex-col',
-                  focusMode && 'lg:w-[42%]',
+                  'flex min-h-0 flex-1 flex-col',
+                  focusMode && 'lg:w-[42%] lg:flex-none',
                 )}
               >
                 <TeamBoard

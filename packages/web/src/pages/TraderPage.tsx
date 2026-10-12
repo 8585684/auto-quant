@@ -199,10 +199,20 @@ export function TraderPage() {
    * 但**直接改成全宽会牺牲行情图表与账户卡片** —— 那些也是操作员要看的东西。
    * 所以做成**一个可切换的视图**：需要细看团队时点「全屏」，看完点「返回」。
    *
-   * ⚠️ 默认 `false`（保持既有布局）—— 三种模式都受影响，
-   * 所以不能替用户改默认值。
+   * ⚠️ 三态（2026-10-13 实测后改）：
+   * ```
+   *   null  → 跟随模式默认（团队模式 = 全屏，另两种 = 常规）
+   *   true  → 强制全屏
+   *   false → 强制常规
+   * ```
+   * **为什么需要"跟随默认"**：团队模式**本来就该全屏** ——
+   * 它的看板在 40% 宽里装不下（实测工作流只剩 226px）。
+   * 而如果初始值是 `false`，用户每次进团队模式都要**手动点一次全屏** ——
+   * 那正是他说的"直接跳转把这块占用全部页面"（他要的是**默认就这样**）。
+   *
+   * 另两种模式的默认值仍是常规 —— **逐字节不变**。
    */
-  const [feedFocus, setFeedFocus] = useState(false);
+  const [feedFocusOverride, setFeedFocusOverride] = useState<boolean | null>(null);
   const { runOnce, busyId: runOnceBusyId } = useRunOnce();
   const { requestReview, busyId: reviewBusyId } = useAgentReview();
 
@@ -308,6 +318,14 @@ export function TraderPage() {
   const settleAsset = typeof rawAsset === 'string' && rawAsset.trim() ? rawAsset.trim() : DEFAULT_SETTLE_ASSET;
 
   const trader: TraderRow | null = tradersQuery.data?.find((row) => row.id === traderId) ?? null;
+  /*
+   * 决策流是否聚焦 —— 见 `feedFocusOverride` 的三态说明。
+   *
+   * ⚠️ 必须放在 `trader` **之后**（它依赖 `trader.mode`）。
+   * 而 `trader` 又是 `tradersQuery` 的结果，所以这里只能算派生值、
+   * 不能放进 `useState` 的初始值里（那时 `trader` 还不存在）。
+   */
+  const feedFocus = feedFocusOverride ?? trader?.mode === 'ai_team';
   /**
    * 这个机器人用的钱包名。取不到时回落到通用称呼，不显示空。
    *
@@ -1344,7 +1362,7 @@ export function TraderPage() {
       {feedFocus ? (
         <div className="flex h-full min-h-0 flex-col">
           <div className="mb-2 flex shrink-0 items-center gap-2">
-            <Button variant="ghost" onClick={() => setFeedFocus(false)} title="返回常规视图（图表与账户卡）">
+            <Button variant="ghost" onClick={() => setFeedFocusOverride(false)} title="返回常规视图（图表与账户卡）">
               ← 返回
             </Button>
             <span className="text-sm text-ink-faint">
@@ -1357,7 +1375,7 @@ export function TraderPage() {
               running={running}
               mode={trader?.mode ?? 'strategy'}
               nextCycleAt={trader?.nextCycleAt ?? null}
-              onToggleFocus={() => setFeedFocus(false)}
+              onToggleFocus={() => setFeedFocusOverride(false)}
               focusMode
               actions={
                 <>
@@ -1390,7 +1408,7 @@ export function TraderPage() {
              * 我第一版只在聚焦分支传了它，于是**常规视图里根本没有那个按钮**，
              * 用户**无法进入全屏**（而"进不去全屏"正是他抱怨的那件事）。
              */
-            onToggleFocus={() => setFeedFocus(true)}
+            onToggleFocus={() => setFeedFocusOverride(true)}
             actions={
               <>
                 {runNowAction}

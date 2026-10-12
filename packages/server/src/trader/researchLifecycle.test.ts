@@ -53,6 +53,54 @@ test('★★★ `stopTrader` 必须调用它（定义了但没人调 = 泄漏照
   );
 });
 
+test('★★★ 后台刷新的【占位】不能被当成"一份旧情报"', () => {
+  /*
+   * ## 实测现象（2026-10-13）
+   *
+   * ```
+   *   [调研] 缓存已过期（29863939 分钟前）—— 先用旧结果，后台正在刷新
+   * ```
+   * **29863939 分钟 ≈ 56 年** —— 因为占位对象里 `at: 0` 被解释成 1970 年。
+   *
+   * ## 两个后果，第二个更严重
+   *
+   * ① 日志里出现一个荒谬的时间（可读性问题）；
+   * ② **空字符串被当作"旧情报"返回给团队** ——
+   *    而 `text: ''` 在提示词里等于**一片空白**，团队却以为
+   *    "有一份过期但可用的情报"。**那比"明说没有材料"更糟**：
+   *    它让 `newscaster` / `sentiment` 以为有材料可整理。
+   *
+   * ## 这条测试钉住什么
+   *
+   * 判据必须是"**有没有真的查到过东西**"（`at > 0` 且 `text` 非空），
+   * 而不是"Map 里有没有这一项"。
+   */
+  /* ① 写入占位时：只有真缓存才被继承。 */
+  const runOnce = SRC.slice(SRC.indexOf('const runOnce = (): void => {'));
+  assert.ok(
+    runOnce.includes('hasRealCache'),
+    '★ 必须区分"有真缓存"与"只有占位"',
+  );
+  assert.ok(
+    /hasRealCache\s*=\s*cached\s*!==\s*undefined\s*&&\s*cached\.at\s*>\s*0/.test(SRC),
+    '★ 判据必须含 `at > 0`（`at: 0` 是占位，不是缓存）',
+  );
+  /* ② 读取时：同样不能把占位当成缓存。 */
+  assert.ok(
+    SRC.includes('const hasRealCache = cached !== undefined && cached.at > 0 && cached.text.length > 0'),
+    '★ 读取侧也必须按"有没有真内容"判断',
+  );
+  /*
+   * ③ 反向保证：`research()` 里不该再出现裸的 `cached !== undefined` 分支
+   *（那正是这个 BUG 的形状）。
+   */
+  const researchFn = SRC.slice(SRC.indexOf('research: async (symbols)'), SRC.indexOf('/* eslint-disable no-unreachable */'));
+  assert.ok(
+    !/if \(cached !== undefined\) \{/.test(researchFn),
+    '★ 不该再有裸的 `cached !== undefined` 分支',
+  );
+});
+
 test('★ 幂等：重复 start 不该堆出多个定时器', () => {
   /*
    * ⚠️ `research()` 每轮都调 `ensureResearchRefresher` ——

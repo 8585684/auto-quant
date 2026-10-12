@@ -436,9 +436,34 @@ function ensureResearchRefresher(
   const runOnce = (): void => {
     const cached = researchCache.get(traderId);
     if (cached?.refreshing === true) return;
+    /*
+     * ⚠️ **占位不能伪装成"一份旧情报"**（2026-10-13 实测踩到）。
+     *
+     * ## 现象
+     *
+     * ```
+     *   [调研] 缓存已过期（29863939 分钟前）—— 先用旧结果，后台正在刷新
+     * ```
+     * **29863939 分钟 ≈ 56 年** —— 因为占位对象里 `at: 0` 被解释成 1970 年。
+     *
+     * ## 两个后果，第二个更严重
+     *
+     * ① 日志里出现一个荒谬的时间（可读性问题）；
+     * ② **空字符串被当作"旧情报"返回给团队** ——
+     *    而 `text: ''` 在提示词里等于**一片空白**，团队却以为
+     *    "有一份过期但可用的情报"。**那比"明说没有材料"更糟**：
+     *    它让 `newscaster` / `sentiment` 以为有材料可整理。
+     *
+     * ## 修法：`at: 0` 的占位**不算缓存**
+     *
+     * 判据统一成"**有没有真的查到过东西**"（`at > 0`）。
+     * 于是 `research()` 那边走的是"首次调研在后台进行 —— 本轮没有新闻材料"
+     * 那条路径，**如实说没有**。
+     */
+    const hasRealCache = cached !== undefined && cached.at > 0 && cached.text.length > 0;
     researchCache.set(traderId, {
-      text: cached?.text ?? '',
-      at: cached?.at ?? 0,
+      text: hasRealCache ? cached.text : '',
+      at: hasRealCache ? cached.at : 0,
       refreshing: true,
     });
     /*
@@ -1317,7 +1342,20 @@ export class TraderManager {
          * 让团队知道"这一轮没有新闻材料"。**不能让整轮卡在调研上。**
          */
         ensureResearchRefresher(traderId, symbols, apiKey);
-        if (cached !== undefined) {
+        /*
+         * ⚠️ **判据是"有没有真的查到过东西"，不是"Map 里有没有这一项"**
+         *（2026-10-13 实测踩到）。
+         *
+         * 后台刷新会先写一个 `refreshing: true` 的**占位**（`at: 0`、`text: ''`）——
+         * 而第一版这里只看 `cached !== undefined`，于是：
+         * ```
+         *   [调研] 缓存已过期（29863939 分钟前）—— 先用旧结果，后台正在刷新
+         * ```
+         * 并**把空字符串当作"旧情报"返回给团队** ——
+         * 那比"明说没有材料"更糟：它让 `newscaster` 以为有材料可整理。
+         */
+        const hasRealCache = cached !== undefined && cached.at > 0 && cached.text.length > 0;
+        if (hasRealCache) {
           /* 有**过期**缓存 → 先用它（总比"什么都没有"好），后台已在刷新。 */
           runtimeLogs.write(
             traderId, 'info', 'team',
