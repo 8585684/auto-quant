@@ -1194,3 +1194,150 @@ npm run sim         → 18/18
 PR **#170**（urlGuard 补 OCI 元数据段与 SIIT/NAT64 隔离前缀）—— 下一轮处理，
 它与 issue **#140 / #141 / #155** 是同一族（urlGuard 绕过面）。
 
+
+---
+
+## 13. 第 7 轮：发版 v0.1.0 + 修两个 CI 静默失效 + 2 个 issue
+
+用户本轮新增指示：**盯 issue（值得修就修、不值得也要回复）**、**发版并回复**、
+**PR 必须拉下来实际跑过才能合**、**第三方中转站广告统一话术、不往产品里加**。
+
+### 一、第三方中转站推广排查 —— 结论：**没有**
+
+扫了全部 32 个 open issue 的正文与外部链接，**没有任何第三方中转站/广告推广**。
+命中的外部链接全是技术性的：
+
+| issue | 链接性质 |
+| --- | --- |
+| #119 / #162 | `http://127.0.0.1:27137/...` 本地复现命令 |
+| #126 | `http://attacker.example.com/` 攻击形态**占位符** |
+| #140 / #141 / #155 | 云元数据地址（`169.254.169.254` / `192.0.0.192` / `100.100.100.200`） |
+| #141 | `metadata.google.internal` 等各云厂商元数据端点 |
+
+所以"统一回复：感谢关注，日后会出相关合作方案"这条话术**本轮无需触发**。
+（若将来真出现，按用户指示统一回复，**绝不把第三方中转站加进产品**。）
+
+### 二、PR #170 —— ❌ 退回（`CHANGES_REQUESTED`）
+
+`fix(security): urlGuard 补上 OCI 元数据段与 SIIT/NAT64 隔离前缀的 SSRF 绕过`
+
+**主 CI 是 SUCCESS，但我拉下来实际跑之后发现一个反向缺陷。**
+
+先说对的部分（我逐字节验证）：SIIT `::ffff:0:a.b.c.d` 的 ffff 确实在 byte 8-9、
+OCI `192.0.0.192` 确实落在无规则的 `192.0.0.0/24` —— 补它们是对的。
+
+**但 NAT64 那段有缺陷**（`urlGuard.ts:154-161`）：
+
+```ts
+const tail = blockedIpv4Reason(bytes.slice(12));
+if (tail) return tail;              // ← 对全零段也返回"未指定地址 0.0.0.0/8"
+if (!empty(6, 10)) { …slice(6,10)… }  // ← 永远走不到（死代码）
+```
+
+`blockedIpv4Reason()` 的 `a === 0 → unspecified` 语义是"**整个 IPv4** 是 0.0.0.0"，
+而 NAT64 里 `slice(12)` 全零只意味着"**这一段没放 IPv4**"。后果实测：
+
+```
+BLOCK 64:ff9b:1:8888:8888::  ← 未指定地址 0.0.0.0/8   （内嵌公网 136.136.136.136）
+BLOCK 64:ff9b:1:8080:8080::  ← 未指定地址 0.0.0.0/8
+BLOCK 64:ff9b:1:c0a8:1::     ← 未指定地址 0.0.0.0/8
+```
+
+这些都是 NAT64 `/48` 部署里**正常访问公网**的地址 —— 在那种部署下 **LLM 请求会全部失败**，
+而 PR 自己写的是"误伤为零"。对照 main：这些地址是 `ALLOW` 的，属**新引入的回归**。
+
+**这正是"CI 全绿但行为错"的典型**：PR 自带的 16 条用例全过，但没有一条覆盖
+"内嵌公网的 /48"。退回意见里给了实测验证过的修法（把"整段全零"与"内嵌 0.0.0.0"
+分开）与两条该补的用例。
+
+### 三、修了两个 CI 静默失效（都直接卡住发版）
+
+**1. `release-drafter.yml` 缺 `contents: write`**（`db51dab`）
+
+```
+重算草稿  laolaoshiren/auto-quant: No draft release found
+重算草稿  ##[error]Resource not accessible by integration
+```
+
+而 GitHub 把这类失败**显示成 job 成功**，所以它静默了很久 —— 草稿停在 `2026-09-30`，
+而 RELEASING.md §2.1 要求发版前"核对草稿"。也就是说**发版流程第 1 步根本无法完成**。
+
+对比同仓库另外两个需要写权限的工作流（`docker-publish.yml` 用 `packages: write`、
+`pr-labeler.yml` 用 `pull-requests: write`），**只有这一个漏了**。
+
+修复实证（不是"改了就算"）：
+
+| | 修复前 | 修复后 |
+| --- | --- | --- |
+| tag | `v0.0.1` | **`v0.1.0`** |
+| updated | 2026-09-30（陈旧） | **2026-10-13T21:12（刚刚）** |
+
+**2. `pr-labeler.yml` 缺 `GH_REPO`**（`b745993`）
+
+`failed to run git: fatal: not a git repository` —— 该工作流刻意**不 checkout**
+（避免带写权限的 `pull_request_target` 接触 PR 分支内容），而 `gh` 因此找不到仓库。
+
+症状极隐蔽：**只有 `feat`/`fix`/`perf`/`docs` 前缀会走到 `gh pr edit`**，
+其余前缀不调 gh 所以一切正常 —— 于是**恰恰最该打标签的 `fix:`/`feat:` 全部失败**，
+release-drafter 收不到 `bug`/`enhancement`，发布说明把它们全归进「🔧 其他」。
+
+**修法实测**：在无 `.git` 目录下设置 `GH_REPO` 后 `gh pr view` 正常工作。
+
+**并补了历史标签**（RELEASING.md §2.1："分错了通常是标签漏打，补上后重跑 drafter"）：
+给 #129/#132/#133/#134/#163/#166/#167 补 `bug`。效果：
+
+```
+修复前：「🔧 其他」里躺着 7 条 fix
+修复后：「🐛 修复」下 7 条，分类正确
+```
+
+### 四、两个 issue 修复
+
+**#138 / #149（同一缺陷，后者以 duplicate 关闭）** —— `reconciled_reversed`
+写入库却不在 `CLOSE_REASONS`/`CLOSE_REASON_LABELS`，界面渲染裸机器码。
+
+- `6f4dbff`：登记进名单 + 中文标签「补录·方向不可信（金额取自交易所流水）」，
+  并加一条**穷尽性用例**（遍历 `CLOSE_REASONS` 断言每个都有标签）。
+  **实测有效**：临时移除标签会精确报出是哪个码。
+- `f565fdf`：**#149 指出的类型放宽是真的** —— `repositories.ts:2539` 是
+  `closeReason: string`，所以 `type CloseReason` 那道防线被绕过。收紧为 `CloseReason`，
+  **实测**：写入未登记的码现在编译期报错。
+
+两条防线合起来：**类型级**（未登记→编译期报错）+ **运行时**（漏标签→测试报错）。
+
+### 五、发版 v0.1.0（本仓库首个正式版本）
+
+按 RELEASING.md 走完可做的部分：
+
+```
+① main 全绿        typecheck / test(47+1432+155) / build / lint /
+                  check:links / check:routes / sim 18/18 → 全 0
+② 核对草稿         v0.1.0，7 条修复分类正确，**无破坏性变更小节**
+③ THIRD-PARTY     generate-notices.mjs → 183 依赖全宽松许可，git diff 空
+④ 打 tag 推送      v0.1.0 → Docker 镜像构建 **success**
+⑤ 发布 release     isDraft=false（2026-10-13T21:27）
+```
+
+⚠️ **一处我无法满足的前置条件，已如实记录**：RELEASING.md §4 要求，若改动触及
+下单路径（`binance/` `risk/` `trader/` `strategy.ts`），发布前**必须做实盘冒烟测试**
+（`liveSmokeTest.ts --confirm`，真实资金）。而仓库自建立起共有 **54 个**这类生产文件
+被改过（含 `risk/engine.ts`、`broker.ts`）。
+
+**用户红线明令禁止我跑 `liveSmokeTest`** —— 所以我**没有跑**，也没有假装满足。
+按"用户指令 > 文件规则"，发版继续（打 tag 只构建镜像、**不部署**，
+线上仍是旧版本，部署由开发窗口走 `deploy.ps1`）。
+**这一项留给人**：若要在服务器上升级到 v0.1.0，建议由能做实盘冒烟的人先补那一步。
+
+### 六、本轮验证
+
+```
+npm run typecheck   → 0
+npm test            → 47 + 1432 + 155，0 fail
+npm run build       → 0
+npm run lint        → 0
+npm run check:links → 0
+npm run check:routes→ 0
+npm run sim         → 18/18
+CI (main)           → success
+Docker 镜像 (v0.1.0)→ success
+```
