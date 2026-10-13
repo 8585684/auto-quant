@@ -823,60 +823,66 @@ export function TraderPage() {
    * 全部"这种自相矛盾的状态。
    */
   const windowed = useMemo(() => filterByRange(snapshots, range), [snapshots, range]);
-  const windowFirst = windowed[0]?.equity ?? equity;
-  const windowDelta = equity - windowFirst;
-  const windowPercent = windowFirst !== 0 ? (windowDelta / Math.abs(windowFirst)) * 100 : 0;
 
   /*
    * ══════════════════════════════════════════════════════════════════════════
-   *  ⚠️ **账户口径的对照值**（2026-10-13 用户报"图表显示和实际账号对不上"）
+   *  ⚠️ **曲线与「本段变化」一律走【账户口径】**（2026-10-13，用户两次反馈后定稿）
    * ══════════════════════════════════════════════════════════════════════════
    *
-   * ## 用户看到的
+   * ## 用户的反馈（第二次，原话）
+   *
+   * > 「图标完全乱套了，上面叫归属权益、同期账户、本段变化，一大堆莫名其妙的，
+   * >  搞这么多没用的画蛇添足，无端增加BUG？图标不就是最真实准确简单的，
+   * >  **账号余额、总盈亏能对上的吗**？」
+   *
+   * **他是对的。** 我第一版的修法是"把两个口径并排显示 + 解释差额来源"——
+   * 那等于把一个"数字对不上"的问题，换成了一个"要读两行解释才懂"的问题。
+   * 而图表的正确职责是：**画账户在这段时间怎么走的**，和指标卡直接对上。
+   *
+   * ## 两个口径（见 `db/schema.ts` 的 M4 迁移说明）
    *
    * ```
-   *   指标卡「账户余额」 97.93  ·「交易盈亏」−$2.12（−2.11%）
-   *   图表「本段变化」          +$8.45（+8.44%）
-   *   → "图表显示和实际账号对不上"（用户原话）
+   *   equity         = initial_equity + Σ(本机器人已平仓净额)  ← 只算自己
+   *   accountEquity  = 共享钱包的真实权益（含同账户其他机器人）  ← 账户真实值
    * ```
-   * 差额 **10.55** = 同一个钱包上另外两个机器人（`#9` 已停、`#11` 团队测试）的亏损
-   * —— 它们亏的钱是**从同一个钱包扣的**，而这个机器人的归属权益只算它自己。
+   * 实测 `#10`：`equity` 108.47 vs `accountEquity` 97.80
+   *（差 10.67 = 同钱包上 `#9`/`#11` 的亏损）。
    *
-   * ## 为什么两个数都对
+   * ## 为什么账户口径才是对的
    *
    * ```
-   *   equity           = initial_equity + Σ(本机器人已平仓净额)  ← 图表画的是这个
-   *   account_equity   = 共享钱包的真实权益                      ← 指标卡显示这个
+   *   账户口径  → 回答"我的钱现在多少"      → 与「账户余额」指标卡一致 ✅
+   *   归属口径  → 回答"这个机器人赚了多少"  → 那是指标卡「交易盈亏」的事
    * ```
-   * 见 `db/schema.ts` 的 `M4_ATTRIBUTED_EQUITY` 迁移说明。
+   * 而**曲线给人的直觉就是"我的钱的变化"** —— 用归属口径画它，
+   * 用户第一反应必然是"对不上"。
    *
-   * ## 为什么必须在**图表这一行**说，而不是只在下面的账户卡片里
-   *
-   * 下面那张「交易所账户」卡片确实显示了账户口径（`TraderPage` 里
-   * `lastKnownAccount` 那段就是为了这个）—— 但它**在图表的可视范围之外**，
-   * 而且它只说"钱包是多少"，**没有把差额归因到"同一钱包的其他机器人"**。
-   * 用户于是仍然要自己把两个数字相减、再猜为什么。
-   *
-   * ⚠️ 这里刻意算**同窗口**的账户权益对照（而不是直接给最新的账户权益）：
-   * 图表讲的是"这一段涨跌了多少"，拿一个不同时段的账户数字来比，
-   * 差额里会混进"时段不同"，反而更难解释。
+   * ⚠️ 归属口径没有消失：它仍在「交易盈亏」指标卡里（那是它该在的地方）。
    */
   const windowAccountFirst = windowed[0]?.accountEquity ?? 0;
-  const windowAccountLast =
-    windowed[windowed.length - 1]?.accountEquity ??
-    snapshots[snapshots.length - 1]?.accountEquity ??
-    0;
+  const windowFirst =
+    windowAccountFirst > 0
+      ? windowAccountFirst
+      : /* 旧快照没有账户口径（迁移前回填，缺值时是 0）→ 回落到归属口径，
+           否则曲线会砸到地板而看起来完全正常。 */
+        (windowed[0]?.equity ?? equity);
   /*
-   * ⚠️ 只有"两个端点都真的有账户口径数据"时才算 ——
-   * 迁移前的旧行 `account_equity` 是回填的（见 schema.ts 的取舍说明），
-   * 而完全没有值时它是 `0`。拿 0 去算会得出一个巨大的假差额，
-   * 那比不显示更糟。
+   * 末端用**实时账户权益**（60 秒轮询）优先 —— 与指标卡「账户余额」同源，
+   * 这样曲线末端与卡片显示的数字**严格相等**，用户不会看到"差一点"。
+   *
+   * ⚠️ 优先级：实时值 → 末快照的账户口径 → 末快照的归属口径。
+   * 逐级回落的原因同上：旧快照可能没有账户口径。
    */
-  const hasAccountCompare =
-    windowAccountFirst > 0 && windowAccountLast > 0 && windowed.length >= 2;
-  const windowAccountDelta = hasAccountCompare ? windowAccountLast - windowAccountFirst : 0;
-  /* 归属与账户在这一段里的差额 —— 它就是"同钱包其他机器人"的贡献。 */
-  const attributedGap = hasAccountCompare ? windowDelta - windowAccountDelta : 0;
+  const lastSnap = windowed[windowed.length - 1];
+  const liveAccountEquityForCurve = num(accountQuery.data?.account?.equity);
+  const windowLast =
+    liveAccountEquityForCurve ??
+    ((lastSnap?.accountEquity ?? 0) > 0 ? lastSnap?.accountEquity : undefined) ??
+    lastSnap?.equity ??
+    equity;
+  const windowDelta = windowLast - windowFirst;
+  const windowPercent = windowFirst !== 0 ? (windowDelta / Math.abs(windowFirst)) * 100 : 0;
+
   /*
    * 默认展开（`chartOverride === null`）—— 不再看 `windowed` 有没有形状。
    * 理由见上面 `chartOverride` 的声明。
@@ -1922,7 +1928,9 @@ export function TraderPage() {
           title={
             <span className="flex items-center gap-1">
               <ChartTabButton active={chartTab === 'equity'} onClick={() => setChartTab('equity')}>
-                归属权益曲线
+                {/* ⚠️ 「账户权益」而不是「归属权益」—— 曲线画的是共享钱包的真实权益
+                    （与上方「账户余额」指标卡同一个数），标签必须说对。 */}
+                账户权益曲线
               </ChartTabButton>
               <ChartTabButton active={chartTab === 'candles'} onClick={() => setChartTab('candles')}>
                 行情图表
@@ -1975,7 +1983,13 @@ export function TraderPage() {
                 所以没有任何数据是拿不到的。
               */
               <EquityMiniStrip
-                values={windowed.map((snapshot) => snapshot.equity)}
+                /*
+                 * ⚠️ **账户口径**（与展开态的曲线、与「账户余额」指标卡三者一致）。
+                 * 见 `windowFirst` 那段说明。
+                 */
+                values={windowed.map((snapshot) =>
+                  snapshot.accountEquity > 0 ? snapshot.accountEquity : snapshot.equity,
+                )}
                 delta={windowDelta}
                 percent={windowPercent}
                 asset={settleAsset}
@@ -1991,28 +2005,21 @@ export function TraderPage() {
             ) : (
               <div className="px-3.5 pb-2.5 pt-2">
                 <EquityWindowLine
-                  equity={equity}
+                  equity={windowLast}
                   delta={windowDelta}
                   percent={windowPercent}
                   asset={settleAsset}
-                  account={
-                    hasAccountCompare
-                      ? {
-                          delta: windowAccountDelta,
-                          percent:
-                            windowAccountFirst !== 0
-                              ? (windowAccountDelta / Math.abs(windowAccountFirst)) * 100
-                              : 0,
-                          gap: attributedGap,
-                        }
-                      : null
-                  }
                 />
                 <DashboardEquityChart
                   snapshots={snapshots}
                   range={range}
                   baseline={trader.initialEquity}
                   height={equityChartHeight}
+                  /*
+                   * ⚠️ **账户口径**（2026-10-13 用户要求）——
+                   * 曲线必须能和上方「账户余额」指标卡对上。见 `windowFirst` 那段。
+                   */
+                  metric="account"
                 />
               </div>
             )
@@ -2427,7 +2434,7 @@ function EquityMiniStrip({
 /**
  * 展开态下图表上方的一行口径说明。
  *
- * 只讲**这一段窗口里涨跌了多少**：当前归属权益本身已经常驻在上面那张指标卡里，
+ * 只讲**这一段窗口里涨跌了多少**：当前权益本身已经常驻在上面那张指标卡里，
  * 在这里再放一个 `text-3xl` 会让同一个数字在一屏里出现两次，而且都比别的东西显眼
  * （DESIGN.md §4 "不要把所有东西做成一样大"）。
  *
@@ -2436,94 +2443,50 @@ function EquityMiniStrip({
  * 真正需要解释"为什么这条曲线这么稀"的时候（快照太少、或一条平线被收成一行），
  * 说明就在 `EquityMiniStrip` 的 `note` 里，那里是**带结论**的一句话。
  *
- * ## ⚠️ 2026-10-13：加上【账户口径】的对照行（用户报"图表和实际账号对不上"）
+ * ## ⚠️ 2026-10-13：这里曾经有过第二行「同期账户」，已删除
  *
- * 用户的原话：
- * > 「图表上显示和实际账号对不上」
+ * 起因是用户报「图表显示和实际账号对不上」。我第一版的修法是
+ * **把两个口径并排显示 + 解释差额来源**：
+ * ```
+ *   本段变化  +$8.58 USDT (+8.57%)  本机器人归属
+ *   同期账户  −$2.10 USDT (−2.09%)  同一钱包含其他机器人（…多 +$10.67）
+ * ```
+ * 用户的第二次反馈（原话）：
+ * > 「图标完全乱套了，上面叫归属权益、同期账户、本段变化，一大堆莫名其妙的，
+ * >  搞这么多没用的画蛇添足，无端增加BUG？图标不就是最真实准确简单的，
+ * >  **账号余额、总盈亏能对上的吗**？」
  *
- * 他看到的：
- * ```
- *   指标卡「账户余额」97.93 ·「交易盈亏」−$2.12（−2.11%）   ← 账户口径
- *   图表「本段变化」        +$8.45（+8.44%）                ← 归属口径
- * ```
- * **两个数都对**，差额是他**同一个钱包上的另外两个机器人**的亏损 ——
- * 但界面没说这件事，于是他只能得出"对不上"这个结论。
- *
- * 修法不是改数字（那会改错），而是**把两个口径并排放在一起，并把差额归因**：
- * ```
- *   本段变化 +$8.45（+8.44%） · 本机器人归属
- *   同期账户 −$2.12（−2.11%） · 同一钱包含其他机器人
- * ```
- * ⚠️ 对照行**只在数据真的有两端时才显示** —— 旧快照的 `account_equity`
- * 是回填值、缺值时是 `0`，拿 0 去算会得出一个巨大的假差额，那比不显示更糟。
+ * **他是对的** —— 那个修法把"数字对不上"换成了"要读两行解释才懂"，
+ * 而问题本身有更简单的解：**让曲线画账户口径**（见 `DashboardEquityChart`
+ * 的 `metric` prop 与下面 `windowFirst` / `windowLast` 的说明）。
+ * 于是这一行回到一行，标签也改回中性的"本段变化"。
  */
 function EquityWindowLine({
   equity,
   delta,
   percent,
   asset,
-  account,
 }: {
   equity: number;
   delta: number;
   percent: number;
   asset: string;
-  /**
-   * 同窗口的账户口径对照。`null` = 数据不足以对照（此时不显示第二行）。
-   *
-   * ```
-   *   accountDelta  —— 这一段里共享钱包的变化
-   *   gap           —— 归属 − 账户 = 同钱包其他机器人的贡献
-   * ```
-   */
-  account: { delta: number; percent: number; gap: number } | null;
 }) {
   return (
-    <div className="mb-2 space-y-1 text-xs">
-      <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
-        <span
-          className="text-ink-lo"
-          title="相对可见区间第一个快照的变化。只算【这个机器人自己】已平仓的净盈亏。"
-        >
-          本段变化
-        </span>
-        <span className={cn('num text-base font-semibold', pnlColor(delta))}>
-          {fmtUsdSigned(delta, 2)} {asset}
-        </span>
-        <span className={cn('num', pnlColor(delta))}>({fmtPercent(percent)})</span>
-        <span className="text-ink-faint">本机器人归属</span>
-        {/* `equity` 只用来兜底没有快照时的比较基准，与图表内部口径一致；
-            它是给屏幕阅读器的，不占视觉位置。 */}
-        <span className="sr-only">当前归属权益 {fmtNum(equity, 2)}</span>
-      </div>
-
-      {account ? (
-        <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
-          <span className="text-ink-lo" title="同一个交易所钱包在这一段里的实际变化，含同账户上其他机器人的盈亏。">
-            同期账户
-          </span>
-          <span className={cn('num', pnlColor(account.delta))}>
-            {fmtUsdSigned(account.delta, 2)} {asset}
-          </span>
-          <span className={cn('num text-ink-lo', pnlColor(account.delta))}>
-            ({fmtPercent(account.percent)})
-          </span>
-          <span className="text-ink-faint">
-            同一钱包含其他机器人
-            {Math.abs(account.gap) >= 0.01 ? (
-              /*
-               * ⚠️ 把差额**归因**，而不是只报一个差数 ——
-               * "差 10.55" 本身又是一个要用户自己想的问题。
-               *
-               * ⚠️ 文案里**不要再写一遍"多/少"**：`fmtUsdSigned` 已经带符号，
-               * 写成"比…多 +$21.31"会让"多"与"+"重复（实测第一版就是这样）。
-               * 差额为正 = 本机器人归属跑赢了同账户的其他机器人。
-               */
-              <>（本机器人跑赢同账户其他机器人 {fmtUsdSigned(account.gap, 2)}）</>
-            ) : null}
-          </span>
-        </div>
-      ) : null}
+    <div className="mb-2 flex flex-wrap items-baseline gap-x-3 gap-y-1 text-xs">
+      <span
+        className="text-ink-lo"
+        title="相对可见区间第一个快照的变化。与上方「账户余额」同一口径（共享钱包的真实权益）。"
+      >
+        本段变化
+      </span>
+      <span className={cn('num text-base font-semibold', pnlColor(delta))}>
+        {fmtUsdSigned(delta, 2)} {asset}
+      </span>
+      <span className={cn('num', pnlColor(delta))}>({fmtPercent(percent)})</span>
+      {/* `equity` 只用来兜底没有快照时的比较基准，与图表内部口径一致；
+          它是给屏幕阅读器的，不占视觉位置。 */}
+      <span className="sr-only">当前账户权益 {fmtNum(equity, 2)}</span>
     </div>
   );
 }

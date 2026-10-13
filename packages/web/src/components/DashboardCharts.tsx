@@ -104,8 +104,17 @@ function EquityTooltip({
       </div>
 
       <div className="flex items-baseline justify-between gap-3">
-        {/* 「归属权益」而不是「权益」：这条曲线是该机器人自己的账，不是共享钱包。 */}
-        <span className="text-xs text-ink-lo">归属权益</span>
+        {/*
+         * ⚠️ **「账户权益」而不是「归属权益」**（2026-10-13 用户要求）。
+         *
+         * 这条曲线现在画的是 `accountEquity`（共享钱包的真实权益）——
+         * 与上方「账户余额」指标卡同一个数。标签必须说对，
+         * 否则用户会以为在看另一个口径（那正是他两次反馈的困惑）。
+         *
+         * ⚠️ 归属口径没有消失：它在「交易盈亏」指标卡里回答
+         * "这个机器人赚了多少"（那是另一个问题，不该画成曲线）。
+         */}
+        <span className="text-xs text-ink-lo">账户权益</span>
         <span className="num text-sm text-ink-hi">
           {fmtNum(point.equity, 2)} {asset}
         </span>
@@ -168,6 +177,37 @@ export function DashboardEquityChart({
   height = 240,
   baseline,
   asset,
+  /*
+   * ⚠️ **默认画【账户口径】**（2026-10-13，用户要求）。
+   *
+   * ## 用户的反馈（原话）
+   *
+   * > 「图表不就是最真实准确简单的，账号余额、总盈亏能对上的吗？」
+   *
+   * 他是对的。原来的实现画的是 `snapshot.equity`（**归属**口径：
+   * `initial_equity + Σ本机器人已平仓净额`），而页面上方的指标卡
+   * 「账户余额」显示的是 `accountEquity`（**共享钱包**的真实权益）——
+   * 于是同一屏两个数字，用户第一反应就是"对不上"。
+   *
+   * ## 两个口径的定义（见 `db/schema.ts` 的 M4 迁移说明）
+   *
+   * ```
+   *   equity         = initial_equity + Σ(本机器人已平仓净额)  ← 只算自己
+   *   accountEquity  = 共享钱包的真实权益（含同账户其他机器人）  ← 账户真实值
+   * ```
+   * 实测 `#10`：`equity` 108.47 vs `accountEquity` 97.80（差 10.67 = 同钱包其他机器人）。
+   *
+   * ## 为什么改成账户口径是对的
+   *
+   * **图表是"账户在这段时间怎么走的"** —— 那正是操作员要去交易所核对的数字。
+   * 归属口径适合回答"我这个机器人赚了多少"（那是指标卡的事），
+   * 但它**不适合画成曲线**：它与钱包余额不一致，而曲线给人的直觉就是
+   * "这是我的钱的变化"。
+   *
+   * ⚠️ 归属口径**没有消失** —— 「本段变化」那一行仍然算它（标签写明
+   * "本机器人归属"），因为它回答的是另一个问题。
+   */
+  metric = 'account',
 }: {
   snapshots: EquitySnapshot[];
   range: EquityRange;
@@ -184,6 +224,17 @@ export function DashboardEquityChart({
   baseline?: number;
   /** Settlement unit for the readout. Defaults to USDT, the only one in practice. */
   asset?: string;
+  /**
+   * 画哪个口径。
+   *
+   * ```
+   *   'account'    —— 共享钱包的真实权益（默认；与「账户余额」指标卡一致）
+   *   'attributed' —— 本机器人归属（只算自己的已平仓净额）
+   * ```
+   * ⚠️ 默认是 `'account'`：**曲线必须能和指标卡对上**，
+   * 否则用户看到两个数就会问"为什么对不上"。
+   */
+  metric?: 'account' | 'attributed';
 }) {
   /*
    * ⚠️ hook 必须在"点数不足"那个提前 return **之前**调用 ——
@@ -195,7 +246,20 @@ export function DashboardEquityChart({
   const points: EquityPoint[] = windowed
     .map((snapshot) => ({
       t: new Date(snapshot.timestamp).getTime(),
-      equity: snapshot.equity,
+      /*
+       * ⚠️ 按 `metric` 取口径 —— 见 props 里那段说明。
+       *
+       * ⚠️ **`accountEquity` 为 0 时回落到 `equity`**：迁移前的旧行
+       * `account_equity` 是回填的，而完全没有值时它是 `0`
+       *（见 `db/schema.ts` 的 M4 取舍说明）。直接用 0 会把曲线砸到地板，
+       * 而那条曲线**看起来完全正常** —— 只是数字全错。
+       */
+      equity:
+        metric === 'account'
+          ? snapshot.accountEquity > 0
+            ? snapshot.accountEquity
+            : snapshot.equity
+          : snapshot.equity,
       unrealizedPnl: snapshot.unrealizedPnl,
       openPositions: snapshot.openPositions,
     }))
