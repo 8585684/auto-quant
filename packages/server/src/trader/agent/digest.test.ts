@@ -23,6 +23,41 @@ test('★ 容忍 ```json 包裹与前后废话', () => {
   assert.equal(r.ok, true);
 });
 
+test('★★★ 容忍 <digest> 标签包裹（线上 20 个里 19 个失败的那次教训）', () => {
+  /*
+   * ## 事故（2026-10-13，`#11` 按币并行）
+   *
+   * flash 档模型对"裸输出 JSON"的服从性差，19/20 失败于
+   * "没有找到 JSON 对象"（输出散文或带解释的结构）。
+   * 而同一批模型在 `<team>` / `<decision>` 标签里能稳定输出 JSON。
+   *
+   * 所以 task 现在要求"放在 <digest> 标签里"，extractJson 必须能认它。
+   */
+  const r = parseDigest(
+    '先说两句废话。\n<digest>\n' + JSON.stringify(good()) + '\n</digest>\n再补一句。',
+    'BTCUSDT',
+  );
+  assert.equal(r.ok, true, '★ <digest> 标签里的 JSON 必须能解析');
+});
+
+test('★★★ 标签里的 JSON 优先于正文里的杂散花括号', () => {
+  /*
+   * 模型喜欢在标签外写解释 —— 解释文字里偶发的 `{` 会污染"全文扫第一个 {"。
+   * 顺序必须是 标签 > 围栏 > 全文。
+   */
+  const decoy = '我的判断是 {可能} 偏空。';
+  const r = parseDigest(decoy + '\n<digest>\n' + JSON.stringify(good()) + '\n</digest>', 'BTCUSDT');
+  assert.equal(r.ok, true, '★ 标签优先 —— 正文杂散花括号不该干扰');
+});
+
+test('★ 标签里嵌围栏也能解析（模型两种包裹叠着用）', () => {
+  const r = parseDigest(
+    '<digest>\n```json\n' + JSON.stringify(good()) + '\n```\n</digest>',
+    'BTCUSDT',
+  );
+  assert.equal(r.ok, true);
+});
+
 test('★★★ 标的对不上 → 失败（不能静默记到错的标的名下）', () => {
   /*
    * ⚠️ 按币并行时，每份摘要会被放回**它自己的槽位**。

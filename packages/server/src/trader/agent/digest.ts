@@ -90,18 +90,47 @@ export interface SymbolDigest {
 /** 解析结果。 */
 export type DigestParse = { ok: true; digest: SymbolDigest } | { ok: false; error: string; raw: string };
 
-/** 从模型输出里抽出 JSON（容忍 ```json 包裹与前后废话）。 */
+/** 从模型输出里抽出 JSON（容忍 ```json 包裹、`<digest>` 标签与前后废话）。 */
 function extractJson(text: string): unknown | null {
+  /*
+   * ── ⚠️ **`<digest>` 标签优先**（2026-10-13 线上实测 20 个里 19 个失败）──────
+   *
+   * ## 事故：flash 模型不服从"只输出 JSON"
+   *
+   * 按币并行的失败明细（`#11`，线上原文）：
+   * ```
+   *   没有找到 JSON 对象 ×13   ← 输出的是散文/带解释的结构
+   *   direction 非法 undefined ×3 ← 有 JSON 但值没填
+   *   缺 symbol ×2 · 标的对不上 ×1
+   * ```
+   *
+   * ## 为什么加标签能救
+   *
+   * 本项目所有角色都用 **XML 标签纪律**（`<decision>` / `<risk>` / `<team>`），
+   * 实测 flash 档模型对"先开标签再写内容"的服从性远好于"裸输出 JSON"
+   * —— 同一批模型在 `<team>` 里能稳定输出 JSON 数组，裸输出就写散文。
+   *
+   * ⚠️ 顺序：**标签 > 代码围栏 > 全文**。标签最不容易被"前后废话"污染
+   * （模型喜欢在 JSON 前后写解释，全文扫描会被第一个 `{` 之前的
+   * 解释文字里偶发的 `{` 干扰）。
+   */
+  const tagged = /<digest>([\s\S]*?)<\/digest>/.exec(text);
+  const candidates: string[] = [];
+  if (tagged !== null) candidates.push(tagged[1]!);
   const fence = /```(?:json)?\s*([\s\S]*?)```/.exec(text);
-  const body = fence?.[1] ?? text;
-  const start = body.indexOf('{');
-  const end = body.lastIndexOf('}');
-  if (start < 0 || end <= start) return null;
-  try {
-    return JSON.parse(body.slice(start, end + 1));
-  } catch {
-    return null;
+  if (fence !== null) candidates.push(fence[1]!);
+  candidates.push(text);
+  for (const body of candidates) {
+    const start = body.indexOf('{');
+    const end = body.lastIndexOf('}');
+    if (start < 0 || end <= start) continue;
+    try {
+      return JSON.parse(body.slice(start, end + 1));
+    } catch {
+      /* 试下一个候选（例如标签里嵌了围栏，或正文里围栏外还有个对象）。 */
+    }
   }
+  return null;
 }
 
 /**

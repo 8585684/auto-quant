@@ -1603,19 +1603,34 @@ async function runTradingDeskInner(input: {
              * ⚠️ `invalidates`（失效条件）必填 —— 它防的是"谄媚"：
              * 没有失效条件的判断无法被推翻，也就无法被学习。
              */
+            /*
+             * ⚠️⚠️ **给"填好值的完整示例"，不给"字段说明"**（2026-10-13 两轮实测）。
+             *
+             * 第一版只写"方向判断、信号强度、关键位、依据" → 20/20 全失败（输出散文）。
+             * 第二版写字段说明 → 19/20 失败 —— 它把字段说明当成模板而不是要填的表
+             *（direction 是 undefined：输出里字段在、值没填）。
+             *
+             * 而 `judge` 用"先输出 JSON 数组 + 内联示例"稳定工作了 100+ 轮。
+             * 所以这次直接给【一个填好值的完整示例】—— 模型模仿示例
+             * 远比理解字段说明可靠（few-shot > 指令，对 flash 档尤其如此）。
+             *
+             * ⚠️ `<digest>` 标签与 `digest.ts` 的 `extractJson` 配套
+             *（那里按 标签 > 围栏 > 全文 的顺序找 JSON）。
+             * ⚠️ `invalidates`（失效条件）必填 —— 防谄媚：
+             * 没有失效条件的判断无法被推翻，也就无法被学习。
+             */
             task:
-              '只输出一个 JSON 对象（不要多余文字），字段：\n' +
-              '{\n' +
-              '  "symbol": "本标的（必须与你收到的材料一致）",\n' +
-              '  "direction": "bullish | bearish | neutral | unclear 之一",\n' +
-              '  "score": 0-100 的整数（信号强度，不是上涨概率）,\n' +
-              '  "confidence": 0-100 的整数（你对自己这个判断的置信度）,\n' +
-              '  "keyLevels": { "support": 数字或null, "resistance": 数字或null },\n' +
-              `  "evidence": "结论依据（含具体数字：价格/均线/指标值）",\n` +
-              '  "invalidates": "失效条件（出现什么情况这个判断就错了）",\n' +
-              '  "dataGaps": ["哪些数据你没拿到，没有就空数组"]\n' +
-              '}\n' +
-              '数据不足时 direction 用 "unclear"，不要编。',
+              '把你的分析写成一个 JSON 对象，放在 <digest> 标签里。\n' +
+              '照这个例子填（值全部换成你这个标的的真实数据）：\n' +
+              '<digest>\n' +
+              '{"symbol":"OGNUSDT","direction":"bearish","score":35,"confidence":62,' +
+              '"keyLevels":{"support":0.0311,"resistance":0.0388},' +
+              '"evidence":"4H EMA20 0.0349 在价上方，15m MACD 柱 -0.00022 扩大，RSI7 41.3 低于 50；资金费 -0.018% 空头拥挤",' +
+              '"invalidates":"15m 放量收回 0.0349 并站稳两根以上，或资金费转正收敛",' +
+              '"dataGaps":[]}\n' +
+              '</digest>\n' +
+              '规则：direction 只能是 bullish/bearish/neutral/unclear 之一；score 与 confidence 是 0-100 的整数；' +
+              '数据不足时 direction 用 unclear、把缺的写进 dataGaps —— 不要编。',
           });
           if (!out.ok) return { ok: false as const, text: '', error: out.error ?? '调用失败' };
           return { ok: true as const, text: out.raw };

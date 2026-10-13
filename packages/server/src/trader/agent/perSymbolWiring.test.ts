@@ -82,26 +82,29 @@ test('★ digests 的渲染必须含 依据 与 失效条件（裁决官直接�
   assert.ok(/失效条件：\$\{d\.invalidates\}/.test(CODE), '★ 必须渲染 invalidates（失效条件）');
 });
 
-test('★★★ 按币并行的 task 必须写清【JSON 输出契约】（2026-10-13 全失败的根因）', () => {
+test('★★★ 按币并行的 task 必须给【填好值的完整示例】（散文/字段说明都不够）', () => {
   /*
-   * ## 事故：20 个标的全部解析失败
+   * ## 事故链（两轮线上实测）
    *
-   * 第一版 task 只写了"方向判断、信号强度、关键位、依据" ——
-   * `parseDigest` 要求严格 JSON（symbol/direction/score/confidence/evidence/
-   * invalidates，缺一即整体失败），而模型自然输出了散文。
+   * 第一版"方向判断、信号强度、关键位、依据" → 20/20 失败（输出散文）
+   * 第二版"字段说明" → 19/20 失败（字段在、值没填，direction 是 undefined）
    *
-   * 线上：`按币并行完成：成功 0 · 失败 20`
-   *
-   * ## 判据：task 文本里必须出现契约的关键字段名
+   * ## 所以契约是：内联一个**填好值的示例** + `<digest>` 标签
+   *（few-shot 对 flash 档的服从性远好于指令）。
    */
+  assert.ok(
+    /<digest>/.test(CODE),
+    '★ task 必须用 <digest> 标签（与 digest.ts 的 extractJson 配套，标签 > 围栏 > 全文）',
+  );
+  /* 示例必须是"填好值的"（有具体数字），不是占位符。 */
+  assert.ok(
+    /"direction":"bearish","score":35/.test(CODE),
+    '★ task 里必须内联一个填好值的完整示例（含真实数字），不是字段说明',
+  );
   for (const field of ['"symbol"', '"direction"', '"score"', '"confidence"', '"evidence"', '"invalidates"']) {
     assert.ok(
       CODE.includes(field),
-      `★ task 里必须写明输出字段 ${field} —— 否则模型输出散文，parseDigest 全部失败`,
+      `★ 示例里必须有字段 ${field} —— 否则模型不知道要输出它`,
     );
   }
-  assert.ok(
-    /只输出一个 JSON 对象/.test(CODE),
-    '★ task 必须开宗明义"只输出一个 JSON 对象" —— 与 judge 的"先输出 JSON 数组"同一条纪律',
-  );
 });
