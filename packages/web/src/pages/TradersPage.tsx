@@ -7,7 +7,7 @@ import type { TraderStatus } from '@aq/shared';
 import { api, type TraderRow } from '../lib/api';
 import { useApp, useEvents } from '../lib/store';
 import { useSummaries } from '../lib/summaries';
-import { committedCapitalOf, groupTradersByAccount } from '../lib/fleetTotals';
+import { committedCapitalOf, fleetTotals, groupTradersByAccount } from '../lib/fleetTotals';
 import { useDocumentTitle, usePolled } from '../lib/hooks';
 import { useRunOnce } from '../lib/actions';
 import { Button, ErrorNote, Modal, Panel, Spinner3, cn } from '../components/ui';
@@ -134,27 +134,39 @@ export function TradersPage() {
 
   const runningCount = traders.filter((t) => t.isRunning).length;
   /*
-   * ⚠️ 不能把各机器人的「归属权益」求和。
+   * ⚠️⚠️ **不能把各机器人的「归属权益」求和** —— 也**不能**"同账户取第一个"。
    *
    * 共用同一个交易所账户的机器人，每个人的归属权益里都含**同一笔初始资金**
    * （归属权益 = 初始权益 + 自己的净盈亏 + 自己的浮盈）。求和 = 把同一笔钱
-   * 数很多遍 —— 实测三个机器人给出 **30.67**，而钱包里只有 **10.42**，
-   * 初始权益被重复计算了 **19.81 USDT**。
+   * 数很多遍 —— 实测三个机器人给出 **30.67**，而钱包里只有 **10.42**。
    *
-   * 首页曾经就是这个错（`OverviewPage` 已修），这里是同一处的另一份实现。
-   * 正确的口径：**账户权益每个账户只算一次**（同一账户下所有机器人读的是同一个
-   * 钱包余额），账户之间再相加。已实现盈亏是可加的，保持求和。
+   * ## 2026-10-14 修：这里原来取的是"第一个有效读数"，而不是"最新的"
    *
-   * 这一处原来在 tooltip 里写了免责说明来解释"这个合计不等于钱包余额"——
-   * 但**把数字改对，比在说明里解释它为什么错要好**。
+   * 原实现：
+   * ```
+   *   const shared = group
+   *     .map((trader) => statsMap[trader.id]?.accountEquity)
+   *     .find((value) => ...);       // ← find 取【第一个】，不是最新
+   * ```
+   * `group` 按 id 排序，于是**取到了 id 最小那台机器人的快照** ——
+   * 而它可能是**几周前**的。线上实测（账户 #2 挂着 #9 与 #11）：
+   * ```
+   *   #9  accountEquity = 20.8585 @2026-10-03  ← 43 天前（旧）
+   *   #11 accountEquity = 20.7519 @2026-10-13  ← 最新
+   *   → find() 取 #9 的 20.8585 → 合计 114.97
+   *   → 正确（取最新）        → 合计 114.86
+   * ```
+   * 用户看到的就是这个："盈亏计算有问题，和实际对不上"。
+   *
+   * ## 根治：改用 `fleetTotals()`，而不是在这里手算第二遍
+   *
+   * `fleetTotals.ts` 里已经有正确的 `latestAccountReading()`（**取时间最新**）——
+   * 而这里手算了一遍、且算错了。**同一个算术写在两个地方，改一处等于没改**
+   *（`docs/MAINTENANCE.md` §3.4 记的就是这一类）。
+   * 所以不再"修对这份手算"，而是**让它调用共享库**。
    */
-  const totalEquity = [...groupTradersByAccount(traders).values()].reduce((sum, group) => {
-    // 同一账户下所有机器人的 accountEquity 是同一个数（共享钱包），取一个即可。
-    const shared = group
-      .map((trader) => statsMap[trader.id]?.accountEquity)
-      .find((value): value is number => typeof value === 'number' && Number.isFinite(value) && value > 0);
-    return sum + (shared ?? committedCapitalOf(group));
-  }, 0);
+  const fleetTotal = fleetTotals({ traders, stats: statsMap });
+  const totalEquity = fleetTotal.accountEquityFleet;
   const totalRealized = traders.reduce((sum, trader) => sum + (statsMap[trader.id]?.realizedPnl ?? 0), 0);
   const openPositions = traders.reduce((sum, trader) => sum + (statsMap[trader.id]?.openPositions ?? 0), 0);
 
