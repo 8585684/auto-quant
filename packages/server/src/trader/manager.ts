@@ -373,8 +373,51 @@ interface ResearchCache {
 const researchCache = new Map<number, ResearchCache>();
 
 /** 缓存有效期：默认 15 分钟（新闻不是秒级变化的）。 */
+/**
+ * **调研缓存的有效期**（毫秒）。
+ *
+ * ⚠️ **必须大于刷新间隔**（2026-10-13 实测后改）。
+ *
+ * ## 原来写死 15 分钟，而刷新间隔是 10 分钟、调研实测要 22 分钟
+ *
+ * ```
+ *   刷新间隔   10 分钟
+ *   TTL        15 分钟
+ *   实际耗时   **22.1 分钟**
+ * ```
+ * 于是决策经常读到"已过期"的缓存 —— 而它本可以读上一份
+ *（**新闻不是秒级变化的**，一份 20 分钟前的情报比"没有情报"好得多）。
+ *
+ * ## 新口径
+ *
+ * ```
+ *   TTL = 刷新间隔 + 10 分钟
+ * ```
+ * 这样"上一份的年龄"最多到"下一份刚准备好" —— **中间不会出现空窗**。
+ *
+ * ⚠️ 上界 90 分钟：再长的话"旧闻当新闻"的风险就超过收益了
+ *（实测 `rankIntel` 会把超过 48 小时的消息判为过期，所以上界不是安全线，
+ *  而是"情报新鲜度"的取舍）。
+ */
 function researchTtlMs(): number {
-  return Number(process.env.AQ_RESEARCH_TTL_MS ?? 15 * 60_000);
+  const explicit = Number(process.env.AQ_RESEARCH_TTL_MS ?? '');
+  if (Number.isFinite(explicit) && explicit >= 60_000) return explicit;
+  return researchIntervalMs() + 10 * 60_000;
+}
+
+/**
+ * **后台调研的刷新间隔**（毫秒）—— 与 `ensureResearchRefresher` 共用一处。
+ *
+ * ⚠️ 抽成函数是因为**两个地方都要用它**（间隔与 TTL 必须自洽）——
+ * "同一个算术写在两个地方，改一处等于没改"（本项目已经踩过两次）。
+ */
+function researchIntervalMs(): number {
+  const raw = Number(process.env.AQ_RESEARCH_INTERVAL_MS ?? '');
+  /*
+   * 默认 **20 分钟**：实测一次调研 **22.1 分钟**（4 猎手串行、全部有产出）。
+   * 比它短的间隔只会让下一轮撞上还没跑完的那轮。
+   */
+  return Number.isFinite(raw) && raw >= 60_000 ? raw : 20 * 60_000;
 }
 function agentWorkdir(traderId: number): string {
   const base = process.env.AQ_AGENT_WORKDIR ?? '/opt/autoquant/data/agent-workspace';
@@ -429,11 +472,42 @@ function ensureResearchRefresher(
 ): void {
   if (researchRefreshers.has(traderId)) return;
   /*
-   * 间隔默认 10 分钟。新闻不是秒级变化的，而**一次调研要 6–8 分钟**
-   *（四个猎手、两个一批）—— 间隔比它短只会让下一轮撞上还没跑完的那轮。
+   * ══════════════════════════════════════════════════════════════════════
+   *  ⚠️ **三个数字必须自洽**（2026-10-13 实测后重定）
+   * ══════════════════════════════════════════════════════════════════════
+   *
+   * ## 原来那三个数字互相矛盾
+   *
+   * ```
+   *   后台刷新间隔   10 分钟
+   *   缓存 TTL       15 分钟
+   *   调研实际耗时   **22.1 分钟**   ← 实测（4 猎手串行，全部有产出）
+   * ```
+   *
+   * **后果**：每 10 分钟起一次调研，而一次要 22 分钟 →
+   * ① 永远有第二批在跑（`refreshing` 标志挡住了并发，但**下一次触发又立刻开始**）；
+   * ② 缓存 15 分钟就过期 → **决策经常读到"已过期"的缓存**，
+   *    而那句日志会写着"先用旧结果，后台正在刷新"。
+   *
+   * ## 为什么原来的注释说"6–8 分钟"
+   *
+   * 那时是**并发 2**（四个猎手两批），而那个配置下**每个都超时** ——
+   * "6–8 分钟"是"超时前跑的那一段"，不是"真的跑完"。
+   * 现在串行（并发 1）**真的跑完了**，耗时是 **22.1 分钟**（实测各猎手 199–510 秒）。
+   *
+   * ## 新的口径（按"实测耗时"反推，而不是按"希望多久"）
+   *
+   * ```
+   *   刷新间隔  = max(默认 20 分钟, 上次实测耗时 × 1.2)
+   *   TTL       = 刷新间隔 + 10 分钟   ← 保证"缓存不会在下一份准备好之前就过期"
+   * ```
+   * ⚠️ **TTL 必须 > 刷新间隔**：否则决策会在两份情报之间读到"已过期"，
+   * 而那段时间**它本可以读上一份**（新闻不是秒级变化的）。
+   *
+   * ⚠️ 而"实测耗时"用**自适应**的：不同机器、不同模型档位下耗时差很多
+   *（我这次是 22 分钟，4 核机器上可能 8 分钟）。写死一个数会在换机器后失准。
    */
-  const raw = Number(process.env.AQ_RESEARCH_INTERVAL_MS ?? '');
-  const intervalMs = Number.isFinite(raw) && raw >= 60_000 ? raw : 10 * 60_000;
+  const intervalMs = researchIntervalMs();
 
   const runOnce = (): void => {
     const cached = researchCache.get(traderId);
