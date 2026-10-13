@@ -41,6 +41,7 @@
 
 import type { ModelTier } from '../../llm/modelCatalog.js';
 import { mapConcurrent } from './pool.js';
+import { analyzePerSymbol, type PerSymbolResult } from './perSymbol.js';
 import { enterCritical, leaveCritical } from './resourceGate.js';
 import { compactMarketContext } from './symbolSlices.js';
 import { pickForAnalysis } from './analystSampling.js';
@@ -1533,6 +1534,77 @@ async function runTradingDeskInner(input: {
    *（否则模型会以为"没数据"—— 而那正是裁决官上一轮的原话）。
    */
   const marketHeadForDebate = headOfMarket(analystContext, DEBATE_MARKET_FOR_JUDGE_CHARS);
+
+  /*
+   * ══════════════════════════════════════════════════════════════════════════
+   *  ⚠️ **按币并行分析**（`AQ_PER_SYMBOL=on` 才启用，默认关闭）
+   * ══════════════════════════════════════════════════════════════════════════
+   *
+   * ## 用户的建议（2026-10-12 原话）
+   *
+   * > 「假设要分析 20 个，那就**并行 20 个子代理，同步进行一人分析一个，
+   * >  分析完了以后汇总**」
+   *
+   * ## 为什么现状（共享材料）会失败
+   *
+   * 4 个分析师**共享一份** 46k 字符的材料（6 个候选 × 6k）：
+   * ```
+   *   · 太大 → 必须压缩 K 线序列（keepLast=10）
+   *   · 压缩 → 模型抱怨「看不到真实摆动低点，止损只能估算」
+   *   · 「止损只能估算」→ 不满足入场标准 → 每轮都 skip
+   * ```
+   * 按币并行的收益：每个标的给**完整序列**（不压缩，材料只有约 4k），
+   * 模型能算出真实止损。
+   *
+   * ## 为什么默认关闭
+   *
+   * 它是**另一种编排形态**，与"4 个分析师共享材料"各有取舍（见 `perSymbol.ts`
+   * 的注释）：按币并行**看不到别人**（跨币比较需要下游补偿），而现状能看到。
+   * 所以先用环境变量切换，等实测数据说明哪种更好再定默认。
+   *
+   * ## ⚠️ 预算：按币并行的调用【不计入 `maxCalls`】
+   *
+   * `DESK_LIMITS.maxCalls` 管的是"团队角色"（总管/分析师/辩论/裁决/汇报），
+   * 而按币并行是**分析层的另一种实现** —— 它替代的是`market_analyst` +
+   * `technical` 那两个角色，不是"多问几个角色"。
+   * 计入会让它挤掉裁决官（唯一决策者），那是本末倒置。
+   *
+   * ⚠️ 但**超时仍然生效**（每个标的走 `safeAsk`，见 `input.ask` 的实现）。
+   */
+  let perSymbolResult: PerSymbolResult | null = null;
+  if (process.env.AQ_PER_SYMBOL === 'on') {
+    const compactedForPerSymbol = compactMarketContext(input.marketContext, 30 /* 完整序列 */);
+    if (compactedForPerSymbol !== null && compactedForPerSymbol.slices.length > 0) {
+      const tasks = compactedForPerSymbol.slices.map((s) => ({
+        symbol: s.symbol ?? 'UNKNOWN',
+        context: [compactedForPerSymbol.shared, s.text].join('\n\n'),
+      }));
+      note('supervisor', 'dispatch', `按币并行：${tasks.length} 个标的，并发 4`);
+      perSymbolResult = await analyzePerSymbol({
+        tasks,
+        ask: async (task) => {
+          const out = await safeAsk(input.ask, {
+            role: 'market_analyst',
+            tier: 'T2_mid',
+            context: task.context,
+            task:
+              '分析这个标的的当前状态：方向判断、信号强度（0–100）、关键支撑/阻力位、' +
+              '以及一段**可被裁决官直接使用**的依据（含具体数字）。',
+          });
+          if (!out.ok) return { ok: false as const, text: '', error: out.error ?? '调用失败' };
+          return { ok: true as const, text: out.raw };
+        },
+        concurrency: 4,
+      });
+      note(
+        'supervisor',
+        'dispatch',
+        `按币并行完成：成功 ${perSymbolResult.digests.length} · 失败 ${perSymbolResult.failed.length}` +
+          ` · 并发峰值 ${perSymbolResult.peakConcurrency}`,
+      );
+    }
+  }
+
   const debateMaterial = [
     '## 市场（摘要 —— 与分析师看到的是同一份压缩材料）',
     marketHeadForDebate.text,
@@ -1554,6 +1626,42 @@ async function runTradingDeskInner(input: {
      */
     '## 分析师产出',
     analyses.map((a) => `- ${a.role}: ${a.ok ? a.raw.slice(0, ANALYST_DIGEST_CHARS) : `（失败：${a.error ?? '未知'}）`}`).join('\n'),
+    /*
+     * ⚠️ **按币并行的产出放在【分析师产出之后、辩论之前】**（2026-10-13）。
+     *
+     * 它是**另一种分析层的实现**（每个标的单独评估，完整序列）——
+     * 辩论者与裁决官用它做"逐币核对"，而不是替代分析师的整体判断。
+     *
+     * ⚠️ 失败项必须显式列出（`perSymbol.ts` 的注释里写明了这条纪律）：
+     * 否则下游会以为"这个币没被选中"，而真相是"它没分析成" —— 两者含义完全不同。
+     */
+    ...(perSymbolResult !== null
+      ? [
+          '## 按币并行分析（每个标的的独立评估，含完整序列）',
+          perSymbolResult.digests.length > 0
+            ? perSymbolResult.digests
+                .map(
+                  (d) =>
+                    `- **${d.symbol}** ${d.direction}（强度 ${d.score} · 置信 ${d.confidence}）` +
+                    (d.keyLevels?.support !== undefined || d.keyLevels?.resistance !== undefined
+                      ? ` ｜ 支撑 ${d.keyLevels?.support ?? '-'} 阻力 ${d.keyLevels?.resistance ?? '-'}`
+                      : '') +
+                    `\n  依据：${d.evidence}` +
+                    `\n  失效条件：${d.invalidates}` +
+                    (d.dataGaps !== undefined && d.dataGaps.length > 0 ? `\n  数据缺口：${d.dataGaps.join('、')}` : ''),
+                )
+                .join('\n')
+            : '（按币并行没有产出任何成功的摘要）',
+          ...(perSymbolResult.failed.length > 0
+            ? [
+                '',
+                `（以下 ${perSymbolResult.failed.length} 个标的**分析失败**，不是"被排除"：` +
+                  perSymbolResult.failed.map((f) => `${f.symbol}（${f.reason}）`).join('、') +
+                  '）',
+              ]
+            : []),
+        ]
+      : []),
   ].join('\n\n');
 
   let bull: DeskRoleOutput | null = null;
