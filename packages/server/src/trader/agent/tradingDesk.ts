@@ -1628,6 +1628,17 @@ async function runTradingDeskInner(input: {
         `按币并行完成：成功 ${perSymbolResult.digests.length} · 失败 ${perSymbolResult.failed.length}` +
           ` · 并发峰值 ${perSymbolResult.peakConcurrency}`,
       );
+      /*
+       * ⚠️ **失败原因必须逐条上报**（2026-10-13 实测踩到）。
+       *
+       * 只写汇总行（"失败 18"）把最有价值的信息丢了 —— 18 个为什么失败
+       * 全都看不到，而那正是修它的唯一线索。逐条写 reason，
+       * 审计日志里就能直接看到"摘要解析失败：缺 invalidates"还是
+       * "模型未返回"还是"标的对不上" —— 三者的修法完全不同。
+       */
+      for (const f of perSymbolResult.failed) {
+        note('supervisor', 'dispatch', `按币并行失败 ${f.symbol}：${f.reason}`);
+      }
     }
   }
 
