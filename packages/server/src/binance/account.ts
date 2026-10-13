@@ -44,17 +44,26 @@ export interface AccountBalanceSnapshot extends AccountState {
  * v2 shape is used instead — same fields, which is why one mapper covers both.
  */
 export async function fetchAccountState(rest: BinanceRest): Promise<AccountState> {
-  let account: BinanceAccountV3;
+  return mapAccount(await readAccount(rest));
+}
+
+/**
+ * Read the account from v3, falling back to v2 when that deployment has no v3.
+ *
+ * `-1121` / 404 means the v3 endpoint is unavailable there; the v2 shape carries
+ * the same fields, which is why one mapper covers both. The rule lives here once
+ * because both readers below need it — two copies would let the second one drift
+ * into "always v3" and start failing on deployments that never had v3.
+ */
+async function readAccount(rest: BinanceRest): Promise<BinanceAccountV3> {
   try {
-    account = await rest.signedRequest<BinanceAccountV3>('GET', '/fapi/v3/account');
+    return await rest.signedRequest<BinanceAccountV3>('GET', '/fapi/v3/account');
   } catch (error) {
     if (error instanceof BinanceApiError && (error.code === -1121 || error.httpStatus === 404)) {
-      account = await rest.signedRequest<BinanceAccountV3>('GET', '/fapi/v2/account');
-    } else {
-      throw error;
+      return await rest.signedRequest<BinanceAccountV3>('GET', '/fapi/v2/account');
     }
+    throw error;
   }
-  return mapAccount(account);
 }
 
 function mapAccount(account: BinanceAccountV3): AccountState {
@@ -99,16 +108,7 @@ export async function fetchBalanceSnapshot(
   rest: BinanceRest,
 ): Promise<{ ok: true; balance: AccountBalanceSnapshot } | { ok: false; error: string }> {
   try {
-    let account: BinanceAccountV3;
-    try {
-      account = await rest.signedRequest<BinanceAccountV3>('GET', '/fapi/v3/account');
-    } catch (error) {
-      if (error instanceof BinanceApiError && (error.code === -1121 || error.httpStatus === 404)) {
-        account = await rest.signedRequest<BinanceAccountV3>('GET', '/fapi/v2/account');
-      } else {
-        throw error;
-      }
-    }
+    const account = await readAccount(rest);
 
     return {
       ok: true,

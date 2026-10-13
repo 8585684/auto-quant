@@ -1,7 +1,7 @@
 import { createLogger } from '../logger.js';
 import { fetchBalanceSnapshot, type AccountBalanceSnapshot } from '../binance/account.js';
 import { BinanceRest, type BinanceRestOptions } from '../binance/rest.js';
-import { resolveEndpoints, type BinanceEnvironment } from '../binance/endpoints.js';
+import type { BinanceEnvironment } from '../binance/endpoints.js';
 import type { Vault } from '../crypto/vault.js';
 import { exchanges } from '../store/repositories.js';
 
@@ -148,5 +148,3 @@ export class BalanceService {
     return result.ok ? result.balance.walletBalance : null;
   }
 }
-
-export { resolveEndpoints };

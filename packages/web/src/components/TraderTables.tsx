@@ -2122,7 +2122,6 @@ export function TraderTables({
   tab,
   onChange,
   positionCount,
-  openOrderCount,
   refreshToken,
   onSelectSymbol,
   positionSymbols,
@@ -2133,19 +2132,6 @@ export function TraderTables({
   tab: TraderTabId;
   onChange: (tab: TraderTabId) => void;
   positionCount: number;
-  /**
-   * **已废弃，故意不再使用**。
-   *
-   * 它数的是 WebSocket 推来的 `order` 事件（`store.ts` 的 `live.orders`）里还没到终态的那些：
-   * 页面刚打开时它是 **0**（推送只在"页面开着的时候恰好下了单"时才有人写），
-   * 而撤单与成交**永远不会**把它删掉。表格读的却是 REST 的第一页 —— 于是截图里
-   * 「当前委托 0」下面躺着十六行委托。两个数说的根本不是同一件事。
-   *
-   * 现在标签与表格读的是同一个数组（见下面的 `ordersPaging`），这个 prop 只为了让
-   * 调用方（`TraderPage.tsx`）不用改就能编译。调用方那边还有一个同样口径的
-   * 「持仓 / 委托」数字，改它要动 `TraderPage.tsx`，不在本次范围内。
-   */
-  openOrderCount?: number;
   /**
    * Bumped by the caller after a manual 对账, so the tables refetch instead of
    * waiting out their 15-second poll — the numbers the operator just changed

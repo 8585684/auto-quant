@@ -43,8 +43,6 @@ export interface BinanceRestOptions {
   apiSecret?: string;
   /** Which Binance deployment to talk to. Defaults to live. */
   environment?: BinanceEnvironment;
-  /** @deprecated retained for callers that only think in testnet terms. */
-  testnet?: boolean;
   /** Milliseconds the request stays valid on the server. Binance caps at 60000. */
   recvWindow?: number;
   timeoutMs?: number;
@@ -215,10 +213,7 @@ export class BinanceRest {
   private readonly slotWaiters: Array<() => void> = [];
 
   constructor(options: BinanceRestOptions = {}) {
-    // `testnet: true` historically meant the legacy futures testnet. Map it to
-    // the current demo environment, which is the forward path.
-    const environment: BinanceEnvironment =
-      options.environment ?? (options.testnet ? 'demo' : 'production');
+    const environment: BinanceEnvironment = options.environment ?? 'production';
     this.endpoints = resolveEndpoints(environment);
     this.baseUrl = this.endpoints.rest;
 
