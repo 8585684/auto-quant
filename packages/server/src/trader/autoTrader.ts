@@ -3179,8 +3179,48 @@ export class AutoTrader {
        * 实测 `#9` 修之前的样子：角色句说「对资金保持保守」、MODE_GUIDANCE 又说
        * 一遍「稳健/保住本金压倒一切」、而它自己写的 `entryStandards` 里还抄了
        * 第三遍 —— **三层都在替它回答一个本该它自己回答的问题。**
+       *
+       * ── ⚠️⚠️ **`ai_team` 也必须算"托管"**（2026-10-13 修一个真 BUG）────────
+       *
+       * ## 原来写的是 `mode === 'ai_managed'` —— 于是 `ai_team` 被漏掉了
+       *
+       * 后果（实测 `#11`，55 轮零决策后抓到的）：
+       * ```
+       *   system_prompt 含"由你自己判断"? **false**
+       *   system_prompt 含"稳健"?        **true**   ← conservative 那段确实生效了
+       * ```
+       * 也就是说团队模式的机器人一直在吃**系统写死的"稳健"性格**：
+       * ```
+       *   「保住本金压倒一切。宁可交易更少、质量更高。」
+       *   「当信号互相冲突时，正确的动作是 `wait`。」
+       *   「错过一波行情不花一分钱；一笔糟糕的入场不是。」
+       * ```
+       * **而裁决官正是引用了它**（原文）：
+       * > 「账户与模式不允许赌：权益仅20.75U、**conservative**、逐仓、无持仓……
+       * >  **40轮空仓不是必须打破的错误。**」
+       *
+       * ## 为什么这是 BUG 而不是"配置如此"
+       *
+       * 用户的需求 ③ 明确说了：
+       * > 「系统**不再设置内置风控**（我的想法是既然都要做这么智能了，
+       * >  那么**风格也应该由一个智能体来负责**，而不是系统内置简单风控规则）」
+       *
+       * `tradingMode` 是**系统预设的风格档**（稳健/进取/短线）——
+       * 让团队模式吃它，等于**系统替智能体回答了"该多保守"这个问题**。
+       * 而 `defaultAiTeamConfig()` 里那些数值（`minConfidence: 0`、
+       * `minRiskRewardRatio: 0`、`maxMarginUsage: 100`）**全都放开了** ——
+       * 说明本意就是"不预设"，**只有这一段文本漏了**。
+       *
+       * ## 修法：两种托管模式都走"由你自己判断"
+       *
+       * ```
+       *   ai_managed → 风格由你自己判断
+       *   ai_team    → 风格由你自己判断（团队里那由**风控官**负责把关）
+       *   strategy   → 仍然按 tradingMode 注入（固定策略需要它，行为不变）
+       * ```
+       * ⚠️ **`strategy` 模式的行为逐字节不变** —— 那是写死策略的人真的选了那一档。
        */
-      aiManaged: this.deps.trader.mode === 'ai_managed',
+      aiManaged: this.deps.trader.mode === 'ai_managed' || this.deps.trader.mode === 'ai_team',
       account: {
         equity: account.equity,
         availableBalance: account.availableBalance,
