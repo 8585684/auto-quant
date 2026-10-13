@@ -2027,6 +2027,58 @@ export class TraderManager {
               `${parsed.dropped.length > 0 ? ` · 格式不合规 ${parsed.dropped.length} 条` : ''}`,
             );
             if (ranked.length > 0) {
+              /*
+               * ══════════════════════════════════════════════════════════════════
+               *  ⭐ **情报触发的提前唤醒**（2026-10-14 · 去轮次化的阶段 2）
+               * ══════════════════════════════════════════════════════════════════
+               *
+               * ## 用户对"去轮次"的终态定义（原话）
+               *
+               * > 「要完全脱离轮次这个概念（起码整体是脱离的，只有内部几个
+               * >  干定时工作的 AI 智能体才需要用到轮次，其他都是不间断在干活的）」
+               *
+               * ## 现状与缺口
+               *
+               * 调研层已是独立 worker（20 分钟自己的节奏，与决策周期解耦），
+               * 但它查到强情报时**决策循环并不知道** —— 要等下一个定时心跳。
+               * 事件唤醒已有两个源（成交 / 持仓剧变），情报是缺的第三个。
+               *
+               * ## 判据：什么值得叫醒决策
+               *
+               * ```
+               *   direction 是 bullish/bearish（neutral 不算 —— 那不是信号）
+               *   且 confirmed（≥2 个独立来源 —— 单源传闻不值得打断）
+               *   且 freshness 是 fresh（"新鲜"档 —— 偏旧的不值得）
+               * ```
+               *
+               * ## ⚠️ 为什么用 `autoTrader?.requestEarlyCycle` 而不是直接调
+               *
+               * `shouldEarlyWake` 里有完整的四道闸（运行中/团队模式/最小间隔/
+               * 只提前不推后）—— 尤其"最小间隔"防的是
+               * "情报 → 唤醒 → 决策 → 又一条情报"的紧循环。
+               * 这里只负责"发现值得唤醒的事"，要不要醒由那些闸决定。
+               */
+              const hot = ranked.filter(
+                (r) =>
+                  (r.intel.direction === 'bullish' || r.intel.direction === 'bearish') &&
+                  r.assessment.confirmed &&
+                  r.assessment.freshness === 'fresh',
+              );
+              if (hot.length > 0) {
+                /*
+                 * ⚠️ 用 optional chaining 而不是先 get 再判 undefined：
+                 * 这段代码在 buildTeamModel 的深层闭包里，TypeScript 对
+                 * 跨闭包边界的 narrowing 有不保留的情况（实测此处就是）。
+                 * `?.` 的语义与"判 undefined 后调用"完全一致，且不依赖 narrowing。
+                 */
+                const why = `情报唤醒：${hot.length} 条已确认的强方向情报（${hot
+                  .slice(0, 3)
+                  .map((h) => `[${h.intel.direction}] ${h.intel.summary.slice(0, 30)}`)
+                  .join('；')}）`;
+                runtimeLogs.write(traderId, 'info', 'team', `[调研] ${why}`);
+                this.running.get(traderId)?.requestEarlyCycle(why);
+              }
+
               const text = ranked
                 .map((r) => {
                   const h = (r.assessment.ageMs / 3_600_000).toFixed(1);
