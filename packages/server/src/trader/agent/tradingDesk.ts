@@ -43,6 +43,7 @@ import type { ModelTier } from '../../llm/modelCatalog.js';
 import { mapConcurrent } from './pool.js';
 import { enterCritical, leaveCritical } from './resourceGate.js';
 import { compactMarketContext } from './symbolSlices.js';
+import { pickForAnalysis } from './analystSampling.js';
 import {
   buildSupervisorPrompt,
   parseDispatch,
@@ -634,7 +635,46 @@ async function runTradingDeskInner(input: {
      * 修法在下面：**裁剪时同步改写标题**（`AQ_ANALYST_UNIVERSE` 的说明里）。
      */
     const limit = Math.max(1, Number(process.env.AQ_ANALYST_UNIVERSE ?? '') || 6);
-    const useSlices = compacted.slices.slice(0, limit);
+    /*
+     * ══════════════════════════════════════════════════════════════════════════
+     *  ⚠️⚠️ **不能按顺序取前 N 个 —— 那会让分析师结构性瞎掉一整类候选**
+     * ══════════════════════════════════════════════════════════════════════════
+     *
+     * ## 真 BUG（2026-10-13 线上实测）
+     *
+     * `#11`（团队模式）**87 轮零开仓**，而 `#10`（单模型托管）是 209/571 = 36.6%。
+     * 查材料结构发现：
+     * ```
+     *   ###  1–6   ai_requested  ← 前 6 个【全部】是它（GTC/OGN/W/CT/SKL/DOS）
+     *   ###  7–14  coinpool      ← 后 8 个【全部】是它（BTC/ETH/SOL/ZEC/…）
+     * ```
+     * 而这里原来写的正是 `compacted.slices.slice(0, limit)` ——
+     * **恰好等于"只看 ai_requested"**。分析师于是永远看不到主流币。
+     *
+     * 而 `#10` 那笔赚钱的开仓正是 **ETHUSDT（coinpool）**。
+     *
+     * ## 为什么会这样（两个各自正确的决定合起来错了）
+     *
+     * ```
+     *   ① strategy/coins.ts:130  "ai_requested 先加 —— 顺序就是优先级"  ← 对
+     *   ② 本处（实测 12 个候选 → content=0 字）→ 只取 6 个            ← 对
+     *   合起来：ai_requested 占满前 6 个 → 分析师【永远只看那一类】
+     * ```
+     * 这是典型的**组合性缺陷**：两个决定单独看都对，谁都没想到会合起来出问题。
+     *
+     * ## 修法：按来源分层取样（见 `pickForAnalysis`）
+     *
+     * ```
+     *   ✓ 保序（模型读起来仍是"从强到弱"）
+     *   ✓ 每个来源至少 1 个（即使某个来源只占 1 个位置）
+     *   ✓ 只有 1 种来源时，结果与 slice(0, limit) 完全一致（行为不变）
+     * ```
+     * ⚠️ 最后那条是它能安全上线的关键：只在"混合来源"时改变行为，
+     * 而"混合来源"正是出问题的那种情况。
+     *
+     * ⚠️ 说明文字里的数字也要跟着改（否则又回到"标题与内容不一致"那个老问题）。
+     */
+    const { picked: useSlices, droppedBySource } = pickForAnalysis(compacted.slices, limit);
     /*
      * ⚠️ **裁剪后必须改写标题**（2026-10-13 加）。
      *
@@ -659,9 +699,22 @@ async function runTradingDeskInner(input: {
     const truncationNote =
       useSlices.length < compacted.slices.length
         ? `\n\n（说明：为控制材料规模，上面只列出 **${useSlices.length}** 个候选的完整序列；` +
-          `本轮共有 ${compacted.slices.length} 个候选，其余 ${
-            compacted.slices.length - useSlices.length
-          } 个在裁决官的完整材料里。**不要因为看不到它们而认为材料有缺失** ——` +
+          `本轮共有 ${compacted.slices.length} 个候选。` +
+          /*
+           * ⚠️ **把"按来源各留了代表"这件事明说**（2026-10-13）。
+           *
+           * 原来这里只写"其余 N 个在裁决官的完整材料里"。而修掉"按顺序截取"
+           * 之后取样是按来源分层的 —— 模型看到"14 个候选只给了 6 个"时，
+           * 会本能地怀疑"是不是把我需要的那类漏了"。明说取样规则能消除这个疑虑，
+           * 也让它知道**边界在哪**（这仍然是数据边界，只是不再是"偏心的边界"）。
+           */
+          (Object.keys(droppedBySource).length > 1
+            ? `取样的规则是**按来源各保留代表**（不是按顺序截取），所以你看不到的那 ${compacted.slices.length - useSlices.length} 个` +
+              `分布在：${Object.entries(droppedBySource)
+                .map(([k, v]) => `${k} ${v} 个`)
+                .join('、')}。`
+            : `其余 ${compacted.slices.length - useSlices.length} 个在裁决官的完整材料里。`) +
+          `**不要因为看不到它们而认为材料有缺失** ——` +
           `你只需基于上面给出的 ${useSlices.length} 个做分析，并明确说明这是你的数据边界。）`
         : '';
     /* **共享部分 + 前 N 个候选**（每个候选的 K 线已压到 5 点）。 */

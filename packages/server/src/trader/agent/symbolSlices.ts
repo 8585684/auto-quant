@@ -54,6 +54,29 @@ export interface SymbolSlice {
   symbol: string | null;
   /** 该标的的完整材料（含标题行）。 */
   text: string;
+  /**
+   * **这个候选是从哪个来源进来的**（`ai_requested` / `coinpool` / `static` …）。
+   *
+   * ## ⚠️ 为什么要在切分时顺手解析，而不是让消费者再从文本猜一次
+   *
+   * 2026-10-13 的实测教训：`tradingDesk` 需要"按来源分层取样"（否则
+   * `ai_requested` 会占满前 N 个名额、把整个 `coinpool` 挤掉）——
+   * 而第一版我把来源解析写在了**消费者**里（`analystSampling.parseSliceSources`），
+   * 它用正则从 `text` 里再抠一次标题。
+   *
+   * 结果：**测试里的最小材料没写序号**（`### GTCUSDT（…）` 而不是
+   * `### 1. GTCUSDT（…）`）→ 解析失败 → 分层退化成"按顺序取"
+   * → 正是要避免的那个 BUG 原地复活，而且**只在特定格式下复活**。
+   *
+   * **根因是"同一件事算两遍"** —— 而本项目对这件事有明确的教训
+   *（`prompt.ts` 里 `quantity` 曾由两条路径各算一次导致真实拒单）。
+   * 所以：**在唯一解析标题的地方（`splitMarketContext`）一次算出**，
+   * 消费者直接用字段，不再解析文本。
+   *
+   * ⚠️ 解析不出时是**空数组**（而不是 `['unknown']`）——
+   * 让消费者能区分"没有来源信息"与"来源就是 unknown"。
+   */
+  sources: string[];
 }
 
 export interface SplitResult {
@@ -75,6 +98,27 @@ export interface SplitResult {
 const HEADING = /^### (\d+)\. (\S+?)(?:（|\s*$)/;
 
 /**
+ * 从标题行里解析**来源**（括号里 `+` 分隔的那些）。
+ *
+ * ```
+ *   ### 1. GTCUSDT（ai_requested）                        → ['ai_requested']
+ *   ### 7. BTCUSDT（coinpool + reference — 多来源共振）    → ['coinpool', 'reference']
+ * ```
+ * ⚠️ 只认**行首**的 `###`（与 `HEADING` 同一约束），避免把正文里的
+ * `###` 或括号内容误当标题。
+ */
+const HEADING_SOURCES = /^### \d+\. \S+?（([^）]*)）/;
+
+function parseSourcesOf(line: string): string[] {
+  const m = HEADING_SOURCES.exec(line);
+  if (m === null) return [];
+  return String(m[1])
+    .split('+')
+    .map((s) => (s.split('—')[0] ?? '').replace(/多来源共振.*$/, '').trim())
+    .filter((s) => s.length > 0);
+}
+
+/**
  * 把渲染好的 `marketContext` 按候选标的切成 N 份。
  *
  * @returns 切不出来（没有候选标题 / 只有 1 段）时 **`null`** ——
@@ -82,10 +126,12 @@ const HEADING = /^### (\d+)\. (\S+?)(?:（|\s*$)/;
  */
 export function splitMarketContext(marketContext: string): SplitResult | null {
   const lines = marketContext.split('\n');
-  const heads: Array<{ line: number; symbol: string | null }> = [];
+  const heads: Array<{ line: number; symbol: string | null; sources: string[] }> = [];
   for (let i = 0; i < lines.length; i++) {
     const m = HEADING.exec(lines[i]!);
-    if (m !== null) heads.push({ line: i, symbol: m[2] ?? null });
+    if (m !== null) {
+      heads.push({ line: i, symbol: m[2] ?? null, sources: parseSourcesOf(lines[i]!) });
+    }
   }
   /* 少于 2 个标的没有拆分的意义（拆了也不会更小）。 */
   if (heads.length < 2) return null;
@@ -95,7 +141,12 @@ export function splitMarketContext(marketContext: string): SplitResult | null {
   for (let i = 0; i < heads.length; i++) {
     const from = heads[i]!.line;
     const to = i + 1 < heads.length ? heads[i + 1]!.line : lines.length;
-    slices.push({ symbol: heads[i]!.symbol, text: lines.slice(from, to).join('\n') });
+    slices.push({
+      symbol: heads[i]!.symbol,
+      text: lines.slice(from, to).join('\n'),
+      /* ⚠️ 来源在**这里**一次算出（见 `SymbolSlice.sources` 的说明）。 */
+      sources: heads[i]!.sources,
+    });
   }
   return { shared, slices };
 }
@@ -264,6 +315,21 @@ export function compactMarketContext(
   if (split === null) return null;
   return {
     shared: compactUniverseOverview(compactSeriesLines(split.shared, keepLast), keepUniverseRows),
-    slices: split.slices.map((s) => ({ symbol: s.symbol, text: compactSeriesLines(s.text, keepLast) })),
+    /*
+     * ⚠️ **`sources` 必须原样带过来**（2026-10-13）。
+     *
+     * 它是"按来源分层取样"的唯一依据（见 `SymbolSlice.sources` 的说明）——
+     * 在这里漏掉它，`pickForAnalysis` 就会把每个切片都当成"来源未知"，
+     * 于是**退化成"按顺序取前 N 个"**：`ai_requested` 又会占满名额、
+     * 把整个 `coinpool` 挤掉，也就是这个 BUG 原地复活。
+     *
+     * ⚠️ 而它**不会**被 `compactSeriesLines` 影响（那是逐行压 K 线，
+     * 标题行原样保留）—— 所以带的是 `s.sources`，不是重新解析的结果。
+     */
+    slices: split.slices.map((s) => ({
+      symbol: s.symbol,
+      text: compactSeriesLines(s.text, keepLast),
+      sources: s.sources,
+    })),
   };
 }
