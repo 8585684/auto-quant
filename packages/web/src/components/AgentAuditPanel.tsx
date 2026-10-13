@@ -33,6 +33,7 @@
 import { useState } from 'react';
 
 import { api, type AgentAudit } from '../lib/api';
+import { fmtSigned, pnlColor } from '../lib/format';
 import { usePolled } from '../lib/hooks';
 import { Panel } from './ui';
 
@@ -215,8 +216,14 @@ export function AgentAuditPanel({ traderId }: { traderId: number }): React.React
                       {e.outcomeTrades === null ? (
                         <span className="text-ink-faint">等结果中</span>
                       ) : (
-                        <span className={e.outcomeNetPnl !== null && e.outcomeNetPnl >= 0 ? 'text-up' : 'text-down'}>
-                          {e.outcomeTrades} 笔 · 净 {e.outcomeNetPnl?.toFixed(2) ?? '—'}
+                        /*
+                         * 颜色走 `pnlColor`：它把 **0 当中性色**，而这里原来是手写的
+                         * `>= 0 ? 'text-up' : 'text-down'` —— 净盈亏恰好为 0 的实验
+                         * 会被染成盈利绿。原因是**同一个失效模式**在本组件里出现了两次
+                         *（另一处在下面的「教训记忆」，见那条注释）。
+                         */
+                        <span className={pnlColor(e.outcomeNetPnl)}>
+                          {e.outcomeTrades} 笔 · 净 {fmtSigned(e.outcomeNetPnl)}
                         </span>
                       )}
                     </div>
@@ -238,9 +245,20 @@ export function AgentAuditPanel({ traderId }: { traderId: number }): React.React
                     <span className="w-24 shrink-0 truncate font-medium text-ink-soft" title={m.symbol}>
                       {m.symbol}
                     </span>
-                    <span className={m.netPnl >= 0 ? 'num w-16 shrink-0 text-up' : 'num w-16 shrink-0 text-down'}>
-                      {m.netPnl >= 0 ? '+' : ''}
-                      {m.netPnl.toFixed(2)}
+                    {/*
+                      ⚠️ **保本平仓不能显示成绿色盈利。**
+                      这里原来写的是 `m.netPnl >= 0 ? 'text-up' : 'text-down'` 与
+                      `m.netPnl >= 0 ? '+' : ''` —— 两处都把 0 算进了"盈利"那一侧，
+                      于是一笔净盈亏恰好为 0 的回合被渲染成**绿色的 `+0.00`**。
+                      而"保本"的真实含义是"这一场白干"，操作员会把没赚钱读成小赚。
+
+                      颜色改用 `pnlColor`（`lib/format.ts`，注释首行就是
+                      "Zero is neutral"），符号改用 `fmtSigned`（它天然不给 0 加符号）。
+                      两处必须一起改：只改颜色的话 `+0.00` 还在，只改符号的话绿色还在 ——
+                      这正是本仓库反复记录的那类"两处各自正确、合起来失效"。
+                    */}
+                    <span className={`num w-16 shrink-0 ${pnlColor(m.netPnl)}`}>
+                      {fmtSigned(m.netPnl)}
                     </span>
                     <span className="min-w-0 flex-1 text-ink-lo">{m.lesson}</span>
                   </li>

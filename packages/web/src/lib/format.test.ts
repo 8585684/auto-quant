@@ -36,6 +36,7 @@ import {
   isNum,
   marginModeLabel,
   orderMarginMode,
+  pnlColor,
   safeJson,
   sideLabel,
   symbolTone,
@@ -134,6 +135,31 @@ test('美元符号在正负号之后 —— `-$1.50` 而不是 `$-1.50`', () => 
   assert.ok(s.startsWith('-'), `实际 ${s}`);
   assert.ok(s.includes('$'), `实际 ${s}`);
   assert.equal(s.indexOf('$'), 1, '`$` 必须紧跟在符号后面');
+});
+
+test('★ pnlColor：零是中性色 —— 保本平仓绝不能被染成绿色盈利', () => {
+  /*
+   * 这个函数此前**零测试覆盖**，而它正是「保本平仓显示成绿色 +0.00」那个缺陷的
+   * 正确实现（外部 issue #125）。漏用之所以长期没被发现，就是因为它自己没被钉住。
+   *
+   * 语义（函数注释首行就是 "Zero is neutral"）：
+   *   正 → 涨色、负 → 跌色、**零 → 中性色**、"读不到" → 也走中性色。
+   *
+   * 为什么零不能算盈利：一笔净盈亏恰好为 0 的回合意味着"白干一场"，
+   * 把它显示成绿色会让操作员把"没赚钱"读成"小赚"。
+   */
+  assert.equal(pnlColor(0), 'text-ink-mid', '★ 零必须是中性色，不是 text-up');
+  assert.equal(pnlColor(1.5), 'text-up');
+  assert.equal(pnlColor(-1.5), 'text-down');
+
+  // 负零与零同待遇：`-0` 在数值上就是 0，不该被当成亏损。
+  assert.equal(pnlColor(-0), 'text-ink-mid', '-0 与 0 同待遇');
+
+  // "没有值"不是"值是零"，但两者都走中性色（绝不复用涨跌色）。
+  assert.equal(pnlColor(null), 'text-ink-mid');
+  assert.equal(pnlColor(undefined), 'text-ink-mid');
+  assert.equal(pnlColor(Number.NaN), 'text-ink-mid');
+  assert.equal(pnlColor(Number.POSITIVE_INFINITY), 'text-ink-mid', 'Infinity 不是有限数，按无值处理');
 });
 
 /* -------------------------------------------------------------------------- */
