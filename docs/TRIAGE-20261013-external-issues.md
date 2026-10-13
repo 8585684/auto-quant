@@ -790,6 +790,105 @@ main 上的 `2fb0881`「彻底剔除 pause/resume —— 全自动托管里暂�
 （CONTRIBUTING「一个 PR 只做一件逻辑上的事」），建议单独提 —— 我在留言里说了
 "这类本地探针确实需要一个归属，单独提我倾向收"。
 
+---
+
+## 9. 第 4 轮：又一批 PR（CI 这次真的会跑了）
+
+### ⚠️ CI 状态的变化（值得记一笔）
+
+第 3 轮那三个 PR 的 CI 全是 `action_required`（首次贡献者需人工批准）。
+**这一轮不再是了** —— #131 / #133 的 `类型检查 · Lint · 测试 · 构建` **真的跑起来了**
+（#131 甚至 labeler 也成功）。所以闸门①恢复成"看页面"。
+
+唯一仍然报错的是 `打标签`，而那是**仓库既有缺陷**（见上一节）：`fix:` / `feat:`
+这类会调 `gh pr edit --add-label` 的标题必然失败，因为 `pr-labeler.yml`
+刻意不 checkout 而 `gh` 需要 git 仓库。**这不是任何 PR 的问题**，不据此退回。
+
+### PR #133 —— ✅ 已合并（squash `0c2ab29`）
+
+`fix(llm): 重定向的每一跳都重跑 urlGuard，跨主机跳转剥掉鉴权头`
+
+**这是个真实的安全缺陷，我独立复现了它**（而不只是读代码）：
+
+```
+# 用真实 HTTP 服务器复现：默认 fetch(redirect:'follow') 的行为
+原始 fetch(follow) 结果: status=200  内网被打到? true  body=SECRET-CREDS
+```
+
+即：一个"合法的公网网关"回 302 指向内网 → **undici 真的跟了过去并取回响应体**。
+而 `urlGuard` 只校验第一个 URL，所以那层防护在这条路径上是失效的。
+
+**我还验证了 PR 里那句"undici 只剥 Authorization"** —— 用真实服务器实测：
+
+```
+重定向后目标主机收到的头: {"host":..., "x-api-key":"SECRET-1",
+                          "api-key":"SECRET-2", ...}   ← authorization 不在
+```
+
+所以它不只是"打到内网"，而是**带着真实 API Key 打到内网**。这一条成立。
+
+**并验证了它的测试真的能拦住回归**：把 `fetchGuarded` 里每一跳的
+`checkOutboundUrl` 去掉后，6 个用例里有 2 个失败（含最关键的那条
+"跳转到云元数据地址被拒绝"）。所以那批测试不是摆设。
+
+五道闸门：① CI **SUCCESS** + 本地全套（46+1404+133 / build / lint / sim 18/18）✅；
+② 不碰 `risk/` `binance/` `autoTrader.ts`、无新 `placeOrder` ✅；
+③ PR 自填"是"并说明验证到第 1 级（单测）—— 我认这个判断：
+   这个缺陷唯一能被真实钉住的层级就是 stub fetch，`sim` 的确定性夹具不会注入
+   带 `Location` 的 LLM 响应；④ 只有 `169.254.169.254`（**仓库既有约定**，
+   `urlGuard.ts` 与 `env.ts` 都拿它当例子）+ 夹具 key ✅；⑤ 标题合规 ✅。
+
+### PR #131 —— ✅ 已合并（squash `6931321`）
+
+`refactor: 清掉 stop/resume 残骸、重复的 :id 解析与死代码，并把文档/接口一致性接进 CI`
+
+**这个 PR 与已合入的 #129/#130 有重叠**（都基于同一个作者的同一批工作），
+所以我先量了一下"相对当前 main 到底新增了什么"：
+
+```
+main...pr-131 真正的净差异 = 11 个文件 / +175 −221
+其中暂停残骸与 CI 接线部分**与 main 已一致**（git 视为相同，不再出现在 diff 里）
+```
+
+也就是说重叠部分**不构成冲突**（合并实测 `Auto-merging` 成功），
+真正新增的是：`:id` 收敛（22 条路由）、策略回退收敛、死代码删除、`MODULES.md` 修正。
+
+**几处我逐一独立核过的关键判断**：
+- `NaN` 被静默绑成 NULL：`db/index.ts:18` 的 `normalise()` 确实
+  `if (!Number.isFinite(value)) return null` → `WHERE id = NULL` → 误导性 404。✅
+- `rest.ts` 删掉的 `testnet` 选项**真的没有调用方**：`balance.ts:98` 在构造
+  `BinanceRestOptions` **之前**就把 `row.testnet` 转成了 `environment`，
+  `bootstrap.ts:75` 也不传它。✅
+- `FirmRoster.tsx` 真的死了：全仓库只剩**注释**提到它，零 import。✅
+- `FirmRoster` / `openOrderCount` 删除后前端无残留引用。✅
+
+五道闸门：① CI **SUCCESS**（连 labeler 都过了）+ 本地全套 ✅；
+② 不碰 `placeOrder` / 归属闸门 / parser 语义 / `trades.insert()` 算术 ✅；
+③ PR 自填"否"并**逐条说明为什么是等价重构**，且验证到第 2 级（`sim` 18/18，我复跑过）
++ `npm run verify` ✅；④ 干净 ✅；⑤ 8 个一行标题的独立提交 ✅。
+
+### PR #132 —— ❌ 退回（`CHANGES_REQUESTED`，等作者补一行）
+
+`fix(binance): 标记价取不到时条件单放行，不再误判为会立即触发`
+
+**行为修复是对的**，我独立验证了三层：
+1. `isValidTrigger()` 第一行 `!(marketPrice > 0) → false`（`symbols.ts:290`），
+   而 `getMarkPrice()` 失败返回 0（`broker.ts:597`）→ 任何合法触发价都被判"会立即触发"；
+2. 后果确实严重：`autoTrader.ts:8502` 只在 `markNow > 0` 时才紧急平仓，
+   而 broker 这一层缺同一个守卫 → 一次行情故障就能把健康持仓**不必要的紧急全平**；
+3. 改法与上面 24 行的名义检查（`if (refPrice > 0 && …)`）**同构**，方向也安全
+   （`-2021` 仍在，判定者换成交易所）。
+   并且我验证了"没有这个修复就会失败" —— 回退 `broker.ts` 后新用例确实失败。
+
+**但它的 CI 是红的**：`TS1360` —— 新增测试夹具漏了必填的 `timeInForce`
+（`types.ts:318`）。我本地补上 `timeInForce: 'GTC'`（该文件其它 11 处夹具的写法）
+后**全套绿**：typecheck / 46+1405+133 / build / lint / **sim 18/18**。
+
+按闸门①的例外条款，"测试写错了"本来**可以合**。但这是 `trading-path` + `binance`
+（真实下单路径），我采取更严的口径并**问过用户**：**不替外部 PR 代笔**，
+请作者自己补那一行让 CI 转绿 —— 这样合并记录里"CI 绿"才是真的。
+退回复核意见里写清了：只要求改这一行，其余（诊断、修法、注释、测试设计）一个字都不用动。
+
 | Issue | 回帖要点 |
 | --- | --- |
 | 117 | 唯一 `risk.review()` 在 3831 行；回执路径 8122 行直调 `executeAdjust`；方向校验只在 `reviewAdjust`（用例 822-896 为证） |
