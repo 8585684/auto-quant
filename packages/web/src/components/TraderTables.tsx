@@ -43,6 +43,7 @@ import {
   type PnlCosts,
 } from './PnlBreakdown';
 import { BALANCE_LABEL, fmtDateTime, fmtDuration, fmtPercent, fmtPrice, fmtQty, fmtSigned, fmtUsd, fmtUsdSigned, marginModeLabel, orderMarginMode, pnlColor, symbolTone, symbolToneWithAvoidance } from '../lib/format';
+import { summarizeClose } from '../lib/closeSummary';
 import { pickPositions } from '../lib/pickPositions';
 
 /* -------------------------------------------------------------------------- */
@@ -677,6 +678,14 @@ function ClosePositionModal({
     closed: string[];
     /** 「全部平仓」时顺带撤掉的待成交挂单张数（单标的平仓不用它）。 */
     cancelledPending?: number;
+    /**
+     * 平仓失败的标的与原因。
+     *
+     * ⚠️ 这个字段原来**不存在**，于是「全部平仓」里部分标的失败时，
+     * 界面照样显示绿色成功横幅，操作员以为清仓完成就离开，而敞口仍在裸奔
+     *（外部 issue #144，真实资金）。服务端一直在返回它 —— 是前端把它丢了。
+     */
+    failed?: Array<{ symbol: string; error: string }>;
     stillRunning: boolean;
   } | null>(null);
 
@@ -703,6 +712,11 @@ function ClosePositionModal({
         setResult({
           closed: response.closed,
           cancelledPending: response.cancelledPending,
+          /*
+           * ⚠️ **必须拷 `failed`** —— 漏掉它，界面就会在"部分标的根本没平掉"时
+           * 照样报成功（外部 issue #144，真实资金）。
+           */
+          failed: response.failed,
           stillRunning: response.stillRunning,
         });
       } else {
@@ -741,21 +755,50 @@ function ClosePositionModal({
       <div className="space-y-3">
         {result ? (
           <>
-            <div className="rounded-md border border-up/50 bg-up/10 px-3 py-2 text-base font-semibold text-up">
-              {result.closed.length === 0 && (result.cancelledPending ?? 0) === 0
-                ? '没有需要平掉的持仓，也没有等待成交的挂单。'
-                : `${
-                    result.closed.length === 0 ? '没有持仓。' : `已平仓：${result.closed.join('、')}。`
-                  }${
-                    /*
-                     * ⚠️ **挂单也要如实报出**（2026-10-02 用户报告"不作用于委托挂单"）。
-                     * 撤掉挂单是"把敞口收回来"的一部分，而操作员看不到它就会以为没生效。
-                     */
-                    (result.cancelledPending ?? 0) > 0
-                      ? `已撤掉 ${result.cancelledPending} 张等待成交的挂单。`
-                      : ''
-                  }`}
-            </div>
+            {/*
+              ⚠️ **语气与文案由 `summarizeClose` 决定，不在这里拼。**
+
+              原来这里是一段**无条件**的绿色成功横幅：只要请求没抛异常就渲染
+              "已平仓：…"。而「全部平仓」是**逐个**平的，部分标的失败会进
+              `response.failed` —— 那段横幅在"3 个里只平掉 2 个"时照样说成功，
+              操作员以为清仓完成就离开，**而敞口仍在裸奔**
+              （外部 issue #144，真实资金；主动清仓 = 避险动作）。
+
+              收成纯函数的好处：语气只在一处决定、且可被直接单测
+              （见 `lib/closeSummary.test.ts`）。
+            */}
+            {(() => {
+              const summary = summarizeClose(result);
+              const toneClass =
+                summary.tone === 'danger'
+                  ? 'border-down/50 bg-down/10 text-down'
+                  : summary.tone === 'success'
+                    ? 'border-up/50 bg-up/10 text-up'
+                    : 'border-base-700 bg-base-850/60 text-ink-mid';
+              return (
+                <>
+                  <div
+                    className={`rounded-md border px-3 py-2 text-base font-semibold ${toneClass}`}
+                  >
+                    {summary.headline}
+                  </div>
+                  {/*
+                    失败明细**逐条列出**（symbol + 原因）：操作员要拿着它去手动处理，
+                    所以不能只给一个计数。
+                  */}
+                  {summary.failed.length > 0 && (
+                    <ul className="space-y-1 rounded-md border border-down/40 bg-down/5 px-3 py-2">
+                      {summary.failed.map((f) => (
+                        <li key={f.symbol} className="text-xs leading-relaxed text-down">
+                          <span className="font-semibold">{f.symbol}</span>
+                          <span className="text-ink-mid">：{f.error}</span>
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </>
+              );
+            })()}
             {result.stillRunning && (
               /*
                * 机器人还在跑，它下一个周期可能重新开仓。

@@ -787,12 +787,27 @@ export const api = {
    *
    * 服务端逐个平（每个都走 `closeManually` 的同一套顺序：先撤单、再市价平、再记账），
    * 并返回**实际平掉的币种列表** —— 界面靠这个列表说话，而不是靠一个哨兵值。
+   *
+   * ⚠️ **返回里必须带上 `failed`。**
+   *
+   * 服务端 `manager.closeAllPositions()` 明确返回
+   * `failed: Array<{ symbol; error }>` —— 逐个平的过程中，任何一个标的失败
+   * （触及交易所最小名义、网络瞬时错误…）都会被塞进这个数组。
+   *
+   * 这里原来**漏声明了 `failed`**，于是 `response.failed` 在 TS 下不可见，
+   * 消费点（`TraderTables` 的 `setResult`）也顺手没拷它 —— 结果界面在
+   * **部分标的根本没平掉**的情况下照样显示成功横幅，操作员以为清仓完成就离开，
+   * 而**敞口仍在裸奔**。这是本项目最不能出错的操作之一（主动清仓 = 避险动作）。
    */
   closeAllPositions: (id: number) =>
-    request<{ ok: boolean; closed: string[]; cancelledPending: number; stillRunning: boolean }>(
-      `/traders/${id}/positions/close-all`,
-      { method: 'POST', body: {} },
-    ),
+    request<{
+      ok: boolean;
+      closed: string[];
+      cancelledPending: number;
+      /** 平仓失败的标的与原因。**非空时界面必须如实报出，不能说"已全部平仓"。** */
+      failed: Array<{ symbol: string; error: string }>;
+      stillRunning: boolean;
+    }>(`/traders/${id}/positions/close-all`, { method: 'POST', body: {} }),
 
   /* --- per-trader data --- */
   /**
