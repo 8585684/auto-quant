@@ -148,7 +148,68 @@ export function splitMarketContext(marketContext: string): SplitResult | null {
       sources: heads[i]!.sources,
     });
   }
-  return { shared, slices };
+
+  /*
+   * ══════════════════════════════════════════════════════════════════════════
+   *  ⚠️⚠️ **最后一个切片里的"非候选尾巴"必须搬回 `shared`**（2026-10-13 实测 P0）
+   * ══════════════════════════════════════════════════════════════════════════
+   *
+   * ## 事故：策略师写的规则【从来没到过任何团队角色】—— 95 轮 100% skip
+   *
+   * `routedModel.ts:863` 拼材料时把**规则段放在最后**：
+   * ```
+   *   marketContext = userPrompt
+   *                 + '\n\n---\n\n## 团队需要遵守的规则（来自交易循环）\n'
+   *                 + systemPrompt        ← 策略师的 entryStandards 等都在这里
+   * ```
+   * 而切分是"按候选标题切" —— 于是**规则段被并进了【最后一个候选的切片】**。
+   *
+   * 而 `analystContext` 只取**前 6 个切片**（实测 12 个候选的临界值）：
+   * ```
+   *   切片 1–6   → 给分析师
+   *   切片 7–N   → 丢掉（含那个被污染的最后一片 → 规则段也一起丢了）
+   * ```
+   * **四个分析师 + 裁决官【从来没见过策略师写的规则】。**
+   *
+   * 线上实证（`#11`，策略师自己写的规则原文）：
+   * ```
+   *   「You MUST open at least one position per 6 cycles if any symbol
+   *     showed a ≥2% move. If you skip for 6 straight cycles, your entry
+   *     standards are too strict by construction — override them.」
+   * ```
+   * 而实测：**95 轮全部 skip · 212 条决策 0 个非 skip · orders 0 · trades 0**。
+   * 规则在 `system_prompt` 里、也在 `marketContext` 里 ——
+   * **只是被切片逻辑吃掉了。**
+   *
+   * ## 修法：把尾巴里的"非候选内容"识别出来，搬回 `shared`
+   *
+   * 判据用 `routedModel.ts` 拼材料时写下的那个**独特分隔符**：
+   * ```
+   *   \n---\n\n## 团队需要遵守的规则
+   * ```
+   * 它足够特异（普通候选段里不会出现），而且**拼材料的地方就那么一处**。
+   *
+   * ⚠️ **搬回而不是复制**：复制会让最后一个候选的段落里也留着规则
+   *（那会让分析师把它当成"这个标的的规则"，正是要避免的混淆）。
+   *
+   * ⚠️ 找不到分隔符时**原样返回**（不猜、不丢）——
+   * 若哪天拼材料的格式变了，这里会退化成"规则段仍在最后一个切片里"，
+   * 也就是**修之前的行为**，而不是把材料弄坏。
+   */
+  const RULES_MARKER = '\n---\n\n## 团队需要遵守的规则';
+  let sharedOut = shared;
+  const last = slices[slices.length - 1];
+  if (last !== undefined) {
+    const at = last.text.indexOf(RULES_MARKER);
+    if (at > 0) {
+      /* 尾巴 = 规则段（含分隔符），把它接到 shared 后面。 */
+      const tail = last.text.slice(at);
+      last.text = last.text.slice(0, at);
+      sharedOut = sharedOut.length > 0 ? `${sharedOut}\n${tail}` : tail.trimStart();
+    }
+  }
+
+  return { shared: sharedOut, slices };
 }
 
 /**
