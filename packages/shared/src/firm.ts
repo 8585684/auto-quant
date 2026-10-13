@@ -142,7 +142,21 @@ export const FIRM_ROLES: readonly FirmRole[] = [
     duty: '把一轮发生了什么整理成人能读的摘要',
     department: '管理',
     tier: 'T1_fast',
-    status: 'planned',
+    /*
+     * ⚠️ **2026-10-13 从 `planned` 改为 `staffed`** —— 它真的在岗了。
+     *
+     * 线上运行日志（`#11`，2026-10-13 13:52）：
+     * ```
+     *   13:52:25  [report] reporter：汇总本轮结果，写成人话
+     *   13:52:27  [report] reporter：完成（1906ms）
+     * ```
+     * 接线在 `tradingDesk.ts` 的裁决之后，产出进 `DeskOutcome.report`
+     *（三态：string 有产出 / null 跑了但失败 / undefined 预算不足没被调用）。
+     *
+     * ⚠️ 它的产出目前**还没有渲染进界面**（`deskOutput.ts` 未动）——
+     * 界面上暂时看不到那段人话，这是已知的下一步。
+     */
+    status: 'staffed',
   },
 
   /* ── 研究 ────────────────────────────────────────────────────────── */
