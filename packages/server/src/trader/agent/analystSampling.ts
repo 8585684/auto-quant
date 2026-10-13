@@ -68,6 +68,36 @@ export interface SourcedSlice {
 }
 
 /**
+ * **这段材料是"完整型"还是"只有摘要"**（2026-10-13）。
+ *
+ * ## 为什么必须区分（线上材料实测）
+ *
+ * `prompt.ts` 渲染候选时有两种密度：
+ * ```
+ *   **前 10 个给出完整指标序列**；**其余只给摘要**（最新值 + 最近 5 根的走向）
+ * ```
+ * 实测同一轮材料：
+ * ```
+ *   完整型 ≈ 10,000 字符（GTC/OGN/…/BTC/ETH/SOL/ZEC）
+ *   摘要型 ≈  1,100 字符（NEAR/XRP/HYPE/DOGE）
+ * ```
+ * 而 `compactMarketContext` 按 `### N. SYMBOL` 切分，**不区分这两种** ——
+ * 于是取样时它们**平等地各占一个名额**。最坏情况是"3 个完整 + 3 个摘要"，
+ * 一半名额花在没序列的标的上。
+ *
+ * ## 判据：找指标序列的字段名
+ *
+ * 完整序列一定含 `current_ema20` 这类字段（`prompt.ts` 的渲染格式）；
+ * 摘要型只有"最新价 + 最近 5 根走向"的文字。
+ *
+ * ⚠️ **不用"长度 >= N 字符"作判据** —— 长度会随配置漂（`promptPoints`
+ * 可设 5–120），而"有没有那个字段"是**格式契约**（有测试钉住渲染格式）。
+ */
+export function isDetailedSlice(text: string): boolean {
+  return /current_ema20\s*=/.test(text);
+}
+
+/**
  * **按来源分层取样** —— 保序，但保证每个来源都有代表。
  *
  * ## 判据（为什么不是简单的"轮流取"）
@@ -114,31 +144,45 @@ export function pickForAnalysis<T extends { symbol: string | null; text: string;
     s,
     i,
     src: s.sources[0] ?? 'unknown',
+    /*
+     * ⚠️ **"完整型"优先于"摘要型"**（2026-10-13，见 `isDetailedSlice` 的说明）。
+     *
+     * 线上实测：完整型 ≈ 10k 字符（有指标序列可分析），
+     * 摘要型 ≈ 1.1k 字符（只有最新值 + 最近 5 根走向）。
+     * 按个数分配时两者平等 —— 那会把名额浪费在没序列的标的上，
+     * 而分析师**会去点评它们**（它只能看到价格与涨跌，于是报告"数据不足"）。
+     */
+    detailed: isDetailedSlice(s.text),
   }));
 
-  const bySource = new Map<string, typeof withSource>();
-  for (const x of withSource) {
-    const arr = bySource.get(x.src);
-    if (arr) arr.push(x);
-    else bySource.set(x.src, [x]);
-  }
+  /*
+   * ⚠️ **只在"完整型"里做分层取样；摘要型只用于补位**。
+   *
+   * 若完整型够 `limit` 个 → 完全不碰摘要型（名额全给有序列的）。
+   * 若不够 → 摘要型按同样的分层规则补（"知道有这个标的在"也有价值）。
+   */
+  const detailedPool = withSource.filter((x) => x.detailed);
+  const summaryPool = withSource.filter((x) => !x.detailed);
 
   /*
-   * 只有 1 种来源（或全是 unknown）→ 与 `slice(0, limit)` 完全一致。
-   * ⚠️ 这是这条修法能安全上线的关键：绝大多数机器人只配了一种来源，
-   * 对它们来说这个改动**必须无感**。
+   * ⚠️ **单一来源 + 完整型够用 → 与 `slice(0, limit)` 完全一致**。
+   *
+   * 这是这条修法能安全上线的关键：绝大多数机器人只配了一种来源
+   *（`static` 或 `coinpool`），对它们来说这个改动**必须无感** ——
+   * 否则就是拿一个大改动去换一个局部修复。
    */
-  if (bySource.size <= 1) {
+  const sourceCount = new Set(withSource.map((x) => x.src)).size;
+  if (sourceCount <= 1 && detailedPool.length >= limit) {
     return { picked: slices.slice(0, limit), droppedBySource: {} };
   }
 
   /*
-   * 来源的**处理顺序**：按该来源第一个出现的下标排 ——
-   * 这样"排在前面的来源"先拿到名额（与原有的优先级语义一致）。
+   * ⚠️ **分层只对"完整型池"做**（见 `isDetailedSlice` 的说明）。
+   *
+   * 摘要型（1.1k 字符，无指标序列）**不该和完整型（10k 字符）**
+   * 平等地占一个名额 —— 那会把名额浪费在没法分析的标的上。
+   * 摘要型只在完整型不足时用来补位（"知道有这个标的在"也有价值）。
    */
-  const order = [...bySource.entries()]
-    .map(([src, arr]) => ({ src, first: arr[0]!.i, arr }))
-    .sort((a, b) => a.first - b.first);
 
   /*
    * ⚠️ **分配策略：轮流取（round-robin），而不是"保底 1 个后按顺序补"**。
@@ -153,8 +197,7 @@ export function pickForAnalysis<T extends { symbol: string | null; text: string;
    * 花在 `ai_requested`（极端波动标的）上，只看到 1 个主流币。
    *
    * 让 BTC 有代表只是"修掉了最坏情况"，而**不是"修对了"**：
-   * 分析师的产出是给裁决官的方向感，那个方向感应该来自**两类的均衡样本**，
-   * 而不是"5 个热点 + 1 个主流"。
+   * 分析师的产出是给裁决官的方向感，那个方向感应该来自**两类的均衡样本**。
    *
    * ## 轮流取（当前实现）
    *
@@ -168,31 +211,75 @@ export function pickForAnalysis<T extends { symbol: string | null; text: string;
    * ```
    * ⚠️ 某来源取完后**跳过它**（不会卡住），所以"6 个 ai + 1 个 coin、
    * limit=3"会给出 `ai, coin, ai`（而不是死等不足的那个）。
+   *
+   * ⚠️ 若 `pool` 里的来源只剩一种（例如完整型全是 ai），上面那条
+   * `bySource.size <= 1` 的早退已经处理了"等价于按顺序取"的情况。
    */
-  const cursors = new Map<string, number>(order.map((g) => [g.src, 0]));
-  const chosen = new Set<number>();
-  /* 先按"每轮各来源一个"的顺序收集候选下标，直到取满或全部取完。 */
-  const allTaken = order.reduce((n, g) => n + g.arr.length, 0);
-  let progressed = true;
-  while (chosen.size < limit && chosen.size < allTaken && progressed) {
-    progressed = false;
-    for (const g of order) {
-      if (chosen.size >= limit) break;
-      const cur = cursors.get(g.src) ?? 0;
-      if (cur >= g.arr.length) continue;
-      chosen.add(g.arr[cur]!.i);
-      cursors.set(g.src, cur + 1);
-      progressed = true;
+  const pickedSet = new Set<number>();
+
+  /** 在给定的候选里按来源轮流取，直到填满 `limit`。 */
+  const roundRobinInto = (candidates: typeof withSource): void => {
+    const bySrc = new Map<string, typeof withSource>();
+    for (const x of candidates) {
+      const arr = bySrc.get(x.src);
+      if (arr) arr.push(x);
+      else bySrc.set(x.src, [x]);
+    }
+    if (bySrc.size <= 1) {
+      /* 单一来源 → 按原顺序取（保序）。 */
+      for (const x of candidates) {
+        if (pickedSet.size >= limit) break;
+        pickedSet.add(x.i);
+      }
+      return;
+    }
+    const ord = [...bySrc.entries()]
+      .map(([src, arr]) => ({ src, first: arr[0]!.i, arr }))
+      .sort((a, b) => a.first - b.first);
+    const cursors = new Map<string, number>(ord.map((g) => [g.src, 0]));
+    const total = ord.reduce((n, g) => n + g.arr.length, 0);
+    let progressed = true;
+    while (pickedSet.size < limit && progressed) {
+      progressed = false;
+      for (const g of ord) {
+        if (pickedSet.size >= limit) break;
+        const cur = cursors.get(g.src) ?? 0;
+        if (cur >= g.arr.length) continue;
+        pickedSet.add(g.arr[cur]!.i);
+        cursors.set(g.src, cur + 1);
+        progressed = true;
+      }
+      /* 全部取完（`total` 只是兜底防死循环）。 */
+      if (ord.every((g) => (cursors.get(g.src) ?? 0) >= g.arr.length)) break;
+    }
+    void total;
+  };
+
+  /*
+   * 第一步：**只在完整型里分层**（若完整型够 limit 个）。
+   * 第二步：不够才让摘要型补位。
+   */
+  if (detailedPool.length >= limit) {
+    roundRobinInto(detailedPool);
+  } else {
+    roundRobinInto(detailedPool);
+    roundRobinInto(summaryPool);
+  }
+  /* 仍未填满（极端情况：候选数 < limit）→ 按原顺序补齐。 */
+  if (pickedSet.size < limit) {
+    for (const x of withSource) {
+      if (pickedSet.size >= limit) break;
+      pickedSet.add(x.i);
     }
   }
 
   const picked = withSource
-    .filter((x) => chosen.has(x.i))
+    .filter((x) => pickedSet.has(x.i))
     .sort((a, b) => a.i - b.i)
     .map((x) => x.s);
   const droppedBySource: Record<string, number> = {};
   for (const x of withSource) {
-    if (chosen.has(x.i)) continue;
+    if (pickedSet.has(x.i)) continue;
     droppedBySource[x.src] = (droppedBySource[x.src] ?? 0) + 1;
   }
   return { picked, droppedBySource };
