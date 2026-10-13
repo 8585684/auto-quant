@@ -168,7 +168,8 @@ npm run dev:web      # 前端：vite dev server，带 /api 与 WebSocket 代理
 | `npm run sim` | `tsx packages/server/src/scripts/simulate.ts` | **完整交易生命周期模拟**：确定性 K 线夹具 + 会真正触发止损止盈的模拟交易所 + 脚本化模型，80 轮，逐项校验（**当前全部通过**；`--real-market` 可换回真实行情）。写临时数据库 |
 | `npm run sim:live` | `tsx packages/server/src/scripts/simulate.ts --live --loose --cycles 12` | 同上，但模型换成**真实 LLM**（需要 `SIM_LLM_KEY`），策略放宽（`--loose`）以便真的有可能下单 |
 | `npm run notices` | `node scripts/generate-notices.mjs` | 重新生成 `THIRD-PARTY-NOTICES.md`。**改过任何依赖之后必须跑**——CI 会校验产物与当前依赖一致，不一致就红 |
-| `npm run check:links` | `node scripts/check-links.mjs` | 检查文档里的**站内链接**是否都解析得到（外链不查，别人家站点挂了不该让本项目变红）。改过文档路径/标题就跑一次 |
+| `npm run check:links` | `node scripts/check-links.mjs` | 检查文档里的**站内链接**是否都解析得到（外链不查，别人家站点挂了不该让本项目变红）。**CI 每次都会跑**；本地改过文档路径/标题时先跑一次，省得推上去才发现 |
+| `npm run check:routes` | `node scripts/check-api-routes.mjs` | 前后端接口对照：前端 `api.ts` 声明的每个调用，后端是否真有那条路由。**CI 每次都会跑**。改过 `api.ts` 或 `server.ts` 的路由后先跑一次 |
 | `npm run ui:smoke` | `node scripts/ui-smoke.mjs` | 用真实浏览器把每个页面打开一遍，抓运行时报错、白屏、横向滚动条。（需要先有 `packages/web/dist` 且服务在跑；用本机 Chrome/Edge，不下载浏览器） |
 
 各脚本自己的参数（本文不重复，脚本头部注释写得很细）：
