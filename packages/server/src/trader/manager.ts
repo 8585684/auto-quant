@@ -2843,6 +2843,32 @@ export class TraderManager {
       await this.startUserStream(traderId, connection);
 
       const mode = dryRun ? '模拟盘' : '实盘';
+      /*
+       * ══════════════════════════════════════════════════════════════════════
+       *  ⚠️⚠️ **把这次用的 `dryRun` 落库**（2026-10-13 实测安全修复）
+       * ══════════════════════════════════════════════════════════════════════
+       *
+       * ## 为什么必须落库
+       *
+       * 否则服务重启后，`resumePersisted` 只能拿到**一个进程级的值**，
+       * 于是"操作员用它启动时选模拟盘"这件事**在重启后丢失** ——
+       * 测试机器人被静默恢复成实盘（线上 `#11` 真的发生过）。
+       *
+       * ## ⚠️ 落库失败不能让启动失败
+       *
+       * 机器人**已经在跑了**（上面 `autoTrader.start()` 已完成）——
+       * 此时抛异常会让调用方以为"没启动"，而实际在跑。
+       * 那比"下次重启时回落到 env"糟得多。
+       * 所以这一条单独包 try/catch，失败只记日志。
+       */
+      try {
+        traders.setDryRun(traderId, dryRun);
+      } catch (error) {
+        log.warn(
+          `机器人 ${traderId} 的纸面模式未能落库（不影响本次运行，但重启后会回落到进程开关）：` +
+            `${(error as Error).message}`,
+        );
+      }
       runtimeLogs.write(traderId, 'info', 'manager', `机器人已启动（${mode}）`);
       eventBus.publish({
         type: 'log',
@@ -3554,7 +3580,47 @@ export class TraderManager {
        */
       let result: { ok: boolean; error?: string };
       try {
-        result = await this.startTrader(trader.id, dryRun, { retryTransient: true });
+        /*
+         * ══════════════════════════════════════════════════════════════════════
+         *  ⚠️⚠️ **每台机器人用【它自己】的 dryRun，不是那个进程级参数**
+         *      （2026-10-13 实测安全修复）
+         * ══════════════════════════════════════════════════════════════════════
+         *
+         * ## 事故：测试机器人被重启**静默恢复成实盘**
+         *
+         * 用户要求"测试必须 `dryRun: true`"，`#11` 也确实以模拟盘启动 ——
+         * **直到下一次部署重启服务**：
+         * ```
+         *   resumePersisted(env.dryRun)   ← 一个进程级开关，恢复【所有】机器人
+         *   → env.dryRun = false（服务器 .env 的 DRY_RUN=false）
+         *   → #11 被用 false 恢复 → 实盘 🚨
+         * ```
+         * 线上 `runtime_logs` 证据：`#11 …「机器人已启动（实盘）」`。
+         * 它当时 `orders=0`（全 skip）才没造成损失 —— **那是运气，不是保护**。
+         *
+         * ## 为什么之前是对的、现在错了
+         *
+         * "一个进程级开关恢复所有机器人"在**所有机器人共用一个开关**时自洽。
+         * 而 `#11` 这类**测试机器人必须与实盘 `#10` 用不同的值** ——
+         * 那个前提被打破了。
+         *
+         * ## 修法
+         *
+         * ```
+         *   trader.dryRun === undefined  → 回落到传入的 env 值（既有机器人不变）
+         *   trader.dryRun === true/false → 用它（操作员当时的显式选择）
+         * ```
+         * ⚠️ 这**不是**"恢复时重新读一次 env" —— 那正是错的：
+         * 操作员当时的意图必须被记住，哪怕 env 变了。
+         */
+        const effectiveDryRun = trader.dryRun ?? dryRun;
+        if (trader.dryRun !== undefined && trader.dryRun !== dryRun) {
+          log.info(
+            `机器人「${trader.name}」按它自己记录的纸面模式恢复（dryRun=${effectiveDryRun}）` +
+              `—— 与本次进程的 ${dryRun} 不同。`,
+          );
+        }
+        result = await this.startTrader(trader.id, effectiveDryRun, { retryTransient: true });
       } catch (error) {
         result = { ok: false, error: (error as Error).message };
         log.error(

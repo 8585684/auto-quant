@@ -848,6 +848,54 @@ const M15_PENDING_WAIT_MINUTES = /* sql */ `
 ALTER TABLE positions ADD COLUMN wait_minutes REAL;
 `;
 
+/*
+ * ══════════════════════════════════════════════════════════════════════════
+ *  ⚠️⚠️ **`dryRun` 落库**（2026-10-13 实测安全事件）
+ * ══════════════════════════════════════════════════════════════════════════
+ *
+ * ## 事故：测试机器人被服务重启**静默恢复成实盘**
+ *
+ * 用户明确要求"测试只能用模拟盘、必须 `dryRun: true`"。而我这样启动了 `#11`，
+ * 它也确实以模拟盘跑着 —— **直到下一次部署重启服务**：
+ *
+ * ```
+ *   resumePersisted(env.dryRun)   ← 用【一个进程级的开关】恢复【所有】机器人
+ *   → env.dryRun 来自服务器 .env（DRY_RUN=false）
+ *   → #11 被用 dryRun=false 恢复 → 实盘 🚨
+ * ```
+ *
+ * 线上 `runtime_logs` 的决定性证据：
+ * ```
+ *   #11 [团队测试] 多智能体 → 「机器人已启动（**实盘**）」
+ *   #10 赚大钱             → 「机器人已启动（实盘）」   ← 这个是对的
+ * ```
+ * 而 `#11` 当时 `orders=0`（全 skip）才没造成损失 —— **那是运气，不是保护**。
+ *
+ * ## 为什么 `dryRun` 之前"不该落库"（原来的理由，现在不成立了）
+ *
+ * `api/server.ts` 里写着：
+ * > 「`dryRun` 是**运行时**的事实（它是启动参数、不落库），仓储层算不出来。」
+ *
+ * 那个理由在"**所有机器人用同一个开关**"时是自洽的 —— 进程级一个值就够。
+ * 但 `#11` 这类**测试机器人**必须与实盘 `#10` **用不同的值**，
+ * 于是"进程级单一开关"这个前提被打破了。
+ *
+ * ## 修法：`dry_run` 成为机器人自己的属性
+ *
+ * ```
+ *   NULL  —— 从未被显式指定过 → 回落到 env.dryRun（既有机器人行为完全不变）
+ *   0/1   —— 操作员启动时指定的值 → 重启后【按它恢复】
+ * ```
+ * ⚠️ 用 NULL 而不是默认 0：默认 0 会让**所有既有机器人**在迁移后
+ * 被当成"显式指定了实盘"，那就等于把 env 的回落路径悄悄删掉了。
+ *
+ * ⚠️ 这是**安全修复**，不是便利性改动：它保证"操作员说要模拟盘，
+ * 那它一直是模拟盘"，不会因为一次部署而变成用真钱。
+ */
+const M18_TRADER_DRY_RUN = /* sql */ `
+ALTER TABLE traders ADD COLUMN dry_run INTEGER;
+`;
+
 export const MIGRATIONS: readonly Migration[] = [
   { version: 1, name: 'initial', sql: M1_INITIAL },
   { version: 2, name: 'trade-accounting', sql: M2_TRADE_ACCOUNTING },
@@ -872,4 +920,5 @@ export const MIGRATIONS: readonly Migration[] = [
   { version: 15, name: 'pending-wait-minutes', sql: M15_PENDING_WAIT_MINUTES },
   { version: 16, name: 'trade-intel-attribution', sql: M16_TRADE_INTEL_ATTRIBUTION },
   { version: 17, name: 'position-intel-attribution', sql: M17_POSITION_INTEL_ATTRIBUTION },
+  { version: 18, name: 'trader-dry-run', sql: M18_TRADER_DRY_RUN },
 ];

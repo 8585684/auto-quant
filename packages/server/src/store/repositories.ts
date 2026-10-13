@@ -519,6 +519,14 @@ interface TraderRow {
   consecutive_failures: number;
   agent_config_json: string | null;
   mode: string;
+  /**
+   * 操作员启动时指定的"是否纸面模式"。
+   *
+   * `null` = **从未被显式指定过** → 回落到进程级 `env.dryRun`（不落库）。
+   * 见 `M18_TRADER_DRY_RUN` 与 `setDryRun` 的说明 ——
+   * 这一列是一条**安全修复**，不是便利性字段。
+   */
+  dry_run: number | null;
   created_at: string;
   updated_at: string;
 }
@@ -539,6 +547,12 @@ function toTrader(row: TraderRow): Trader {
     consecutiveFailures: row.consecutive_failures,
     agentConfigJson: row.agent_config_json,
     mode: row.mode as TraderMode,
+    /*
+     * ⚠️ `undefined` 与 `false` 必须分得开（见 `Trader.dryRun` 的说明）：
+     * 这一列是 NULL 时**不能**转成 `false`，否则"从未指定过"会被当成
+     * "操作员指定了实盘"，env 的回落路径就被悄悄删掉了。
+     */
+    dryRun: row.dry_run === null ? undefined : row.dry_run !== 0,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -648,6 +662,43 @@ export const traders = {
       'UPDATE traders SET status = ?, last_error = ?, updated_at = ? WHERE id = ?',
       status,
       error,
+      now(),
+      id,
+    );
+  },
+
+  /**
+   * ══════════════════════════════════════════════════════════════════════════
+   *  **记下"操作员启动这一台时选的纸面模式"**（2026-10-13 实测安全修复）
+   * ══════════════════════════════════════════════════════════════════════════
+   *
+   * ## 事故：测试机器人被服务重启**静默恢复成实盘**
+   *
+   * 用户要求"测试必须 `dryRun: true`"，而 `#11` 也确实以模拟盘启动 ——
+   * **直到下一次部署重启服务**：
+   * ```
+   *   resumePersisted(env.dryRun)    ← 一个进程级开关，恢复【所有】机器人
+   *   → env.dryRun 来自服务器 .env（DRY_RUN=false）
+   *   → #11 被用 dryRun=false 恢复 → 实盘 🚨
+   * ```
+   * 线上 `runtime_logs` 证据：`#11 …「机器人已启动（实盘）」`。
+   * 它当时 `orders=0`（全 skip）才没造成损失 —— **那是运气，不是保护**。
+   *
+   * ## 为什么之前不落库（那个理由现在不成立了）
+   *
+   * `api/server.ts` 原文：
+   * > 「`dryRun` 是**运行时**的事实（它是启动参数、不落库），仓储层算不出来。」
+   *
+   * 那个理由在"所有机器人共用一个开关"时自洽。但**测试机器人必须与实盘
+   * 机器人用不同的值** —— 那个前提被打破了，所以它必须成为机器人自己的属性。
+   *
+   * @param id 机器人 id
+   * @param dryRun 启动时用的值；`null` 表示"清除显式指定、回到 env 回落"
+   */
+  setDryRun(id: number, dryRun: boolean | null): void {
+    getDb().run(
+      'UPDATE traders SET dry_run = ?, updated_at = ? WHERE id = ?',
+      dryRun === null ? null : dryRun ? 1 : 0,
       now(),
       id,
     );
