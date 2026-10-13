@@ -765,6 +765,8 @@ test('★ 标记价取不到时，条件单放行（而不是被误判成「会�
   const { rest, calls } = fakeRest({
     algoId: '9', clientAlgoId: 'sl-2', algoType: 'CONDITIONAL', orderType: 'STOP_MARKET',
     symbol: 'BTCUSDT', side: 'SELL', positionSide: 'BOTH', quantity: '0.01',
+    /* ⚠️ `timeInForce` 是必填（`BinanceAlgoOrderResponse`）——
+     * 漏了它 typecheck 会红。这条 fixture 曾漏过一次，CI 与另一位贡献者都抓到了。 */
     algoStatus: 'NEW', timeInForce: 'GTC', triggerPrice: '67000', price: '0', closePosition: true, reduceOnly: false,
     workingType: 'MARK_PRICE', priceProtect: true, createTime: 0, updateTime: 0, triggerTime: 0,
   } satisfies BinanceAlgoOrderResponse);
