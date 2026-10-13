@@ -143,6 +143,43 @@ test('runtimeLogs.trim() compacts the table on demand', () => {
   assert.equal(db.count('SELECT COUNT(*) AS n FROM runtime_logs'), RUNTIME_LOG_CAP);
 });
 
+test('★ runtimeLogs.list() 自己钳制 limit —— 巨值原本会让端点 500', () => {
+  /*
+   * 复现的是外部 issue #124：`GET /api/logs?limit=<巨值>` 返回
+   * **500 datatype mismatch**。
+   *
+   * 原来的路由只挡了非有限值（`Number.isFinite`），而 `1e21` **是有限数** ——
+   * 它顺利通过并直达 SQL 的 `LIMIT ?`，`node:sqlite` 随即抛
+   * `ERR_SQLITE_ERROR: datatype mismatch`（不是截断、不是空结果）。
+   *
+   * 实测的触发条件是 **≥1e21 或非整数**：`1.5` 同样抛；
+   * 而 `2**53` 虽然已超出安全整数范围却仍然正常 —— 所以判据不是"超安全整数"。
+   *
+   * 钳制放在仓储层（与 `clampOrderLimit` 同一个取舍），这样"忘了在路由里写钳制"
+   * 不再可能：所有调用点自动受保护。
+   */
+  traderId = seedTrader();
+  for (let i = 0; i < 5; i += 1) runtimeLogs.write(traderId, 'info', 'trader', `钳制 ${i}`);
+
+  // 这两个值原本会让整个端点 500 —— 现在必须正常返回，且不超过一页上限。
+  assert.doesNotThrow(() => runtimeLogs.list(1e21), '≥1e21 原本抛 datatype mismatch');
+  assert.doesNotThrow(() => runtimeLogs.list(1.5), '非整数原本同样抛 datatype mismatch');
+  assert.equal(runtimeLogs.list(1e21).length, 5, '巨值被收成上限，5 行全回');
+  assert.equal(runtimeLogs.list(1.5).length, 1, '1.5 取整为 1 行');
+
+  // 负数在 SQLite 里表示**无上限**，会把全表回出去 —— 与"只回一页"的契约相反。
+  assert.equal(runtimeLogs.list(-5).length, 1, '负数必须收进 [1, max]，不是无上限');
+  assert.equal(runtimeLogs.list(0).length, 1, 'LIMIT 0 的空结果会伪装成"没有日志"');
+
+  // 非有限值回落到默认页大小（与路由原来的 `?? 200` 契约一致）。
+  assert.equal(runtimeLogs.list(Number.NaN).length, 5, 'NaN 回落到默认页大小');
+  assert.equal(runtimeLogs.list(Number.POSITIVE_INFINITY).length, 5, 'Infinity 回落到默认页大小');
+
+  // 正常值不受影响。
+  assert.equal(runtimeLogs.list(3).length, 3, '正常 limit 必须原样生效');
+  assert.equal(runtimeLogs.list().length, 5, '不传时用默认页大小');
+});
+
 test('a burst of writes does far fewer DELETEs than writes', () => {
   traderId = seedTrader();
   const db = getDb();
@@ -499,4 +536,50 @@ test('★ 提示词全文只保留最近若干条 —— 它是这个库 90% 的
   assert.equal(rows.length, writes, `清空提示词不等于删行，实际 ${rows.length} 行`);
   /* 最新那条必须有全文 —— 复盘正在跑的这几轮靠它。 */
   assert.ok(rows[rows.length - 1]!.len > 0, '最新一条必须有全文');
+});
+
+test('★ feesOf() 必须派生 exitFee —— `exit_fee` 不是数据库列', () => {
+  /*
+   * 原实现写的是 `SELECT entry_fee, exit_fee FROM trades WHERE id = ?`，
+   * 而 `exit_fee` **从来不是一列**（`schema.ts` 的迁移只加了 `entry_fee`；
+   * 那边 `net_pnl = gross − entry_fee − exit_fee − funding_fee` 只是注释，不是 DDL）。
+   *
+   * 于是那个查询**必然抛** `no such column: exit_fee`。它此前没有调用者，
+   * 所以是一颗没被踩到的哑弹 —— 一旦有人调用就会直接拿到 500
+   * （`server.ts` 把非 4xx 一律按 500 处理）。
+   *
+   * 修法是**派生**，且必须与读出层（`trades.list()` 的
+   * `Math.max(0, fee - entry_fee)`）同一个口径 —— 否则全项目会出现两处
+   * 各自计算 exitFee 的代码，而它们迟早会分叉。
+   */
+  traderId = seedTrader();
+  const { id } = tradeStore.insert({
+    traderId,
+    symbol: 'BTCUSDT',
+    side: 'long',
+    quantity: 0.01,
+    entryPrice: 68_000,
+    exitPrice: 68_000,
+    leverage: 3,
+    grossPnl: 1,
+    entryFee: 0.01183192,
+    exitFee: 0.01216007,
+    fundingFee: 0,
+    closeReason: 'model_decision',
+    openedAt: new Date(Date.UTC(2025, 0, 1)).toISOString(),
+  });
+
+  assert.doesNotThrow(() => tradeStore.feesOf(id), '不得再抛 no such column: exit_fee');
+
+  const fees = tradeStore.feesOf(id);
+  assert.ok(Math.abs(fees.entryFee - 0.01183192) < 1e-12, `entryFee 实际 ${fees.entryFee}`);
+  assert.ok(Math.abs(fees.exitFee - 0.01216007) < 1e-9, `派生的 exitFee 实际 ${fees.exitFee}`);
+  /* 两侧必须能加回合计 —— 这是"同一件事只有一个口径"的可检形式。 */
+  assert.ok(
+    Math.abs(fees.entryFee + fees.exitFee - 0.02399199) < 1e-9,
+    'entryFee + exitFee 必须等于合计手续费',
+  );
+
+  /* 不存在的 id：返回零值，而不是抛。 */
+  assert.deepEqual(tradeStore.feesOf(-1), { entryFee: 0, exitFee: 0 });
 });

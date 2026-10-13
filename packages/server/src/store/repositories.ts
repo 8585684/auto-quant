@@ -2245,13 +2245,26 @@ export const trades = {
    * 返回 0，而 0 **不代表"这笔没有手续费"** —— 直接写 0 会把一个正确的数字（可能是运行期
    * 记下的、甚至交易所退费的负数）覆盖掉。实测被测试抓到过一次
    * （见 `autoTrader.test.ts` 的「对账重复执行是幂等的」）。
+   *
+   * ⚠️ **`exit_fee` 不是数据库列**（`schema.ts` 的迁移只加了 `entry_fee`），
+   * 所以这里**必须派生**，与 `trades.list()` 的读出层同一个口径：
+   * `exit_fee = fee − entry_fee`。
+   *
+   * 原实现写的是 `SELECT entry_fee, exit_fee FROM trades` —— 那个查询**必然抛**
+   * `no such column: exit_fee`。它此前没有调用者，所以是一颗没被踩到的哑弹；
+   * 一旦有人调用就会直接拿到 500（`server.ts` 把非 4xx 一律按 500 处理）。
+   * 顺带一提：`schema.ts` 里 `net_pnl = gross − entry_fee − exit_fee − funding_fee`
+   * 那一行只是注释，不是 DDL，别被它误导。
    */
   feesOf(id: number): { entryFee: number; exitFee: number } {
-    const row = getDb().get<{ entry_fee: number | null; exit_fee: number | null }>(
-      'SELECT entry_fee, exit_fee FROM trades WHERE id = ?',
+    const row = getDb().get<{ entry_fee: number | null; fee: number | null }>(
+      'SELECT entry_fee, fee FROM trades WHERE id = ?',
       id,
     );
-    return { entryFee: Number(row?.entry_fee) || 0, exitFee: Number(row?.exit_fee) || 0 };
+    const entryFee = Number(row?.entry_fee) || 0;
+    const fee = Number(row?.fee) || 0;
+    /* 夹到 0 以上：手续费有**退费**的负数情形，此时派生的平仓侧不该变成负成本。 */
+    return { entryFee, exitFee: Math.max(0, fee - entryFee) };
   },
   /**
    * 某机器人的成交记录，**最新在前**，一次一页。`before` 是游标：只返回 `id < before` 的行。
@@ -3983,6 +3996,16 @@ export const settings = {
 
 /** 控制台日志保留的最新行数。表有界，但**不再每写一行就裁剪一次**。 */
 export const RUNTIME_LOG_CAP = 500;
+
+/**
+ * `runtimeLogs.list()` 一次最多回多少行。
+ *
+ * 与 `RUNTIME_LOG_CAP` 一致：表里本来就只有这么多行，要更多也没有。
+ */
+export const RUNTIME_LOG_PAGE_MAX = RUNTIME_LOG_CAP;
+
+/** 不传 `limit` 时返回多少行 —— 与历史契约一致（路由原先写死 200）。 */
+export const RUNTIME_LOG_PAGE_DEFAULT = 200;
 /**
  * 每写入这么多行才执行一次裁剪。
  *
@@ -4025,11 +4048,28 @@ export const runtimeLogs = {
     );
   },
 
-  list(limit = 200): Array<{ id: number; traderId: number | null; level: string; scope: string; message: string; createdAt: string }> {
+  list(limit = RUNTIME_LOG_PAGE_DEFAULT): Array<{ id: number; traderId: number | null; level: string; scope: string; message: string; createdAt: string }> {
+    /*
+     * ⚠️ **钳制放在仓储层，不放在路由** —— 与 `orders` 的 `clampOrderLimit` 同一个取舍。
+     *
+     * 原来的路由只挡了非有限值（`Number.isFinite`），而 `1e21` **是有限数**：
+     * 它顺利通过并直达 SQL 的 `LIMIT ?`，`node:sqlite` 随即抛
+     * `datatype mismatch`（不是截断、不是空结果）→ 整个端点 500。
+     * 实测触发条件是 **≥1e21 或非整数**（`1.5` 同样抛；而 `2**53` 虽然超出
+     * 安全整数范围却仍然正常，所以"超安全整数"不是判据）。
+     *
+     * 放在这里而不是路由里的理由：表有界（`RUNTIME_LOG_CAP`），
+     * 所以"要超过 500 行"本身就没有意义；在仓储层钳制能让**将来任何新调用点**
+     * 自动受保护，不必记得在每个路由里各写一遍。
+     *
+     * 另外顺手挡住负数：SQLite 的 `LIMIT -5` 表示**无上限**，
+     * 会把全表回给调用方 —— 与"只回一页"的契约相反。
+     */
+    const pageSize = clampPageLimit(limit, RUNTIME_LOG_PAGE_MAX, RUNTIME_LOG_PAGE_DEFAULT);
     return getDb()
       .all<{ id: number; trader_id: number | null; level: string; scope: string; message: string; created_at: string }>(
         'SELECT * FROM runtime_logs ORDER BY id DESC LIMIT ?',
-        limit,
+        pageSize,
       )
       .reverse()
       .map((row) => ({

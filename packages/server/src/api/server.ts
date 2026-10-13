@@ -41,6 +41,7 @@ import {
   ownUnrealizedPnlOf,
   positions as positionStore,
   runtimeLogs,
+  RUNTIME_LOG_PAGE_DEFAULT,
   settings,
   strategies,
   traders,
@@ -987,8 +988,16 @@ export async function buildServer(deps: ApiDependencies): Promise<FastifyInstanc
   app.get('/api/system/update', authed, async () => checkForUpdates());
 
   app.get('/api/logs', authed, async (request) => {
-    const limit = Number((request.query as { limit?: string }).limit ?? 200);
-    return { logs: runtimeLogs.list(Number.isFinite(limit) ? limit : 200) };
+    /*
+     * ⚠️ **这里只做"字符串 → 数字"，钳制交给仓储层**（`runtimeLogs.list()`）。
+     *
+     * 原来这里写的是 `Number.isFinite(limit) ? limit : 200`，而 `1e21` **是有限数** ——
+     * 它直达 SQL 的 `LIMIT ?` 后 `node:sqlite` 抛 `datatype mismatch`，
+     * 整个端点变成 500（实测触发条件是 ≥1e21 或非整数）。
+     * 与 `orders` 的处理保持一致：上限的钳制集中在一处，每个路由不必各写一遍。
+     */
+    const limit = Number((request.query as { limit?: string }).limit ?? RUNTIME_LOG_PAGE_DEFAULT);
+    return { logs: runtimeLogs.list(limit) };
   });
 
   /* --- Exchange accounts ------------------------------------------------- */
