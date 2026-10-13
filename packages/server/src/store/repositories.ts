@@ -1,5 +1,6 @@
 import type {
   AiModelConfig,
+  CloseReason,
   DecisionRecord,
   EquitySnapshot,
   ExchangeAccount,
@@ -2536,7 +2537,7 @@ export const trades = {
     entryFee?: number;
     exitFee?: number;
     fundingFee?: number;
-    closeReason: string;
+    closeReason: CloseReason;
     openedAt: string;
     /** Exchange fill time. Defaults to now; reconciliation supplies the real one. */
     closedAt?: string;
