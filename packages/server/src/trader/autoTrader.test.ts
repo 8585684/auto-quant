@@ -5031,6 +5031,205 @@ test('★ 减仓只部分成交时，本地持仓按实际成交量减 —— �
 });
 
 /* -------------------------------------------------------------------------- */
+/*  减仓之后最终平仓：手续费按【原始总量】分摊，不是按剩余量                        */
+/* -------------------------------------------------------------------------- */
+
+test('★ 减仓过一半后最终平仓，手续费不能被清零（分母用错了会乘 0）', async () => {
+  /*
+   * ## 这个用例防的是什么（外部 issue #142，账目算术，影响真实资金）
+   *
+   * `bookClosedPosition()` 分摊「已记过的那部分手续费」时用了：
+   *
+   *     partialShare = Math.min(partialQty / local.quantity, 1)
+   *
+   * 而这两个操作数是**互不相交的两块**，不是"部分 / 整体"：
+   *
+   *   · `partialQty` —— `booked_partial_qty`，**已减仓并记过账**的数量（单调累加）
+   *   · `local.quantity` —— 减仓之后**剩余还开着**的数量
+   *
+   *   `partialQty + local.quantity` 才是原始总量。
+   *
+   * 于是减掉一半时 `168 / 168 = 1.0` → `Math.min(...,1)` 夹到 1 →
+   * `entryFee × 0` **与** `exitFee × 0` **双双归零**。
+   *
+   * 而正确形态（`autoTrader.ts` 那条注释早就写明了意图）是
+   * `grossPnl = G − g, exitFee = XF − xf` —— 按**数量比例**分摊。
+   *
+   * ## 为什么这一条必须由测试钉住
+   *
+   * 后果方向是 §2.5 明令禁止的那一侧：**少记手续费 = 账面净额比交易所好看**，
+   * 一个实际亏损的账户能看起来是赚的。而且 `ledger_check` 的 gap 会长期不为 0，
+   * 逐渐训练操作员忽略那条唯一能自动发现账本错误的告警。
+   *
+   * 该路径此前**没有任何测试覆盖**（`grep partialShare --include=*.test.ts` 零命中）。
+   *
+   * ## 夹具的两个关键选择
+   *
+   * 1. **必须打开 `autoUserTrades`**：`exitFeeInput` 来自
+   *    `getUserTrades()` 里 orderId 匹配的成交；关掉它 `exitFeeInput` 就是 0，
+   *    手续费在进入分摊逻辑**之前**已经是 0 —— 那样断言 `fee > 0`
+   *    无论实现对不对都会失败，用例变成在测夹具。
+   *    打开它之后 `findRoundTrip()` 能重建整段往返，`authoritative` 非空，
+   *    正是本缺陷要修的那条分支。
+   *
+   * 2. **不走 `reduce_position` 决策**，直接按 `executeReduce` 第 ④ 步的形状改持仓行
+   *    （数量减半 + `booked_partial_qty` 累加）。理由：减仓决策会在同一个 broker 上
+   *    再产生一笔成交，让后面的平仓撞上 `trades.findDuplicate()` 的幂等闸门
+   *    （"此前已入账，本次不再重复记录"），于是 `bookClosedPosition()` 的
+   *    分摊代码根本不会被走到。直接改行反而更贴近触发条件：
+   *    `local.quantity` 是剩余量、`booked_partial_qty` 是已记量，两者互不相交。
+   */
+  const broker = new FakeBroker();
+  broker.autoUserTrades = true;
+  await buildTrader(broker, OPEN_LONG_RESPONSE).runOnce();
+
+  const opened = positionStore.open(traderId).find((p) => p.symbol === SYMBOL);
+  assert.ok(opened, '前提：已开仓');
+  const originalQty = opened.quantity;
+
+  const half = originalQty / 2;
+  positionStore.resize(traderId, SYMBOL, {
+    quantity: half,
+    entryPrice: opened.entry_price,
+    marginUsed: (half * opened.entry_price) / Math.max(opened.leverage, 1),
+    addRealizedPartialPnl: 0,
+    addBookedPartialQty: half,
+  });
+
+  const afterReduce = positionStore.open(traderId).find((p) => p.symbol === SYMBOL);
+  assert.ok(afterReduce, '前提：减半之后还剩一半');
+  assert.equal(afterReduce.quantity, half, '前提：剩余量确实是原量的一半');
+  const booked = positionStore.partialBooked(traderId, SYMBOL);
+  assert.equal(booked.qty, half, '前提：已记数量等于剩余数量（旧实现会把 share 夹成 1）');
+
+  /* 把剩下的平掉 —— 走 `bookClosedPosition()`，也就是被除数写错的那条路径。 */
+  const closeResponse = `<decision>
+\`\`\`json
+[
+  {
+    "symbol": "${SYMBOL}",
+    "action": "close_long",
+    "confidence": 80,
+    "reasoning": "剩下的全部平掉。"
+  }
+]
+\`\`\`
+</decision>`;
+  await buildTrader(broker, closeResponse).runOnce();
+
+  const rows = tradeStore.list(traderId, 50);
+  /* 最终平仓那一行的原因码是 `model_decision`（部分平仓那行是 `manual_partial`）。 */
+  const finalRow = rows.find((r) => r.closeReason === 'model_decision');
+  assert.ok(
+    finalRow,
+    `前提：最终平仓写出了一行成交记录。实际原因码：${rows.map((r) => r.closeReason).join(', ')}`,
+  );
+
+  /*
+   * 关键断言：这一行的手续费**不能是 0**。旧实现下它是 0（被 `(1 - partialShare)` 乘掉）。
+   *
+   * ⚠️ 用 `Math.abs` 比较，因为**符号取决于走哪条分支**：
+   *   · `authoritative` 非空时，`commissionsInWindow()` 已经 `Math.abs` 过 → **正数**
+   *   · 回退路径直接用 `exitFeeInput`，那是 `getUserTrades().commission` 的原值 ——
+   *     币安把它报成**负数**（支出），`FakeBroker` 也照此伪造（本文件 665 行注释）
+   *
+   * 本用例固定位的是"有没有被乘成 0"，与符号无关，所以取绝对值。
+   * 断言"非零"而不是某个精确值 —— 精确值取决于夹具费率，钉死它会变成在测夹具。
+   */
+  assert.ok(
+    Math.abs(finalRow.fee) > 0,
+    `★ 减仓过一半后最终平仓的手续费不能是 0（分母用了剩余量而非原始总量就会这样）。实际 fee=${finalRow.fee}`,
+  );
+
+  /*
+   * §2.5 恒等式：净 = 毛 − 手续费 + 资金费。
+   * 手续费被清零时这条**也仍然成立**（0 是合法值），所以它单独不足以发现本缺陷 ——
+   * 但它是"修好之后没有把别的东西弄坏"的守卫。
+   */
+  assert.ok(
+    Math.abs(finalRow.netPnl - (finalRow.pnl - finalRow.fee + finalRow.fundingFee)) < 1e-9,
+    `净盈亏必须等于 毛 − 手续费 + 资金费。net=${finalRow.netPnl} pnl=${finalRow.pnl} fee=${finalRow.fee} funding=${finalRow.fundingFee}`,
+  );
+});
+
+test('★ 减仓后最终平仓走回退路径时，本腿的手续费也不能被削掉', async () => {
+  /*
+   * 上一条覆盖的是能重建整段往返时的分摊。这一条覆盖**回退路径** ——
+   * 两者必须分开考，因为它们的正确行为**不同**：
+   *
+   *   · 能重建（`authoritative` 非空）：那两个费用覆盖**整段往返**，
+   *     所以必须按数量比例把已记那部分扣掉，否则同一笔费记两次；
+   *   · 走回退（`authoritative == null`）：`exitFeeInput` 是**本腿自己这一笔**的
+   *     成交手续费（`autoTrader.ts:7496-7499` 从 `getUserTrades()` 按 orderId 取），
+   *     它本来就不含已减仓那部分 —— 再乘 `(1 - share)` 会**新引入少记**。
+   *
+   * 这正是原缺陷的第二个坑：只把分母从 `local.quantity` 改成
+   * `partialQty + local.quantity` **还不够** —— 回退路径上 `partialShare`
+   * 在减半时仍然是 1，于是唯一已知的那笔费用照样被削成 0。
+   *
+   * ## 为什么减过仓的仓位天然更容易落到回退路径
+   *
+   * `findRoundTrip()` 按 `symbol + quantity + entryPrice` 匹配（`autoTrader.ts:5706`），
+   * 而**减过仓的持仓行 quantity 已经变小**（是剩余量），交易所重建出来的是**整段**
+   * 成交量 —— 两个数一旦不等就匹配不上。所以这条分支不是罕见角落，
+   * 而是本缺陷的主要现场之一。
+   */
+  const broker = new FakeBroker();
+  /*
+   * `autoUserTrades` 打开：让 `getUserTrades()` 能按 orderId 取到**本腿**的佣金，
+   * 使 `exitFeeInput` 非 0 —— 否则手续费在进入分摊逻辑之前就是 0，用例测不到东西。
+   */
+  broker.autoUserTrades = true;
+  await buildTrader(broker, OPEN_LONG_RESPONSE).runOnce();
+
+  const opened = positionStore.open(traderId).find((p) => p.symbol === SYMBOL);
+  assert.ok(opened, '前提：已开仓');
+
+  /* 减半：剩余量 ≠ 交易所重建的整段量 → `findRoundTrip()` 匹配不上 → 走回退。 */
+  const half = opened.quantity / 2;
+  positionStore.resize(traderId, SYMBOL, {
+    quantity: half,
+    entryPrice: opened.entry_price,
+    marginUsed: (half * opened.entry_price) / Math.max(opened.leverage, 1),
+    addRealizedPartialPnl: 0,
+    addBookedPartialQty: half,
+  });
+
+  const closeResponse = `<decision>
+\`\`\`json
+[
+  {
+    "symbol": "${SYMBOL}",
+    "action": "close_long",
+    "confidence": 80,
+    "reasoning": "剩下的全部平掉。"
+  }
+]
+\`\`\`
+</decision>`;
+  await buildTrader(broker, closeResponse).runOnce();
+
+  const finalRow = tradeStore.list(traderId, 50).find((r) => r.closeReason === 'model_decision');
+  assert.ok(finalRow, '前提：最终平仓写出了一行成交记录');
+
+  /*
+   * ⚠️ 断言打在 `fee`（`trades.fee` 的**原值**）上，而不是 `exitFee`：
+   *
+   * `trades.list()` 的 `exitFee` 是**派生**的 —— `Math.max(0, fee - entry_fee)`
+   * （`repositories.ts:1851`），它把负数夹成 0。而回退路径上 `exitFeeInput` 是
+   * `getUserTrades().commission` 的原值，币安把它报成**负数**（支出），
+   * `FakeBroker` 也照此伪造（本文件 665 行注释）——
+   * 于是"费用被记下来了、而且是负的"这件事**在 `exitFee` 上根本看不出来**。
+   *
+   * `fee` 是唯一能如实反映"有没有被乘成 0"的字段，所以钉它。
+   */
+  assert.ok(
+    Math.abs(finalRow.fee) > 0,
+    `★ 回退路径上本腿的手续费不能被削掉（partialShare 在减半时仍会被夹成 1）。实际 fee=${finalRow.fee}`,
+  );
+});
+
+/* -------------------------------------------------------------------------- */
 /*  限价入场                                                                    */
 /* -------------------------------------------------------------------------- */
 

@@ -5308,13 +5308,47 @@ export class AutoTrader {
     /*
      * ⚠️ **已记那部分的手续费要按数量比例扣掉**，否则它在账上出现两次
      * （部分平仓那行一次、这一行一次）。两条腿的费率一致，按数量分摊足够准。
+     *
+     * ## 🔴 分母曾经是 `local.quantity`，于是手续费被**整个乘掉**
+     *
+     * 这两个操作数是**互不相交的两块**，不是"部分 / 整体"：
+     *
+     *   · `partialQty`（`booked_partial_qty`）—— **已减仓并记过账**的数量，单调累加
+     *   · `local.quantity`               —— 减仓之后**剩余还开着**的数量
+     *
+     * 原始总量是 `partialQty + local.quantity`。拿前者的除以后者，减掉一半时
+     * `168 / 168 = 1.0` → `Math.min(…, 1)` 夹到 1 → `entryFee` 与 `exitFee`
+     * **双双归零**。实测：只要减仓量 ≥ 剩余量（减掉一半或更多），
+     * 最终平仓那一行的手续费恒为 0。
+     *
+     * 而少记手续费的方向正是 §2.5 明令禁止的那一侧 —— **账面净额比交易所好看**，
+     * 一个实际亏损的账户能看起来是赚的。同时 `ledger_check` 的 gap 长期不为 0，
+     * 会逐渐训练操作员忽略那条唯一能自动发现账本错误的告警。
+     *
+     * ## 只在有权威值时分摊
+     *
+     *   · `authoritative` 存在时，`entryFee` / `exitFeeRaw` 覆盖**整段往返**
+     *     （见 `findRoundTrip()` 的说明），所以必须按数量比例把已记那部分扣掉；
+     *   · `authoritative == null`（走回退）时，`exitFeeInput` 是**剩余腿自己那一笔**
+     *     的成交手续费，它本来就不含已减仓的部分 —— 再乘 `(1 - share)` 会
+     *     **新引入少记**（把唯一已知的那笔费用也削掉）。
+     *
+     * `entryFeeRaw` 在回退路径上恒为 0（开仓费在开仓那一刻已作为持仓成本付掉），
+     * 所以它乘不乘都一样；这里仍统一写成乘以 share，是为了让"只有权威值才分摊"
+     * 这条规则在两条腿上长得一样，不必让读者去推 `?? 0` 的取值。
      */
     const partialShare =
-      partialQty > 0 && local.quantity > 0 ? Math.min(partialQty / local.quantity, 1) : 0;
+      authoritative && partialQty > 0 && local.quantity > 0
+        ? Math.min(partialQty / (partialQty + local.quantity), 1)
+        : 0;
     const entryFeeRaw = authoritative?.entryFee ?? 0;
     const exitFeeRaw = authoritative?.exitFee ?? exitFeeInput;
     const entryFee = entryFeeRaw * (1 - partialShare);
-    const exitFee = exitFeeRaw * (1 - partialShare);
+    /*
+     * 回退路径（`authoritative == null`）**原样**采用 `exitFeeInput`：
+     * 那是剩余腿自己那一笔的费用，不参与分摊。
+     */
+    const exitFee = authoritative ? exitFeeRaw * (1 - partialShare) : exitFeeInput;
 
     /*
      * Funding is read here, at the moment of closing, and not only during the
