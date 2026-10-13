@@ -80,17 +80,42 @@ test('★★★ fleetTotals：同账户多机器人时取【最新】快照（�
   );
 });
 
-test('★ 只有 stats（无快照）时也不能取第一个 —— 走 fleetTotals 的兜底', () => {
+test('★★★ TradersPage 必须把【快照】喂给 fleetTotals（不能只传 stats）', () => {
+  /*
+   * ## 我上一轮修得不完整（2026-10-14 自查发现）
+   *
+   * 我把手算的 `.find()` 换成了 `fleetTotals({ traders, stats })` ——
+   * **但没传 `snapshots`**。而 fleetTotals 拿不到快照时会走这条兜底：
+   * ```
+   *   group.reduce((max, t) => Math.max(max, stats[t.id]?.accountEquity ?? 0), 0)
+   * ```
+   * 「取组内最大值」在**账户亏损时会把旧的高点当成当前的钱** ——
+   * 正是 `latestAccountReading()` 的注释里点明要避免的。
+   *
+   * 所以判据是：调用点必须带 `snapshots:`。
+   */
+  assert.ok(
+    /fleetTotals\(\{[^}]*snapshots:/s.test(PAGE),
+    '★ 必须传 snapshots —— 只传 stats 会让 fleetTotals 退回"取最大值"，账户亏损时会显示旧高点',
+  );
+});
+
+test('★★★ TradersPage 必须自己取快照（REST + socket 合并）', () => {
+  assert.ok(/api\.traderEquity\(/.test(PAGE), '★ 必须调 api.traderEquity 拉 REST 快照');
+  assert.ok(/pairEquityByTrader\(/.test(PAGE), '★ 必须按 id 配对（下标配对会在机器人增删后张冠李戴）');
+  assert.ok(
+    /liveByTrader\[trader\.id\]\?\.equity/.test(PAGE),
+    '★ 必须把 socket 推来的新点也并进去（否则列表页比详情页慢一个周期）',
+  );
+});
+
+test('★ 无快照时也不能取第一个 —— 走 fleetTotals 的兜底（取最大值，不静默给 0）', () => {
   const traders = [
     { id: 9, exchangeAccountId: 2, initialEquity: 20.78, createdAt: '2026-10-01T00:00:00Z' },
     { id: 11, exchangeAccountId: 2, initialEquity: 20.75, createdAt: '2026-10-11T00:00:00Z' },
   ] as never;
   const stats = { 9: { accountEquity: 20.8585 }, 11: { accountEquity: 20.7519 } } as never;
   const t = fleetTotals({ traders, stats });
-  /*
-   * 无快照时 fleetTotals 取组内**最大值**（见它的注释：宁可偏大也不显示 0）。
-   * 这里只钉"不是简单的取第一个"，具体策略由 fleetTotals 决定。
-   */
   assert.ok(
     t.accountEquityFleet >= 20.75,
     '★ 无快照时也要给出一个正值（不能是 0 或取到第一个的偶然值）',

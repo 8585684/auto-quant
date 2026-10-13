@@ -3,11 +3,12 @@ import { ModeBadge } from '../components/TeamRoster';
 import { Link, useNavigate } from 'react-router-dom';
 import * as PopoverPrimitive from '@radix-ui/react-popover';
 import { ArrowUpRight, MoreHorizontal, Pencil, Play, RotateCw, Square, Trash2 } from 'lucide-react';
-import type { TraderStatus } from '@aq/shared';
+import type { EquitySnapshot, TraderStatus } from '@aq/shared';
 import { api, type TraderRow } from '../lib/api';
 import { useApp, useEvents } from '../lib/store';
 import { useSummaries } from '../lib/summaries';
 import { committedCapitalOf, fleetTotals, groupTradersByAccount } from '../lib/fleetTotals';
+import { pairEquityByTrader } from '../lib/equityPairing';
 import { useDocumentTitle, usePolled } from '../lib/hooks';
 import { useRunOnce } from '../lib/actions';
 import { Button, ErrorNote, Modal, Panel, Spinner3, cn } from '../components/ui';
@@ -83,6 +84,44 @@ export function TradersPage() {
 
   const statsMap = useSummaries((s) => s.stats);
   const refreshMany = useSummaries((s) => s.refreshMany);
+
+  /*
+   * ══════════════════════════════════════════════════════════════════════════
+   *  ⚠️ **必须把快照喂给 `fleetTotals`，否则它只能"取最大值"兜底**
+   *      （2026-10-14 自查发现我上一轮修得不完整）
+   * ══════════════════════════════════════════════════════════════════════════
+   *
+   * 上一轮我把手算的 `.find()` 换成 `fleetTotals({ traders, stats })` ——
+   * **但没传 `snapshots`**。而 `fleetTotals` 拿不到快照时会走这条兜底：
+   * ```
+   *   const fromStats = group.reduce((max, t) => Math.max(max, stats[t.id]?.accountEquity ?? 0), 0);
+   * ```
+   * 「取组内最大值」在**账户亏损时会把旧的高点当成当前的钱** ——
+   * 正是 `latestAccountReading()` 的注释里点明要避免的那种错。
+   *
+   * 所以这里照搬 `OverviewPage` 的成熟做法（它一直是传快照的）：
+   * 两个来源合并 —— REST 的 `traderEquity` + socket 推来的新点。
+   *
+   * ⚠️ 间隔用 60 秒（不是 `traders` 的 4–8 秒）：快照只在**决策周期结束时**
+   * 写一次（分钟级），按列表的节奏轮询等于每个机器人都多花几倍请求去重画同一条线。
+   */
+  const equityQuery = usePolled<Record<number, EquitySnapshot[]>>(
+    async (signal) => {
+      const ids = traders.map((t) => t.id);
+      const pairs = await Promise.all(
+        ids.map(async (id) => ({ id, rows: await api.traderEquity(id, 360, signal) })),
+      );
+      return pairEquityByTrader(pairs);
+    },
+    { intervalMs: 60_000, enabled: traders.length > 0, deps: [traders.map((t) => t.id).join(',')] },
+  );
+  const equitySnapshots: Record<number, EquitySnapshot[]> = {};
+  for (const trader of traders) {
+    equitySnapshots[trader.id] = [
+      ...(equityQuery.data?.[trader.id] ?? []),
+      ...(liveByTrader[trader.id]?.equity ?? []),
+    ];
+  }
 
   const [newOpen, setNewOpen] = useState(false);
   const [startTarget, setStartTarget] = useState<TraderRow | null>(null);
@@ -165,7 +204,7 @@ export function TradersPage() {
    *（`docs/MAINTENANCE.md` §3.4 记的就是这一类）。
    * 所以不再"修对这份手算"，而是**让它调用共享库**。
    */
-  const fleetTotal = fleetTotals({ traders, stats: statsMap });
+  const fleetTotal = fleetTotals({ traders, stats: statsMap, snapshots: equitySnapshots });
   const totalEquity = fleetTotal.accountEquityFleet;
   const totalRealized = traders.reduce((sum, trader) => sum + (statsMap[trader.id]?.realizedPnl ?? 0), 0);
   const openPositions = traders.reduce((sum, trader) => sum + (statsMap[trader.id]?.openPositions ?? 0), 0);
