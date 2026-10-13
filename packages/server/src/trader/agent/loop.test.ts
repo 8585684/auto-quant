@@ -25,7 +25,6 @@ const config = (): StrategyConfig =>
   }) as StrategyConfig;
 
 function makeDeps() {
-  const pauses: string[] = [];
   const cycleIntervals: number[] = [];
   let current = config();
   const deps: AgentToolDeps = {
@@ -44,11 +43,11 @@ function makeDeps() {
       marketOverview: () => [{ symbol: 'BTCUSDT' }],
       skippedOutcomes: async () => ({}),
     },
-    /* 测试要能看到 AI 改周期这件事 —— 与 pauses 同一个形状。 */
+    /* 测试要能看到 AI 改周期这件事。 */
     cycleInterval: () => 3,
     setCycleInterval: (minutes) => { cycleIntervals.push(minutes); return { minutes, clamped: false }; },
   };
-  return { deps, pauses };
+  return { deps };
 }
 
 /** 按脚本逐轮回复的桩模型；脚本用完后再被调用会抛错（用来发现意外的额外调用）。 */

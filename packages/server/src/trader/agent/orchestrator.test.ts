@@ -81,7 +81,6 @@ function makePorts(over: Partial<OrchestratorPorts> = {}) {
   const settled: Array<{ id: number; trades: number; netPnl: number }> = [];
   const experiments: unknown[] = [];
   const runs: unknown[] = [];
-  const pauses: string[] = [];
   const cycleIntervals: number[] = [];
   const savedConfigs: unknown[] = [];
   let current = config();
@@ -121,13 +120,13 @@ function makePorts(over: Partial<OrchestratorPorts> = {}) {
     settleExperiment: (id, outcome) => settled.push({ id, ...outcome }),
     recordExperiment: (row) => experiments.push(row),
     recordRun: (row) => runs.push(row),
-    /* 测试要能看到 AI 改周期这件事 —— 与 pauses 同一个形状。 */
+    /* 测试要能看到 AI 改周期这件事。 */
     cycleInterval: () => 3,
     setCycleInterval: (minutes) => { cycleIntervals.push(minutes); return { minutes, clamped: false }; },
     ...over,
   };
 
-  return { ports, settled, experiments, runs, pauses, savedConfigs, configNow: () => current, quietFacts };
+  return { ports, settled, experiments, runs, savedConfigs, configNow: () => current, quietFacts };
 }
 
 function scripted(replies: string[]): LoopModel {
