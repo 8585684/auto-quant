@@ -826,6 +826,57 @@ export function TraderPage() {
   const windowFirst = windowed[0]?.equity ?? equity;
   const windowDelta = equity - windowFirst;
   const windowPercent = windowFirst !== 0 ? (windowDelta / Math.abs(windowFirst)) * 100 : 0;
+
+  /*
+   * ══════════════════════════════════════════════════════════════════════════
+   *  ⚠️ **账户口径的对照值**（2026-10-13 用户报"图表显示和实际账号对不上"）
+   * ══════════════════════════════════════════════════════════════════════════
+   *
+   * ## 用户看到的
+   *
+   * ```
+   *   指标卡「账户余额」 97.93  ·「交易盈亏」−$2.12（−2.11%）
+   *   图表「本段变化」          +$8.45（+8.44%）
+   *   → "图表显示和实际账号对不上"（用户原话）
+   * ```
+   * 差额 **10.55** = 同一个钱包上另外两个机器人（`#9` 已停、`#11` 团队测试）的亏损
+   * —— 它们亏的钱是**从同一个钱包扣的**，而这个机器人的归属权益只算它自己。
+   *
+   * ## 为什么两个数都对
+   *
+   * ```
+   *   equity           = initial_equity + Σ(本机器人已平仓净额)  ← 图表画的是这个
+   *   account_equity   = 共享钱包的真实权益                      ← 指标卡显示这个
+   * ```
+   * 见 `db/schema.ts` 的 `M4_ATTRIBUTED_EQUITY` 迁移说明。
+   *
+   * ## 为什么必须在**图表这一行**说，而不是只在下面的账户卡片里
+   *
+   * 下面那张「交易所账户」卡片确实显示了账户口径（`TraderPage` 里
+   * `lastKnownAccount` 那段就是为了这个）—— 但它**在图表的可视范围之外**，
+   * 而且它只说"钱包是多少"，**没有把差额归因到"同一钱包的其他机器人"**。
+   * 用户于是仍然要自己把两个数字相减、再猜为什么。
+   *
+   * ⚠️ 这里刻意算**同窗口**的账户权益对照（而不是直接给最新的账户权益）：
+   * 图表讲的是"这一段涨跌了多少"，拿一个不同时段的账户数字来比，
+   * 差额里会混进"时段不同"，反而更难解释。
+   */
+  const windowAccountFirst = windowed[0]?.accountEquity ?? 0;
+  const windowAccountLast =
+    windowed[windowed.length - 1]?.accountEquity ??
+    snapshots[snapshots.length - 1]?.accountEquity ??
+    0;
+  /*
+   * ⚠️ 只有"两个端点都真的有账户口径数据"时才算 ——
+   * 迁移前的旧行 `account_equity` 是回填的（见 schema.ts 的取舍说明），
+   * 而完全没有值时它是 `0`。拿 0 去算会得出一个巨大的假差额，
+   * 那比不显示更糟。
+   */
+  const hasAccountCompare =
+    windowAccountFirst > 0 && windowAccountLast > 0 && windowed.length >= 2;
+  const windowAccountDelta = hasAccountCompare ? windowAccountLast - windowAccountFirst : 0;
+  /* 归属与账户在这一段里的差额 —— 它就是"同钱包其他机器人"的贡献。 */
+  const attributedGap = hasAccountCompare ? windowDelta - windowAccountDelta : 0;
   /*
    * 默认展开（`chartOverride === null`）—— 不再看 `windowed` 有没有形状。
    * 理由见上面 `chartOverride` 的声明。
@@ -1944,6 +1995,18 @@ export function TraderPage() {
                   delta={windowDelta}
                   percent={windowPercent}
                   asset={settleAsset}
+                  account={
+                    hasAccountCompare
+                      ? {
+                          delta: windowAccountDelta,
+                          percent:
+                            windowAccountFirst !== 0
+                              ? (windowAccountDelta / Math.abs(windowAccountFirst)) * 100
+                              : 0,
+                          gap: attributedGap,
+                        }
+                      : null
+                  }
                 />
                 <DashboardEquityChart
                   snapshots={snapshots}
@@ -2372,30 +2435,95 @@ function EquityMiniStrip({
  * 正常运行时它既不是状态、也没有后果 —— 曲线上有多少个点，看曲线本身就知道。
  * 真正需要解释"为什么这条曲线这么稀"的时候（快照太少、或一条平线被收成一行），
  * 说明就在 `EquityMiniStrip` 的 `note` 里，那里是**带结论**的一句话。
+ *
+ * ## ⚠️ 2026-10-13：加上【账户口径】的对照行（用户报"图表和实际账号对不上"）
+ *
+ * 用户的原话：
+ * > 「图表上显示和实际账号对不上」
+ *
+ * 他看到的：
+ * ```
+ *   指标卡「账户余额」97.93 ·「交易盈亏」−$2.12（−2.11%）   ← 账户口径
+ *   图表「本段变化」        +$8.45（+8.44%）                ← 归属口径
+ * ```
+ * **两个数都对**，差额是他**同一个钱包上的另外两个机器人**的亏损 ——
+ * 但界面没说这件事，于是他只能得出"对不上"这个结论。
+ *
+ * 修法不是改数字（那会改错），而是**把两个口径并排放在一起，并把差额归因**：
+ * ```
+ *   本段变化 +$8.45（+8.44%） · 本机器人归属
+ *   同期账户 −$2.12（−2.11%） · 同一钱包含其他机器人
+ * ```
+ * ⚠️ 对照行**只在数据真的有两端时才显示** —— 旧快照的 `account_equity`
+ * 是回填值、缺值时是 `0`，拿 0 去算会得出一个巨大的假差额，那比不显示更糟。
  */
 function EquityWindowLine({
   equity,
   delta,
   percent,
   asset,
+  account,
 }: {
   equity: number;
   delta: number;
   percent: number;
   asset: string;
+  /**
+   * 同窗口的账户口径对照。`null` = 数据不足以对照（此时不显示第二行）。
+   *
+   * ```
+   *   accountDelta  —— 这一段里共享钱包的变化
+   *   gap           —— 归属 − 账户 = 同钱包其他机器人的贡献
+   * ```
+   */
+  account: { delta: number; percent: number; gap: number } | null;
 }) {
   return (
-    <div className="mb-2 flex flex-wrap items-baseline gap-x-3 gap-y-1 text-xs">
-      <span className="text-ink-lo" title="相对可见区间第一个快照的变化。">
-        本段变化
-      </span>
-      <span className={cn('num text-base font-semibold', pnlColor(delta))}>
-        {fmtUsdSigned(delta, 2)} {asset}
-      </span>
-      <span className={cn('num', pnlColor(delta))}>({fmtPercent(percent)})</span>
-      {/* `equity` 只用来兜底没有快照时的比较基准，与图表内部口径一致；
-          它是给屏幕阅读器的，不占视觉位置。 */}
-      <span className="sr-only">当前归属权益 {fmtNum(equity, 2)}</span>
+    <div className="mb-2 space-y-1 text-xs">
+      <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
+        <span
+          className="text-ink-lo"
+          title="相对可见区间第一个快照的变化。只算【这个机器人自己】已平仓的净盈亏。"
+        >
+          本段变化
+        </span>
+        <span className={cn('num text-base font-semibold', pnlColor(delta))}>
+          {fmtUsdSigned(delta, 2)} {asset}
+        </span>
+        <span className={cn('num', pnlColor(delta))}>({fmtPercent(percent)})</span>
+        <span className="text-ink-faint">本机器人归属</span>
+        {/* `equity` 只用来兜底没有快照时的比较基准，与图表内部口径一致；
+            它是给屏幕阅读器的，不占视觉位置。 */}
+        <span className="sr-only">当前归属权益 {fmtNum(equity, 2)}</span>
+      </div>
+
+      {account ? (
+        <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
+          <span className="text-ink-lo" title="同一个交易所钱包在这一段里的实际变化，含同账户上其他机器人的盈亏。">
+            同期账户
+          </span>
+          <span className={cn('num', pnlColor(account.delta))}>
+            {fmtUsdSigned(account.delta, 2)} {asset}
+          </span>
+          <span className={cn('num text-ink-lo', pnlColor(account.delta))}>
+            ({fmtPercent(account.percent)})
+          </span>
+          <span className="text-ink-faint">
+            同一钱包含其他机器人
+            {Math.abs(account.gap) >= 0.01 ? (
+              /*
+               * ⚠️ 把差额**归因**，而不是只报一个差数 ——
+               * "差 10.55" 本身又是一个要用户自己想的问题。
+               *
+               * ⚠️ 文案里**不要再写一遍"多/少"**：`fmtUsdSigned` 已经带符号，
+               * 写成"比…多 +$21.31"会让"多"与"+"重复（实测第一版就是这样）。
+               * 差额为正 = 本机器人归属跑赢了同账户的其他机器人。
+               */
+              <>（本机器人跑赢同账户其他机器人 {fmtUsdSigned(account.gap, 2)}）</>
+            ) : null}
+          </span>
+        </div>
+      ) : null}
     </div>
   );
 }
