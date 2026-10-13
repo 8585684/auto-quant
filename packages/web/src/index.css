@@ -222,6 +222,74 @@
 
 @layer components {
   /*
+   * ══════════════════════════════════════════════════════════════════════════
+   *  ⚠️⚠️ **`.sr-only` 必须锚定到包含块左上角**（2026-10-13 实测抓到的真 BUG）
+   * ══════════════════════════════════════════════════════════════════════════
+   *
+   * ## 事故：整页多出一条 87px 的滚动
+   *
+   * 用户报的是「第三套皮肤（静谧/quill）页面错位」。实测（1600×900）：
+   * ```
+   *   classic   html.scrollHeight = 900  ✅ 不可滚
+   *   console   html.scrollHeight = 900  ✅ 不可滚
+   *   quill     html.scrollHeight = **987**  ❌ 能滚 87px
+   * ```
+   * 决定性判据不是 `scrollHeight`（它可能虚报），而是
+   * **`window.scrollTo(0, 99999)` 之后 `scrollY = 87`** —— 页面真的能滚，真 BUG。
+   *
+   * ## 根因：Tailwind 的 `.sr-only` 没有 `top` / `left`
+   *
+   * ```css
+   *   .sr-only { position: absolute; width: 1px; height: 1px; margin: -1px; … }
+   *                   ↑ 没有 top / left
+   * ```
+   * 一个"绝对定位但没有 `top`/`left`"的元素会**停留在它在文档流里的静态位置**
+   *（CSS 2.1 §10.3.7 的 static position 规则）。
+   *
+   * 这本来是 `.sr-only` 的**设计意图**（"留在原位、只是看不见"），
+   * 但它有一个前言：**它的包含块得是某个有定位的祖先**。
+   * 本页的 `<h2 class="sr-only">` 祖先链上**没有任何 `position` 非 static 的元素**，
+   * 所以包含块是**初始包含块**（视口大小）——
+   * 而它的静态位置在 quill 的布局下是 `top: 950`（内容被 `q-pad` 的 flex 列推后了），
+   * 于是它把 `html` 的 `scrollHeight` 撑到了 **987**。
+   *
+   * 实测对应关系（`.sr-only` 元素的最大 `bottom` 与 `html.scrollHeight`）：
+   * ```
+   *   classic   sr-only 最靠下 859  → html 900
+   *   console   sr-only 最靠下 876  → html 900
+   *   quill     sr-only 最靠下 987  → html **987**   ← 完全对应
+   * ```
+   *
+   * ## 为什么 `overflow: hidden` 挡不住它
+   *
+   * 实测给 `.q-root` / `body` 加 `overflow: hidden` **完全无效**。
+   * 因为绝对定位元素的包含块是**初始包含块**时，
+   * 它**逃出了所有 overflow 祖先的裁剪** —— 那些祖先根本不是它的包含块。
+   *
+   * ## 修法：`top: 0; left: 0`
+   *
+   * 把它**明确锚定到包含块的左上角**，它就不再"滞留在文档流的某个越界位置"。
+   * 这是各类 CSS reset / a11y 工具库的**标准 `sr-only` 写法**
+   *（Normalize、Bootstrap、GitHub 的 `.sr-only` 都带这两条）。
+   *
+   * ## 为什么不改那一个 `<h2>`
+   *
+   * 因为**这是 `.sr-only` 这个写法本身的缺陷**，不是某一个 `<h2>` 的问题：
+   * 全项目有 10 处在用它。只修一处，下一个用 `sr-only` 的地方会再犯一次 ——
+   * 而"下次是谁踩到"取决于布局把它推到哪，**看不出来、也不会报错**。
+   *
+   * ## 验证（三套皮肤 × 全部路由）
+   * ```
+   *   加 top:0;left:0 后：quill 987→900（可滚 87→0）
+   *                        classic / console 保持 900（无回归）
+   * ```
+   */
+  .sr-only {
+    top: 0;
+    left: 0;
+  }
+
+  /*
    * 页面内边距。
    *
    * 原来每个页面各自写 p-4（16px）。在 1448px 宽下就已经**贴到屏幕边缘**，
