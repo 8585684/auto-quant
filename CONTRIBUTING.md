@@ -39,7 +39,7 @@ npm test
 
 | 项目 | 状态 |
 |---|---|
-| CI（类型检查 / Lint / 测试 / 构建 / 密钥扫描） | ✅ 每次 PR 与 push main 都跑（`.github/workflows/ci.yml`）|
+| CI（类型检查 / Lint / 文档链接 / 接口一致性 / 测试 / 构建 / 密钥扫描） | ✅ 每次 PR 与 push main 都跑（`.github/workflows/ci.yml`）|
 | PR 自动打标签（路径 + 标题前缀） | ✅ 仅在 PR 上跑（`.github/workflows/pr-labeler.yml`）|
 | 发布说明草稿（release-drafter） | ✅ 合入 main 时增量重算（`.github/workflows/release-drafter.yml`）|
 | Docker 镜像 | ✅ push main 与 `v*` 标签时构建（`.github/workflows/docker-publish.yml`）|
