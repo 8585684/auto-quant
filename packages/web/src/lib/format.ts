@@ -34,9 +34,59 @@ export function isNum(value: unknown): value is number {
 export function fmtNum(value: number | null | undefined, digits = 2): string {
   if (!isNum(value)) return '—';
   const abs = Math.abs(value);
-  if (abs >= 1_000_000_000) return `${(value / 1_000_000_000).toFixed(2)}B`;
-  if (abs >= 1_000_000) return `${(value / 1_000_000).toFixed(2)}M`;
-  if (abs >= 100_000) return `${(value / 1000).toFixed(1)}K`;
+  /*
+   * ⚠️ **档位按原值选，但取整成"下一档的 1000 倍"时进位**（外部 issue #158）。
+   *
+   * 原实现是"先按阈值选后缀、再对商取整"：
+   *
+   *     if (abs >= 100_000) return `${(value / 1000).toFixed(1)}K`;
+   *
+   * 于是 `999_950 / 1000 = 999.95` → `toFixed(1)` → **`1000.0`** → 屏幕上写
+   * `1000.0K`；`999_995_000` 同理写成 `1000.00M`。
+   *
+   * 这不是"舍入误差"，而是一个**自相矛盾的数字**：它已经够到下一档，
+   * 却以"上一档的 1000 倍"显示 —— 操作员一眼知道不对，却不知道该信哪个。
+   * `scripts/ui-consistency.mjs` 的头部注释记录的正是这一类
+   *「数据两边都对、拼起来自相矛盾」的界面问题。
+   *
+   * ## 为什么不是"拿取整后的值去判档位"
+   *
+   * 那样会把 `999_949`（`0.999949M` → 取整 `1.00`）也推进 M 档 ——
+   * 而它显示 `999.9K` 本来是对的。**改动面会从"每个档位的最后 0.05%"
+   * 扩大到"再往前 0.005%"**，属于没必要的扩大。
+   *
+   * 所以只做最小修正：**该档的显示值一旦取整到 >= 1000（即进位到下一档的量级），
+   * 就换用下一档输出**。非边界值的行为逐字节不变。
+   *
+   * ## 为什么逐档判断而不是统一算一次
+   *
+   * 三档的小数位数不同（B/M 两位、K 一位），`999_995_000` 在 M 档两位小数下
+   * 取整成 `1000.00`、但在 K 档一位下是 `999995.0` —— 判据必须用**该档自己的精度**。
+   */
+  if (abs >= 1_000_000_000) {
+    /*
+     * ⚠️ **B 档之上不再进位 —— 万亿级没有 T 档，而它在本产品里不会出现。**
+     *
+     * `fmtNum` 的输入是成交量、账户权益、数量这类量。这个项目里达到**万亿**
+     * 意味着模型合约账户里有 1 万亿美元，那不是"要修的显示问题"而是"经济已经崩了"。
+     *
+     * 所以这里不做 `>= 1000 → T` 的进位：引入一个永远走不到的档位，
+     * 等于多一段没人验证过的代码（本仓库对"没有消费者的分支"有成文的警惕）。
+     * 边界值（`999_999_000_000` 以上）会显示成 `1000.00B` —— 语义上仍然正确
+     * （它确实是 1 万亿），只是没有更短的后缀可用。
+     */
+    return `${(value / 1_000_000_000).toFixed(2)}B`;
+  }
+  if (abs >= 1_000_000) {
+    const rendered = (value / 1_000_000).toFixed(2);
+    if (Math.abs(Number(rendered)) >= 1000) return `${(value / 1_000_000_000).toFixed(2)}B`;
+    return `${rendered}M`;
+  }
+  if (abs >= 100_000) {
+    const rendered = (value / 1000).toFixed(1);
+    if (Math.abs(Number(rendered)) >= 1000) return `${(value / 1_000_000).toFixed(2)}M`;
+    return `${rendered}K`;
+  }
   return value.toLocaleString('en-US', { minimumFractionDigits: digits, maximumFractionDigits: digits });
 }
 
