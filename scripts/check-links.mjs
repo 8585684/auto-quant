@@ -15,6 +15,7 @@
  * 用法：node scripts/check-links.mjs
  */
 
+import { spawnSync } from 'node:child_process';
 import { readFileSync, readdirSync, existsSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -23,6 +24,25 @@ const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..
 
 /** 跳过这些目录：依赖、版本控制、以及大体积的第三方文档副本。 */
 const SKIP_DIRS = new Set(['node_modules', '.git', 'vendor', 'dist', '.github']);
+
+/**
+ * 被 gitignore 的路径不查 —— 它们不属于这个仓库。
+ *
+ * ## 为什么需要它（实测）
+ *
+ * `.claude/` 下是 AI 会话的草稿（issue 原文、笔记），`.gitignore` 明确忽略它
+ * （「完整的对话历史……极易被无意识地提交」）。而本脚本按目录名递归，于是把草稿里的
+ * `../blob/main/xxx#L745` 当成仓库坏链报出来 —— 那些错误**与仓库无关**，
+ * 却让检查退出码 1。
+ *
+ * 坏处有两层：① 污染"发现 N 个坏链"这个数字，真的坏链被埋在里面；
+ * ② 想让检查通过的人被迫去改**不属于项目的文件**，或者干脆忽略整个检查。
+ *
+ * 用 gitignore 裁、而不是把 `.claude` 加进 `SKIP_DIRS`：后者只治今天这一例，
+ * 而"被忽略的目录里有 markdown"是一类问题（`.cursor/`、`.continue/`、`.dsh/`
+ * 也都在 `.gitignore` 里）。判据是"它进不进版本库"，不是"它叫什么名字"。
+ */
+const SKIP_GITIGNORED = true;
 
 /** 不算链接目标的写法。 */
 const SKIP_TARGET = /^(?:https?:|mailto:|tel:|#|data:)/;
@@ -41,8 +61,56 @@ function collectMarkdown(dir, out = []) {
   return out;
 }
 
+/**
+ * 一次性问 git：这些文件里哪些被 ignore，返回其中被忽略的那些（绝对值）。
+ *
+ * 用 `git check-ignore --stdin` 批量问，而不是每个文件起一次进程 ——
+ * 仓库里几十个 markdown，逐个问会是几十次 fork。
+ *
+ * ⚠️ 三个坑，都踩过：
+ *
+ *   · **喂相对路径**：喂绝对路径会让 git 在 Windows 上把 `/c/...` 的 `/c`
+ *     当成一个路径段，报 `fatal: Invalid path '/c'`，一条都问不出来。
+ *   · **必须关掉路径引号**：git 默认给路径加引号并转义反斜杠
+ *     （`core.quotePath`），输出长成 `".claude\\issue-drafts\\issue1.md"`，
+ *     与 `path.relative()` 给出的 `.claude/issue-drafts/issue1.md`
+ *     **永远匹配不上** —— 过滤会静默失效（表现为"改了却没效果"）。
+ *   · **不要用 `-z`**：`-z` 只作用于输出。带 `-z` 时 git 会把整行输入
+ *     当成一个路径名，实测两个文件里**两个都被判成已忽略**（包括没被忽略的
+ *     `README.md`）—— 那会把整个仓库都跳过，检查变成空转。
+ *     正确做法是 `git -c core.quotePath=false check-ignore --stdin`：
+ *     输出保持一行一路径、正斜杠、无引号，输入按换行分隔照常解析。
+ *
+ * 问不出来（不在 git 仓库里、git 不在 PATH 上）就**当作没有忽略规则**：
+ * 这个检查不该因为环境问题而失效，退回"全都查"与改动前行为一致。
+ */
+function ignoredByGit(files) {
+  if (!SKIP_GITIGNORED || files.length === 0) return new Set();
+  const relativeOf = (file) => path.relative(REPO_ROOT, file).split(path.sep).join('/');
+  try {
+    const result = spawnSync('git', ['-c', 'core.quotePath=false', 'check-ignore', '--stdin'], {
+      cwd: REPO_ROOT,
+      input: `${files.map(relativeOf).join('\n')}\n`,
+      encoding: 'utf8',
+    });
+    // 退出码 1 = 没有任何一个被忽略，那是正常答案，不是错误。
+    if (result.status !== 0 && result.status !== 1) return new Set();
+    const ignored = new Set(
+      (result.stdout || '')
+        .split('\n')
+        .map((line) => line.trim())
+        .filter(Boolean),
+    );
+    return new Set(files.filter((file) => ignored.has(relativeOf(file))));
+  } catch {
+    return new Set();
+  }
+}
+
 function main() {
-  const files = collectMarkdown(REPO_ROOT);
+  const found = collectMarkdown(REPO_ROOT);
+  const ignored = ignoredByGit(found);
+  const files = found.filter((file) => !ignored.has(file));
   const broken = [];
   let checked = 0;
 
