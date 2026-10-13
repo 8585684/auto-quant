@@ -10,6 +10,7 @@ import type { BinanceEnvironment } from '../binance/endpoints.js';
 import { BinanceUserDataStream } from '../binance/ws.js';
 import type { Vault } from '../crypto/vault.js';
 import { mkdirSync } from 'node:fs';
+import { cpus } from 'node:os';
 import { createLogger } from '../logger.js';
 import { env } from '../env.js';
 import { MarketDataService } from '../market/service.js';
@@ -560,6 +561,70 @@ export function stopResearchRefresher(traderId: number): void {
 }
 
 /**
+ * **猎手并发数** —— 由 CPU 核数推导，**两处调研共用这一个**。
+ *
+ * ## 为什么抽成函数（2026-10-13）
+ *
+ * 实测发现**同一个硬编码的 `|| 2` 在文件里出现了两处**
+ *（L635 的 `refreshResearch` 与 L1614 的另一条调研路径）——
+ * 我只改了第一处，而**测试当场抓到了第二处**（那条断言是全文匹配的）。
+ *
+ * 这正是"同一个算术写在两个地方"的典型代价：改一处等于没改。
+ * 所以抽成**唯一**的实现。
+ *
+ * ## 取值
+ *
+ * ```
+ *   AQ_HUNTER_CONCURRENCY 显式设置 → 用它
+ *   否则 → min(3, max(1, floor(核数 / 2)))
+ *     2 核 → 1（串行）· 4 核 → 2 · 8 核以上 → 3（封顶）
+ * ```
+ *
+ * ## 为什么默认是 1 而不是 2（实测）
+ *
+ * ```
+ *   单独实测一个猎手任务： ok=true 耗时 **92.7 秒**
+ *   线上并发跑四个：        **3 个未产出**（每个"超过 600 秒未返回"）
+ * ```
+ * 服务器只有 **2 核 / 1971MB（可用 822MB）**，而每个猎手是
+ * **一整个 claude code 进程**（150–250MB，自带 node 运行时）。
+ * 2 核切成 5–6 份 → 每个慢 6 倍以上 → 全部超时。
+ *
+ * ⚠️ 而代价是**不对称的**：
+ * ```
+ *   慢 6 分钟（串行）→ 调研在【后台】跑，决策不等它 → 没有代价
+ *   全部超时        → 团队永远拿不到新闻 → 功能失效
+ * ```
+ * 实测裁决官的原话：「材料**无新闻、无情绪**……数据不足无法判断」。
+ */
+function hunterConcurrency(): number {
+  const explicit = Number(process.env.AQ_HUNTER_CONCURRENCY ?? '');
+  if (Number.isFinite(explicit) && explicit >= 1) return Math.floor(explicit);
+  const cores = (() => {
+    try {
+      return Math.max(1, cpus().length);
+    } catch {
+      return 1;
+    }
+  })();
+  return Math.min(3, Math.max(1, Math.floor(cores / 2)));
+}
+
+/**
+ * **猎手超时**（毫秒）—— 同样两处共用。
+ *
+ * ⚠️ 原来两处**不一致**：`refreshResearch` 是 600 秒，另一条路径是 240 秒。
+ * 而 240 秒**小于实测的单猎手耗时上界**（单独 92.7 秒，但并发时会成倍拉长）——
+ * 那条路径的猎手实际上更容易全部超时。
+ *
+ * 600 秒的依据：实测单猎手 92.7–197 秒；留 3 倍余量以吸收并发抖动。
+ */
+function hunterTimeoutMs(): number {
+  const v = Number(process.env.AQ_RESEARCH_TIMEOUT_MS ?? '');
+  return Number.isFinite(v) && v > 0 ? v : 600_000;
+}
+
+/**
  * **真正跑一次四猎手调研**，把结果写进 `researchCache`。
  *
  * ⚠️ 它**不抛错**（调用方已经 catch）—— 后台任务失败不该影响任何东西。
@@ -580,14 +645,18 @@ async function refreshResearch(
   const { parseIntelReport } = await import('./intel/parseIntel.js');
   const { rankIntel } = await import('./intel/freshness.js');
 
-  const limit = Math.max(1, Number(process.env.AQ_HUNTER_CONCURRENCY ?? '') || 2);
   /*
-   * ⚠️ 超时给到 **600 秒**（原来 240 秒）。
-   *
-   * 实测：单猎手约 197 秒，而**两个并发时每个都超过 240 秒** → 四个全部超时。
-   * 后台任务不再有"拖慢决策"的顾虑（决策不等它），所以**给足时间**是对的取舍。
+   * ⚠️ 并发数与超时都走**共用函数**（`hunterConcurrency()` / `hunterTimeoutMs()`）——
+   * 它们的完整依据写在函数上方。抽出来的原因见那里：
+   * **同一个硬编码的 `|| 2` 在这个文件里出现过两处**，改一处等于没改。
    */
-  const timeoutMs = Number(process.env.AQ_RESEARCH_TIMEOUT_MS ?? 600_000);
+  const limit = hunterConcurrency();
+  const timeoutMs = hunterTimeoutMs();
+  /*
+   * ⚠️ 超时走 `hunterTimeoutMs()` —— 依据写在它上方。
+   * （这里原来还有一个 `?? 600_000` 的副本，与并发数那次是同一个教训：
+   *   **同一个算术写在两个地方，改一处等于没改**。）
+   */
 
   const results = await mapConcurrent(HUNTERS, limit, async (hunter) => {
     /* ⚠️ 每个猎手一个独立 workdir/HOME —— 共用会让并发实例争用 ~/.claude。 */
@@ -1556,8 +1625,8 @@ export class TraderManager {
          * "**那个来源上什么都没有**" —— 而那是两件完全不同的事
          *（"社区没有讨论" vs "社区猎手挂了"）。
          */
-        const hunterLimit = Math.max(1, Number(process.env.AQ_HUNTER_CONCURRENCY ?? '') || 2);
-        const hunterTimeout = Number(process.env.AQ_RESEARCH_TIMEOUT_MS ?? 240_000);
+        const hunterLimit = hunterConcurrency();
+        const hunterTimeout = hunterTimeoutMs();
         /*
          * ⚠️ **每个猎手一个独立的工作目录**（2026-10-13 实测后加）。
          *
