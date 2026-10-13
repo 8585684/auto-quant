@@ -121,3 +121,9 @@ _ui-directions.html
 
 # 本地 UI 自查脚本与截图（不进版本库）
 .ui-lab/
+
+# 一次性的本地探针 / 调试脚本（不属于项目产物）
+.aqtest/
+packages/server/src/tmpprobe/
+probe*.ts
+probe*.mjs
