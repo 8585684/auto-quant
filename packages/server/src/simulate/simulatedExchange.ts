@@ -664,6 +664,48 @@ export class SimulatedExchange {
   }
 
   /**
+   * 一张**仍在挂**的保护单（`algoStatus: NEW`）的线格式响应。
+   *
+   * `#1 getAlgoOrder` 的在途分支与 `#3 getOpenAlgoOrders` 逐字相同 —— 两处都在把
+   * `position.protection` 里的某条记录投影成响应。抽成一个工厂，是为了让这个形状
+   * **只有一处**可以改：币安的 algo 响应字段一旦和这里漂移，模拟器就会对交易循环
+   * 说谎，而它偏偏是保护单是否挂上、是否触发这条"踩了会亏钱"路径的唯一离线判据
+   * （`npm run sim` 的前几项校验全靠它）。
+   *
+   * 与**终态**响应（`getAlgoOrder` 里走 `resolvedAlgo` 那条）刻意不同：那一支
+   * 的 `orderType`/`side`/`algoStatus`/`triggerPrice`/`triggerTime` 都是另一回事
+   * （单子已经不在这张持仓上、状态是 FINISHED/TRIGGERED/CANCELED），
+   * 所以它保持显式，不塞进同一个工厂当参数 —— 那是过度抽象。
+   */
+  private restingAlgoView(
+    algoId: number,
+    position: SimPosition,
+    order: { kind: 'STOP_MARKET' | 'TAKE_PROFIT_MARKET'; triggerPrice: number },
+  ): BinanceAlgoOrderResponse {
+    return {
+      algoId,
+      clientAlgoId: String(algoId),
+      algoType: 'CONDITIONAL',
+      orderType: order.kind,
+      symbol: position.symbol,
+      side: position.side === 'long' ? 'SELL' : 'BUY',
+      positionSide: 'BOTH',
+      timeInForce: 'GTC',
+      quantity: '0',
+      algoStatus: 'NEW',
+      triggerPrice: String(order.triggerPrice),
+      price: '0',
+      closePosition: true,
+      reduceOnly: false,
+      workingType: 'MARK_PRICE',
+      priceProtect: true,
+      createTime: this.now,
+      updateTime: this.now,
+      triggerTime: 0,
+    };
+  }
+
+  /**
    * Query one algo order by id, including ones that are no longer open.
    *
    * This is what lets the trading loop distinguish "the stop fired" from "the
@@ -675,27 +717,7 @@ export class SimulatedExchange {
     for (const position of this.positions.values()) {
       const order = position.protection.get(id);
       if (!order) continue;
-      return {
-        algoId,
-        clientAlgoId: id,
-        algoType: 'CONDITIONAL',
-        orderType: order.kind,
-        symbol: position.symbol,
-        side: position.side === 'long' ? 'SELL' : 'BUY',
-        positionSide: 'BOTH',
-        timeInForce: 'GTC',
-        quantity: '0',
-        algoStatus: 'NEW',
-        triggerPrice: String(order.triggerPrice),
-        price: '0',
-        closePosition: true,
-        reduceOnly: false,
-        workingType: 'MARK_PRICE',
-        priceProtect: true,
-        createTime: this.now,
-        updateTime: this.now,
-        triggerTime: 0,
-      };
+      return this.restingAlgoView(algoId, position, order);
     }
 
     const resolved = this.resolvedAlgo.get(id);
@@ -744,27 +766,7 @@ export class SimulatedExchange {
     for (const position of this.positions.values()) {
       if (symbol && position.symbol !== symbol) continue;
       for (const [id, order] of position.protection) {
-        rows.push({
-          algoId: Number(id),
-          clientAlgoId: id,
-          algoType: 'CONDITIONAL',
-          orderType: order.kind,
-          symbol: position.symbol,
-          side: position.side === 'long' ? 'SELL' : 'BUY',
-          positionSide: 'BOTH',
-          timeInForce: 'GTC',
-          quantity: '0',
-          algoStatus: 'NEW',
-          triggerPrice: String(order.triggerPrice),
-          price: '0',
-          closePosition: true,
-          reduceOnly: false,
-          workingType: 'MARK_PRICE',
-          priceProtect: true,
-          createTime: this.now,
-          updateTime: this.now,
-          triggerTime: 0,
-        });
+        rows.push(this.restingAlgoView(Number(id), position, order));
       }
     }
     return rows;
