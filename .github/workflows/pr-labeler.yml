@@ -63,6 +63,21 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           PR_TITLE: ${{ github.event.pull_request.title }}
+          # ⚠️ **必须显式给出仓库**：本工作流刻意**不 checkout**（见上面那段说明：
+          # 避免让带写权限的 `pull_request_target` 接触 PR 分支内容），
+          # 而 runner 上因此**没有 `.git` 目录** —— `gh` 在那种情况下会去问 git
+          # 自己身在哪个仓库，然后失败：
+          #
+          #     failed to run git: fatal: not a git repository …
+          #
+          # 而这条步骤**只有 `feat` / `fix` / `perf` / `docs` 前缀才会走到
+          # `gh pr edit`**（其余前缀不映射标签、不调 gh），所以症状极隐蔽：
+          # `refactor:` / `ci:` 的 PR 一切正常，而**恰恰最该打标签的 `fix:` / `feat:`
+          # 全部失败** —— 于是 release-drafter 收不到 `bug` / `enhancement` 标签，
+          # 发布说明把它们全归进「🔧 其他」。
+          #
+          # `GH_REPO` 是 `gh` 官方支持的"不依赖本地 git 仓库"的指定方式。
+          GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           echo "标题：$PR_TITLE"
