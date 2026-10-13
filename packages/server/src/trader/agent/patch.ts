@@ -101,6 +101,63 @@ const STRUCTURAL_INVARIANTS: ReadonlyArray<{
 /*  工具                                                                       */
 /* -------------------------------------------------------------------------- */
 
+/**
+ * **把 `"a.b.c": v` 形式的键展开成嵌套对象**（2026-10-13）。
+ *
+ * 见 `applyAgentPatch` 里那段说明：`set_params` 的工具文档推荐点号写法
+ *（`riskControl.*`），而按字面键名过滤会把整条静默丢弃。
+ *
+ * ## 语义
+ *
+ * ```
+ *   {"riskControl.minPositionSize": 5}          → { riskControl: { minPositionSize: 5 } }
+ *   {"a.b": 1, "a.c": 2}                        → { a: { b: 1, c: 2 } }   （合并，不互相覆盖）
+ *   {"a": {"b": 1}, "a.c": 2}                   → { a: { b: 1, c: 2 } }   （两种写法混用也可以）
+ * ```
+ *
+ * ⚠️ **只处理"含点"的键**，不含点的键原样保留（绝大多数补丁都是嵌套写法，
+ * 这条路径对它们是零影响的 —— 那是"旧行为逐字节不变"的要求）。
+ *
+ * ⚠️ **不覆盖已有值**：若 `{"a": {...}}` 与 `{"a.b": v}` 同时出现，
+ * 后者写进前者里面；若两者写同一个叶子，**嵌套写法优先**
+ *（它是更明确的表达，而且先出现）。
+ */
+function expandDottedKeys(patch: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  /* ① 先放不含点的键（原样）。 */
+  for (const [key, value] of Object.entries(patch)) {
+    if (!key.includes('.')) out[key] = value;
+  }
+  /* ② 再把含点的键写进去。 */
+  for (const [key, value] of Object.entries(patch)) {
+    if (!key.includes('.')) continue;
+    const parts = key.split('.');
+    /*
+     * ⚠️ 空段（`"a..b"` / `".a"` / `"a."`）是坏输入 → 跳过这一个键，
+     * 而不是整条拒绝。理由与"多认格式"一致：一个坏键不该让整个补丁作废。
+     */
+    if (parts.some((p) => p.length === 0)) continue;
+    let node = out;
+    let ok = true;
+    for (const part of parts.slice(0, -1)) {
+      const next = node[part];
+      if (next === undefined) {
+        node[part] = {};
+      } else if (typeof next !== 'object' || next === null || Array.isArray(next)) {
+        /* 与一个非对象值冲突（`{"a": 1, "a.b": 2}`）→ 跳过这个键。 */
+        ok = false;
+        break;
+      }
+      node = node[part] as Record<string, unknown>;
+    }
+    if (!ok) continue;
+    const leaf = parts[parts.length - 1] as string;
+    /* ⚠️ 嵌套写法优先 —— 不覆盖已经由 ① 放好的值。 */
+    if (!(leaf in node)) node[leaf] = value;
+  }
+  return out;
+}
+
 /** 只取 `source` 里在 `target` 中也存在的键，并递归进去。 */
 function pickKnown(target: unknown, source: unknown): unknown {
   if (
@@ -205,7 +262,43 @@ export function applyAgentPatch(current: StrategyConfig, patch: unknown): AgentP
 
   // 1. 只留已知字段。未知字段静默丢弃是**故意的**：配置的形状由 schema 决定，
   //    不由模型决定；把未知字段带进去只会让 zod 报一个与真实错误无关的错。
-  const known = pickKnown(current, patch) as Record<string, unknown>;
+  //
+  //    ── ⚠️⚠️ **但"点号路径"必须先展开**（2026-10-13 修一个真 BUG）──────────
+  //
+  //    ## 事故：模型改了参数、以为成功了、实际被静默丢弃
+  //
+  //    `set_params` 的**工具说明里写的就是点号写法**（原文）：
+  //    ```
+  //      Adjustable: coin selection (coinSource.*), indicators (indicators.*),
+  //                  how much you risk (riskControl.*, throttle.*, circuitBreaker.*)
+  //    ```
+  //    而 `pickKnown` 是按**字面键名**过滤的 —— `"riskControl.minPositionSize"`
+  //    在配置对象里不是键（真正的键是嵌套的 `riskControl`）→ **整条丢弃**。
+  //
+  //    实测（`#11` 的策略师，实验记录 `#79`）：
+  //    ```
+  //      patch_json:   {"riskControl.minPositionSize": 5}
+  //      applied_json: minPositionSize = **12**      ← 没改！
+  //      clamps_json:  []                            ← 也没有"被钳制"的记录
+  //      reason: "DEADLOCK CONFIRMED: minPositionSize(12) > max achievable
+  //               notional(equity 20.75 × positionValueRatio 50% = 10.375)"
+  //    ```
+  //    **它正确地诊断出了死锁、给出了正确的修复、然后那个修复被静默丢掉。**
+  //    这是最坏的一类失败：**它告诉模型成功了。**
+  //
+  //    ## 修法：把点号键展开成嵌套，两种写法都接受
+  //
+  //    ```
+  //      {"riskControl.minPositionSize": 5}        → 展开为嵌套 ✅
+  //      {"riskControl": {"minPositionSize": 5}}   → 原样 ✅
+  //    ```
+  //    ⚠️ **多认格式、不放宽语义** —— 这与本项目里 `set_params` 的
+  //    "也接受平铺字段"、`screen_symbols` 的"多格式识别"是同一条原则：
+  //    模型换一种等价写法不该让整条调用作废。
+  //    ⚠️ 展开发生在 `pickKnown` **之前**，所以未知字段**仍然**会被丢弃
+  //    （安全性不变）。
+  const normalized = expandDottedKeys(patch as Record<string, unknown>);
+  const known = pickKnown(current, normalized) as Record<string, unknown>;
 
   // 2. 结构性不变量。必须在 zod 之前 —— 即使 schema 允许它被改成 false，
   //    这里也要把它按住。
