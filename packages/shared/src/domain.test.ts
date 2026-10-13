@@ -20,6 +20,8 @@ import test from 'node:test';
 
 import {
   beijingDayStartIso,
+  CLOSE_REASON_LABELS,
+  CLOSE_REASONS,
   closeReasonLabel,
   exchangeErrorCode,
   exchangeErrorLabel,
@@ -208,6 +210,51 @@ test('只有止损那一种原因会分叉 —— 止盈与其它原因不受盈
   assert.equal(closeReasonLabel('model_decision', -0.5), '模型主动平仓');
   /* 未知机器码原样返回 —— 库里可能读到迁移前留下的值。 */
   assert.equal(closeReasonLabel('some_future_code', 0.5), 'some_future_code');
+});
+
+test('★★★ 每一个 CLOSE_REASONS 成员都必须有中文标签 —— 否则界面渲染出裸机器码', () => {
+  /*
+   * ## 这个测试防的是什么（外部 issue #138）
+   *
+   * `reconcileTradeHistory()` 对「方向字段不可信、金额取自交易所流水」的补录回合
+   * 写入 `closeReason: 'reconciled_reversed'`（`autoTrader.ts:6056`），
+   * 而那个码**不在 `CLOSE_REASONS` 里**、`CLOSE_REASON_LABELS` 也没有它。
+   *
+   * 于是控制台的「平仓原因」列渲染成**未翻译的英文机器码**：
+   *
+   *     reconciled_reversed      ← 操作员看不懂这是什么
+   *
+   * 而 `docs/MODULES.md` 配方 5 白纸黑字写着「加一个平仓原因，
+   * `CLOSE_REASONS` 与 `CLOSE_REASON_LABELS` 必须同时加」—— 这正是
+   * **本该拦住它的机制**，只是缺一条把它变成可执行断言的测试。
+   *
+   * ## 为什么这条断言要写成「穷尽」而不是逐个列
+   *
+   * 逐个列（`assert.equal(closeReasonLabel('reconciled'), '…')`）只能证明
+   * **今天**这几个有标签；将来加第 10 个原因时，写它的人只要忘了同步，
+   * 这条测试照样绿。穷尽遍历则让"新原因漏了标签"当场变红 ——
+   * 与 `simulate.ts:805` 用权威名单做校验是同一个思路（同一份常量，不再各写一份）。
+   */
+  for (const reason of CLOSE_REASONS) {
+    const label = CLOSE_REASON_LABELS[reason];
+    assert.ok(
+      typeof label === 'string' && label.length > 0,
+      `★★★ CLOSE_REASONS 里的 '${reason}' 没有中文标签 —— ` +
+        `控制台会把它渲染成裸机器码（见 docs/MODULES.md 配方 5）`,
+    );
+    /* 标签必须**真的翻译过**，不能是把机器码原样抄回来。 */
+    assert.notEqual(
+      label,
+      reason,
+      `★★★ '${reason}' 的标签与机器码相同 —— 那等于没翻译`,
+    );
+    /* 且必须能通过 closeReasonLabel 拿到（而不是只有 map 里有）。 */
+    assert.equal(
+      closeReasonLabel(reason),
+      label,
+      `closeReasonLabel('${reason}') 必须返回它的中文标签`,
+    );
+  }
 });
 
 /* -------------------------------------------------------------------------- */

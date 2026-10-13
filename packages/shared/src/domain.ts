@@ -596,6 +596,29 @@ export const CLOSE_REASONS = [
    * signal that live bookkeeping missed a close.
    */
   'reconciled',
+  /*
+   * 补录的一个回合，但**重建出来的方向字段不可信** —— 金额取自交易所流水。
+   *
+   * ## 为什么与 `reconciled` 分开
+   *
+   * 两者描述的不是同一件事：
+   *
+   *   · `reconciled` —— 重建结果可信（方向、数量、价格都对得上），
+   *     只是**进程当时没在跑**，所以没观察到是哪张单平的；
+   *   · `reconciled_reversed` —— 重建**对不上**：本地记的方向与交易所流水相反
+   *     （典型成因是重建窗口从持仓中间截断，把开/平判反）。
+   *     这时**只有金额是可信的**（取自 `income` 流水），方向与价格是推测。
+   *
+   * 分开的理由与 `manual` / `manual_partial` 那两条一致：把两种可信度不同的
+   * 记录混成一个码，会让"这条账目有多可信"这个问题失去答案 ——
+   * 而复盘时操作员恰恰需要把"方向可信的补录"与"只信金额的补录"分开看。
+   *
+   * ⚠️ **加这个码时漏登记进 `CLOSE_REASONS` 曾是一个真实缺陷**（外部 issue #138）：
+   * 写入点 `autoTrader.ts` 早就用它了，而本名单与 `CLOSE_REASON_LABELS` 都没有，
+   * 于是控制台把它渲染成**未翻译的英文机器码**。`domain.test.ts` 现在有一条
+   * 穷尽用例遍历本名单，确保将来新增的码不会再漏标签。
+   */
+  'reconciled_reversed',
 ] as const;
 export type CloseReason = (typeof CLOSE_REASONS)[number];
 
@@ -624,6 +647,17 @@ export const CLOSE_REASON_LABELS: Record<CloseReason, string> = {
    * 成交与盈亏都取自交易所的成交历史，是真实记录。
    */
   reconciled: '机器人未运行时平仓',
+  /*
+   * ⚠️ **措辞要同时说清「可信的部分」与「不可信的部分」。**
+   *
+   * 这一行与上面 `reconciled` 的区别只有一点：**方向字段是重建出来的、不可信**，
+   * 而金额取自交易所流水（`income`）所以是准的。
+   *
+   * 所以标签不能只说"补录"（那与 `reconciled` 没区别，操作员分不出两者），
+   * 也不能只说"方向不可信"（那会让人以为整条账目都不可信，
+   * 而金额恰恰是可信的、账目是对的）。两句都要有。
+   */
+  reconciled_reversed: '补录·方向不可信（金额取自交易所流水）',
   manual: '手工平仓',
   manual_partial: '减仓（部分平仓）',
 };
