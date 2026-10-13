@@ -372,6 +372,160 @@ interface ResearchCache {
 }
 const researchCache = new Map<number, ResearchCache>();
 
+/**
+ * ══════════════════════════════════════════════════════════════════════════
+ *  ⭐ **调研成果要活过进程重启**（2026-10-13 实测后加）
+ * ══════════════════════════════════════════════════════════════════════════
+ *
+ * ## 事故现象
+ *
+ * 线上日志反复出现（每 16 分钟一次）：
+ * ```
+ *   03:08:20 [调研] 首次调研在后台进行 —— 本轮**没有新闻材料**（下一轮就会有）
+ *   03:24:56 [调研] 首次调研在后台进行 —— 本轮**没有新闻材料**
+ *   03:28:21 [调研] 首次调研在后台进行 —— 本轮**没有新闻材料**
+ *   03:45:08 [调研] 首次调研在后台进行 —— 本轮**没有新闻材料**
+ * ```
+ * **"首次调研"出现了很多次** —— 而它字面上只能有一次。
+ * 而同一时段确实**成功过一次**：
+ * ```
+ *   03:50:38 [调研] 可用情报 2 条（过期被剔除 0 条；…）
+ * ```
+ * 然后 `03:58:23` 服务重启（一次部署），`03:59:37` 又是"首次调研"。
+ *
+ * ## 根因
+ *
+ * `researchCache` 是**进程内存**（`Map`）—— 重启就没了。而一次调研要
+ * **22 分钟**（实测），所以"重启 → 22 分钟没有新闻"是必然的。
+ *
+ * ⚠️ **这不是"实现 bug"，而是与用户要求的冲突**：
+ * > 「更新成 **7×24 不间断**、不定时、持续工作模式」
+ *
+ * 一个"每次重启就要重新花 22 分钟找新闻"的系统，**不满足 7×24**。
+ * 而且实测那份情报**只值 2 条**（查询一次成本很高），丢掉它很浪费。
+ *
+ * ## 修法：内存优先 + `settings` 表兜底
+ *
+ * ```
+ *   读：内存有 → 用它（快，且是最新的）
+ *       内存没有 → 读 `settings`（重启后仍能拿到上一份）
+ *   写：内存 + `settings`（同时）
+ * ```
+ *
+ * ⚠️ **只持久化"真的有内容"的那一份**（`at > 0 && text.length > 0`）——
+ * 占位对象（`at: 0`）不该被写进库里，否则重启后会把"空情报"当成"旧情报"
+ *（那是本项目已经修过一次的坑，见 `runOnce` 里那段说明）。
+ *
+ * ⚠️ **仍然有过期判据**：读回来的那一份照样走 `researchTtlMs()` 判断 ——
+ * 持久化只是"让它活过重启"，不是"让它永不过期"。
+ */
+const RESEARCH_CACHE_SETTING_PREFIX = 'research_cache:';
+
+/** 从库里读回一份（重启后仍能拿到）。**只在内存没有时读。** */
+function readPersistedResearch(traderId: number): ResearchCache | undefined {
+  try {
+    const raw = settings.get(`${RESEARCH_CACHE_SETTING_PREFIX}${traderId}`);
+    if (raw === undefined || raw.length === 0) return undefined;
+    const parsed = JSON.parse(raw) as { text?: unknown; at?: unknown };
+    const text = typeof parsed.text === 'string' ? parsed.text : '';
+    const at = typeof parsed.at === 'number' ? parsed.at : 0;
+    /* ⚠️ 空情报不认 —— 与内存那侧的判据一致（`at > 0 && text.length > 0`）。 */
+    if (at <= 0 || text.length === 0) return undefined;
+    return { text, at, refreshing: false };
+  } catch {
+    /* 库读不出来不该让决策失败 —— 当作"没有缓存"，照常走首次调研。 */
+    return undefined;
+  }
+}
+
+/** 写一份到库里（失败不影响内存那侧）。 */
+function persistResearch(traderId: number, text: string, at: number): void {
+  /* ⚠️ 只持久化"真的有内容"的那一份 —— 占位（空串）不该进库。 */
+  if (at <= 0 || text.length === 0) return;
+  try {
+    settings.set(`${RESEARCH_CACHE_SETTING_PREFIX}${traderId}`, JSON.stringify({ text, at }));
+  } catch {
+    /* 写不进去只是"重启后要重查一次"，不该让本轮失败。 */
+  }
+}
+
+/** 读缓存：**内存优先，库兜底**（见上面那段说明）。 */
+function getResearchCache(traderId: number): ResearchCache | undefined {
+  /*
+   * ⚠️ 这里必须是 `researchCache.get(...)`（内存 Map），**不是** `getResearchCache(...)`。
+   *
+   * 我做批量替换（`researchCache.get(` → `getResearchCache(`）时，
+   * **把这个封装函数自己的函数体也换掉了** → 它变成无限递归。
+   * 同类错误还有 `clearResearchCache`（那次更直接：`clearResearchCache(traderId)` 调自己）。
+   *
+   * ⚠️ 教训：**批量替换会改到"定义处"本身** ——
+   * 替换后必须逐个检查新写的封装函数体，而不是只看替换计数。
+   * 而 TypeScript **抓不到这种错**（递归调用的类型完全合法），
+   * 所以这类错误只能靠"逐个看函数体"或"跑一次真实路径"发现。
+   */
+  const inMemory = researchCache.get(traderId);
+  if (inMemory !== undefined) return inMemory;
+  const persisted = readPersistedResearch(traderId);
+  if (persisted !== undefined) {
+    /* 回填内存，避免每次读都碰库。 */
+    researchCache.set(traderId, persisted);
+  }
+  return persisted;
+}
+
+/** 写缓存：**内存与库同时写**（见上面那段说明）。 */
+function setResearchCache(traderId: number, entry: ResearchCache): void {
+  researchCache.set(traderId, entry);
+  persistResearch(traderId, entry.text, entry.at);
+}
+
+/**
+ * 清掉调研缓存。
+ *
+ * ══════════════════════════════════════════════════════════════════════════
+ *  ⚠️ **两个场景需要相反的行为 —— 所以必须区分**（2026-10-13）
+ * ══════════════════════════════════════════════════════════════════════════
+ *
+ * ## 场景 A：用户主动停止机器人（`stopResearchRefresher`）
+ *
+ * 既有测试的意图（`researchLifecycle.test.ts` 原文）：
+ * > 「缓存也要清：机器人停掉后再启动时，一份 10 分钟前的旧情报没有意义 ——
+ * >  而留着它会让**新启动的第一轮基于旧情报决策**。」
+ *
+ * **那个意图是对的**：用户按了停止，再按启动时他期待"重新看现在的市场"。
+ * 所以这里要**连库一起删**（`dropPersisted: true`）。
+ *
+ * ## 场景 B：进程重启（部署 / 崩溃 / OOM）
+ *
+ * ```
+ *   03:50:38 [调研] 可用情报 2 条      ← 22 分钟换来的
+ *   03:58:23 服务重启（一次部署）
+ *   03:59:37 [调研] 首次调研在后台进行  ← 又得等 22 分钟
+ * ```
+ * **而进程重启时根本不会调用 `stopResearchRefresher`**（代码没跑）——
+ * 所以库里的那一份**自然保留**，正是我要的。
+ *
+ * ## 所以：默认只清内存，停止机器人时显式连库一起删
+ *
+ * ```
+ *   clearResearchCache(id)                        → 只清内存（进程重启走这条，库保留）
+ *   clearResearchCache(id, { dropPersisted: true }) → 连库删（用户主动停止走这条）
+ * ```
+ *
+ * ⚠️ 这个区分**必须写清楚** —— 否则下一个人看到"停止时清了库、
+ * 而重启时没清"会以为是漏了，然后"修"成一致，于是两个场景必然坏一个。
+ */
+function clearResearchCache(traderId: number, options?: { dropPersisted?: boolean }): void {
+  researchCache.delete(traderId);
+  if (options?.dropPersisted === true) {
+    try {
+      settings.set(`${RESEARCH_CACHE_SETTING_PREFIX}${traderId}`, '');
+    } catch {
+      /* 删不掉只是"下次启动可能拿到旧情报"，不该让停止流程失败。 */
+    }
+  }
+}
+
 /** 缓存有效期：默认 15 分钟（新闻不是秒级变化的）。 */
 /**
  * **调研缓存的有效期**（毫秒）。
@@ -510,7 +664,7 @@ function ensureResearchRefresher(
   const intervalMs = researchIntervalMs();
 
   const runOnce = (): void => {
-    const cached = researchCache.get(traderId);
+    const cached = getResearchCache(traderId);
     if (cached?.refreshing === true) return;
     /*
      * ⚠️ **占位不能伪装成"一份旧情报"**（2026-10-13 实测踩到）。
@@ -537,7 +691,7 @@ function ensureResearchRefresher(
      * 那条路径，**如实说没有**。
      */
     const hasRealCache = cached !== undefined && cached.at > 0 && cached.text.length > 0;
-    researchCache.set(traderId, {
+    setResearchCache(traderId, {
       text: hasRealCache ? cached.text : '',
       at: hasRealCache ? cached.at : 0,
       refreshing: true,
@@ -582,7 +736,7 @@ function ensureResearchRefresher(
         }
       })
       .finally(() => {
-        const cur = researchCache.get(traderId);
+        const cur = getResearchCache(traderId);
         if (cur !== undefined) cur.refreshing = false;
       });
   };
@@ -631,7 +785,17 @@ export function stopResearchRefresher(traderId: number): void {
     controller.abort();
     researchAborts.delete(traderId);
   }
-  researchCache.delete(traderId);
+  /*
+   * ⚠️ **用户主动停止 → 连库一起删**（`dropPersisted: true`）。
+   *
+   * 既有测试的意图（`researchLifecycle.test.ts`）：
+   * 「机器人停掉后再启动时，一份 10 分钟前的旧情报没有意义 ——
+   *   而留着它会让**新启动的第一轮基于旧情报决策**。」
+   *
+   * **而进程重启（部署/崩溃）走的是另一条路** —— 它根本不调用这个函数，
+   * 所以库里的那一份自然保留（那正是"活过重启"的意思，见 `clearResearchCache`）。
+   */
+  clearResearchCache(traderId, { dropPersisted: true });
 }
 
 /**
@@ -847,7 +1011,7 @@ async function refreshResearch(
             `  ${h} 小时前 · ${r.assessment.verdict}`;
         })
         .join('\n');
-      researchCache.set(traderId, { text, at: Date.now(), refreshing: false });
+      setResearchCache(traderId, { text, at: Date.now(), refreshing: false });
       const unconfirmed = ranked.filter((r) => !r.assessment.confirmed).length;
       runtimeLogs.write(
         traderId, 'info', 'team',
@@ -858,7 +1022,7 @@ async function refreshResearch(
       return;
     }
     const note = '（本轮没有可用的新鲜情报：查到的都过期了）';
-    researchCache.set(traderId, { text: note, at: Date.now(), refreshing: false });
+    setResearchCache(traderId, { text: note, at: Date.now(), refreshing: false });
     /*
      * ⚠️ **这里必须写日志**（2026-10-13 实测踩到）。
      *
@@ -888,7 +1052,7 @@ async function refreshResearch(
   }
   /* 解析不出结构化情报 → 退回合并后的原文（格式没对上，但原文仍可能有信息）。 */
   runtimeLogs.write(traderId, 'warn', 'team', '[调研] 产出不是结构化格式 —— 退回原文使用');
-  researchCache.set(traderId, { text: merged, at: Date.now(), refreshing: false });
+  setResearchCache(traderId, { text: merged, at: Date.now(), refreshing: false });
 }
 export class TraderManager {
   private readonly running = new Map<number, AutoTrader>();
@@ -1551,7 +1715,7 @@ export class TraderManager {
          * 实测一次 agent 调研要 **197 秒**，而新闻不是秒级变化的 ——
          * 让每轮决策都白等 3 分钟是纯浪费，且会把整轮拖到十几分钟。
          */
-        const cached = researchCache.get(traderId);
+        const cached = getResearchCache(traderId);
         const age = cached === undefined ? Infinity : Date.now() - cached.at;
 
         if (cached !== undefined && age < researchTtlMs()) {
@@ -1851,7 +2015,7 @@ export class TraderManager {
                     `  ${h} 小时前 · ${r.assessment.verdict}`;
                 })
                 .join('\n');
-              researchCache.set(traderId, { text, at: Date.now(), refreshing: false });
+              setResearchCache(traderId, { text, at: Date.now(), refreshing: false });
               return text;
             }
             /*
@@ -1859,7 +2023,7 @@ export class TraderManager {
              * "本轮没有可用的新鲜情报"。明说，而不是给一段旧消息。
              */
             const note = '（本轮没有可用的新鲜情报：查到的都过期了）';
-            researchCache.set(traderId, { text: note, at: Date.now(), refreshing: false });
+            setResearchCache(traderId, { text: note, at: Date.now(), refreshing: false });
             return note;
           }
 
@@ -1868,7 +2032,7 @@ export class TraderManager {
             traderId, 'warn', 'team',
             `[调研] agent 的产出不是结构化格式（${parsed.dropped[0]?.reason ?? '未知'}）—— 退回原文使用`,
           );
-          researchCache.set(traderId, { text: agentResult.text, at: Date.now(), refreshing: false });
+          setResearchCache(traderId, { text: agentResult.text, at: Date.now(), refreshing: false });
           return agentResult.text;
         }
 
@@ -1901,7 +2065,7 @@ export class TraderManager {
         );
         /* 兜底结果也缓存 —— 它至少比"没有情报"好，且能省掉下一轮的搜索。 */
         if (result.ok) {
-          researchCache.set(traderId, { text: result.text, at: Date.now(), refreshing: false });
+          setResearchCache(traderId, { text: result.text, at: Date.now(), refreshing: false });
         }
         return result.text;
       },

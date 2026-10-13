@@ -34,8 +34,24 @@ test('★★★ `stopResearchRefresher` 必须存在且真的清定时器与缓�
   /*
    * ⚠️ 缓存也要清：机器人停掉后再启动时，一份 10 分钟前的旧情报没有意义 ——
    * 而留着它会让**新启动的第一轮基于旧情报决策**。
+   *
+   * ⚠️ **2026-10-13 更新**：清缓存抽成了 `clearResearchCache()`，
+   * 而它现在有**两个模式**（见 `manager.ts` 里那段长注释）：
+   * ```
+   *   clearResearchCache(id)                          → 只清内存（进程重启走这条）
+   *   clearResearchCache(id, { dropPersisted: true }) → 连库删（用户主动停止走这条）
+   * ```
+   * **两条路都要清"这一份"** —— 所以这里断言的是"停止时连库一起删"。
+   *（若只清内存，那么停止→启动会拿到库里的旧情报，正是本测试要防的那件事。）
    */
-  assert.ok(fn.includes('researchCache.delete('), '★ 必须同时清缓存');
+  assert.ok(
+    fn.includes('clearResearchCache('),
+    '★ 必须同时清缓存',
+  );
+  assert.ok(
+    /clearResearchCache\(traderId, \{ dropPersisted: true \}\)/.test(fn),
+    '★ 用户主动停止时必须【连库一起删】—— 否则停止→启动会拿到旧情报',
+  );
 });
 
 test('★★★ `stopTrader` 必须调用它（定义了但没人调 = 泄漏照旧）', () => {
