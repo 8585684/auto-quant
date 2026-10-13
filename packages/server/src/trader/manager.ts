@@ -1,8 +1,10 @@
 import {
   StrategyConfigSchema,
+  defaultStrategyConfig,
   isAiDriven,
   type CircuitBreakerReading,
   type StrategyConfig,
+  type StrategyRecord,
   type TraderStatus,
 } from '@aq/shared';
 import { connectExchange, preflight, type ExchangeConnection, type PreflightCheck } from '../binance/bootstrap.js';
@@ -1096,6 +1098,24 @@ export class TraderManager {
   private readonly startedAt = new Map<number, number>();
 
   constructor(private readonly vault: Vault) {}
+
+  /**
+   * 读出策略配置，非法则回退到默认值。
+   *
+   * `null` 记录 = 不依赖策略（AI 托管），同样给默认值。
+   *
+   * ⚠️ **回退必须留一条 warn**：`config_json` 是用户可编辑的旧行，校验失败时
+   * 静默换成默认值等于把用户的策略偷偷换掉，而页面上看不出任何异常。
+   */
+  private configOf(
+    strategyRecord: StrategyRecord | undefined | null,
+  ): StrategyConfig {
+    const parsed = strategyRecord ? StrategyConfigSchema.safeParse(strategyRecord.config) : null;
+    if (strategyRecord && !parsed?.success) {
+      log.warn(`策略「${strategyRecord.name}」校验未通过，非法字段已回退为默认值`);
+    }
+    return parsed?.success ? parsed.data : defaultStrategyConfig();
+  }
 
   /**
    * Subscribe to the exchange's user-data stream for alerting.
@@ -2408,11 +2428,7 @@ export class TraderManager {
           '这个机器人按固定策略运行，但它引用的策略已不存在 —— 请为它重新选择一个策略，或改成 AI 托管模式。',
         );
       }
-      const parsed = strategyRecord ? StrategyConfigSchema.safeParse(strategyRecord.config) : null;
-      const config: StrategyConfig = parsed?.success ? parsed.data : StrategyConfigSchema.parse({});
-      if (strategyRecord && !parsed?.success) {
-        log.warn(`策略「${strategyRecord.name}」校验未通过，非法字段已回退为默认值`);
-      }
+      const config: StrategyConfig = this.configOf(strategyRecord);
 
       /* --- Model -------------------------------------------------------- */
       const { client } = await this.buildModel(trader.aiModelId);
@@ -3256,8 +3272,7 @@ export class TraderManager {
     /* `null` = 不依赖策略（AI 托管）—— 手工平仓同理，绝不能因为策略没了就用不了。 */
     const strategyRecord =
       trader.strategyId === null ? undefined : strategies.get(trader.strategyId);
-    const parsed = strategyRecord ? StrategyConfigSchema.safeParse(strategyRecord.config) : null;
-    const config: StrategyConfig = parsed?.success ? parsed.data : StrategyConfigSchema.parse({});
+    const config: StrategyConfig = this.configOf(strategyRecord);
 
     const autoTrader = new AutoTrader({
       trader,
@@ -3337,8 +3352,7 @@ export class TraderManager {
         const connection = await this.connectionFor(traderId, trader.exchangeAccountId, false);
         const strategyRecord =
           trader.strategyId === null ? undefined : strategies.get(trader.strategyId);
-        const parsed = strategyRecord ? StrategyConfigSchema.safeParse(strategyRecord.config) : null;
-        const config: StrategyConfig = parsed?.success ? parsed.data : StrategyConfigSchema.parse({});
+        const config: StrategyConfig = this.configOf(strategyRecord);
         const autoTrader = new AutoTrader({
           trader,
           config,
