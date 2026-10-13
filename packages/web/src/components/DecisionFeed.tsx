@@ -1238,6 +1238,11 @@ export function DecisionFeed({
                    * 而"这一轮跑了 50000 秒"会把操作员引去查一个不存在的事故。
                    */
                   startedAt={liveCycle?.startedAt ?? null}
+                  /*
+                   * 历史轮的决策记录 —— "最近活跃于 X 分钟前"的数据源。
+                   * 只取 `cotTrace` 与 `timestamp` 两个字段（`lastSeenOf` 只要这两样）。
+                   */
+                  history={records.map((r) => ({ cotTrace: r.cotTrace, timestamp: r.timestamp }))}
                 />
               </div>
             </div>

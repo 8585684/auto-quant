@@ -112,6 +112,19 @@ export interface RosterEntry {
   stepCount: number;
   /** 最近一步是否在"进行中"（用于决定圆点闪不闪）。 */
   inFlight: boolean;
+  /**
+   * **它在历史轮里最后一次出现的时刻**（`null` = 从未跑过）。
+   *
+   * ## 为什么需要它（2026-10-14 · 去轮次化阶段 3）
+   *
+   * `latest === null` 只说明"这一轮没跑"，而团队是**按需出勤**的：
+   * 侦查员上一轮跑了、这轮休息是完全正常的。
+   * 旧 UI 把这种情况写成"本轮未参与" —— 用户抓到了问题：
+   * > 「团队模式不应该是完全抛弃了轮次这个概念吗？而是 7X24 不间断按需工作」
+   *
+   * 有了 `lastSeenAt`，同一行可以如实显示"最近活跃于 12 分钟前"。
+   */
+  lastSeenAt: string | null;
 }
 
 /**
@@ -175,9 +188,44 @@ export function stateOfLastStep(steps: readonly TeamStep[]): 'active' | 'done' |
  * @param steps 实时步骤流
  * @param activeRoles 编制表（默认取 `FIRM_ROLES`，注入是为了可测）
  */
+/**
+ * **从历史决策记录里提取"各角色最后一次出现的时刻"**（2026-10-14 · 阶段 3）。
+ *
+ * ## 为什么从 `cotTrace` 提取（而不是新开接口）
+ *
+ * 历史轮的 `cot_trace` 里各角色产出带的标记（线上实测格式）：
+ * ```
+ *   - technical（group/team-grunt）：…
+ *   - judge（group/auto-…）：…
+ * ```
+ * 正则 `- <role>（…）：` 命中即说明该角色在那轮出过勤。
+ * 加新接口要动 API 层与 store —— 而这里只需要"哪个角色、哪一轮"两个事实。
+ *
+ * ## ⚠️ 为什么只看【最近 N 条】而不是全部
+ *
+ * cotTrace 一条就 4–5k 字符，扫全部历史是 O(轮数 × 5k)。
+ * 取最近 12 条（约 3 小时 @15 分钟周期）已覆盖"最近活跃于"的语义 ——
+ * 更早的活跃对操作员没有操作意义。
+ */
+export function lastSeenOf(
+  history: ReadonlyArray<{ cotTrace: string | null | undefined; timestamp: string }>,
+): Map<string, string> {
+  const seen = new Map<string, string>();
+  /* 从旧到新扫 —— 后面的覆盖前面的，留下的就是"最近一次"。 */
+  for (const r of history.slice(0, 12).reverse()) {
+    const trace = r.cotTrace;
+    if (trace === null || trace === undefined || trace.length === 0) continue;
+    for (const m of trace.matchAll(/- ([a-z_]+)（[^）]*）：/g)) {
+      seen.set(m[1]!, r.timestamp);
+    }
+  }
+  return seen;
+}
+
 export function rosterEntries(
   steps: readonly TeamStep[],
   roster: readonly FirmRole[],
+  seen: ReadonlyMap<string, string> = new Map(),
 ): RosterEntry[] {
   /** role → 它这一轮的所有步骤 */
   const byRole = new Map<string, TeamStep[]>();
@@ -203,6 +251,7 @@ export function rosterEntries(
         latest: null,
         stepCount: 0,
         inFlight: false,
+        lastSeenAt: seen.get(role.id) ?? null,
       };
     }
     const last = own[own.length - 1]!;
@@ -217,6 +266,7 @@ export function rosterEntries(
       },
       stepCount: own.length,
       inFlight: true,
+      lastSeenAt: seen.get(role.id) ?? null,
     };
   });
 
@@ -245,6 +295,8 @@ export function rosterEntries(
       latest: { at: last.at, message: last.message, level: last.level, phase: last.phase ?? null },
       stepCount: own.length,
       inFlight: true,
+      /* 它有实时步骤在跑 —— "最近活跃"就是现在。 */
+      lastSeenAt: last.at,
     });
   }
 

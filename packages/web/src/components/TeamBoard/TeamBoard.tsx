@@ -39,6 +39,7 @@ import {
   STATE_LABEL,
   TIER_LABEL,
   clock,
+  lastSeenOf,
   rosterEntries,
   type RosterEntry,
   type RosterState,
@@ -83,6 +84,23 @@ function elapsedLabel(seconds: number): string {
 }
 
 /**
+ * **"最近活跃于 X"的文案**（去轮次化阶段 3）。
+ *
+ * 与 `clock()`（HH:MM:SS）分开：操作员要的是"多久之前"这个相对量，
+ * 绝对时刻反而要心算。`null` 返回 `null`（调用方显示"待命"）。
+ */
+function lastSeenLabel(at: string | null, now: number): string | null {
+  if (at === null) return null;
+  const t = Date.parse(at);
+  if (!Number.isFinite(t)) return null;
+  const sec = Math.max(0, Math.round((now - t) / 1000));
+  if (sec < 60) return '刚活跃过';
+  if (sec < 3600) return `最近活跃 ${Math.floor(sec / 60)} 分钟前`;
+  if (sec < 86_400) return `最近活跃 ${Math.floor(sec / 3600)} 小时前`;
+  return `最近活跃 ${Math.floor(sec / 86_400)} 天前`;
+}
+
+/**
  * **工作流看板**。
  *
  * @param steps 本轮的实时步骤流（`LiveCycle.steps`）
@@ -95,12 +113,23 @@ export function TeamBoard({
   cycleNumber,
   startedAt,
   roster = FIRM_ROLES,
+  history = [],
 }: {
   steps: readonly TeamStep[];
   cycleNumber: number;
   /** `null` = 不知道开始时刻（例如页面刚连上），此时不显示计时器。 */
   startedAt: number | null;
   roster?: readonly FirmRole[];
+  /**
+   * **历史决策记录**（从旧到新）—— 用于"最近活跃于 X 分钟前"。
+   *
+   * 去轮次化阶段 3：团队按需出勤，"本轮没跑"是常态而非异常。
+   * 旧 UI 写"本轮未参与"，用户抓到：
+   * > 「团队模式不应该是完全抛弃了轮次这个概念吗？而是 7X24 不间断按需工作」
+   * 有了历史，同一行能如实显示"最近活跃于 12 分钟前"。
+   * ⚠️ 可选：拿不到历史时退回旧行为（不会崩）。
+   */
+  history?: ReadonlyArray<{ cotTrace: string | null | undefined; timestamp: string }>;
 }): React.ReactElement {
   /*
    * 计时器每秒刷新 —— 让"这一轮跑了多久"是活的。
@@ -116,7 +145,8 @@ export function TeamBoard({
     return () => window.clearInterval(timer);
   }, [startedAt]);
 
-  const entries = useMemo(() => rosterEntries(steps, roster), [steps, roster]);
+  const seen = useMemo(() => lastSeenOf(history), [history]);
+  const entries = useMemo(() => rosterEntries(steps, roster, seen), [steps, roster, seen]);
 
   /** 一键"展开全部详情" —— 用户说"用户有需要可以手动点击打开查看详情"。 */
   const [allOpen, setAllOpen] = useState(false);
@@ -419,8 +449,11 @@ function AgentRow({
   onToggle: () => void;
   steps: readonly TeamStep[];
 }): React.ReactElement {
-  const { role, state, latest, stepCount } = entry;
+  const { role, state, latest, stepCount, lastSeenAt } = entry;
   const expandable = stepCount > 0;
+  /* "最近活跃于 X 分钟前"是相对量 —— 用渲染时刻算，不挂计时器
+   *（分钟级精度不值得每秒跳；轮次刷新时自然会重算）。 */
+  const now = Date.now();
 
   const body = (
     <div className="flex min-w-0 flex-1 flex-wrap items-baseline gap-x-2 gap-y-0.5">
@@ -452,7 +485,42 @@ function AgentRow({
           <span className="num shrink-0 text-[11px] tabular-nums text-ink-faint">{clock(latest.at)}</span>
         </>
       ) : (
-        <span className="shrink-0 text-xs text-ink-faint">本轮未参与</span>
+        /*
+         * ══════════════════════════════════════════════════════════════════
+         *  ⚠️ **三态，不是一句话**（2026-10-14 · 去轮次化阶段 3）
+         * ══════════════════════════════════════════════════════════════════
+         *
+         * 旧版一律写"本轮未参与" —— 用户抓到了它的问题：
+         * > 「团队模式不应该是完全抛弃了轮次这个概念吗？
+         * >  而是 7X24 不间断按需工作」
+         *
+         * 团队是**按需出勤**的：侦查员上一轮跑了、这轮休息是常态。
+         * 所以"没跑"要分三种：
+         * ```
+         *   最近活跃 X 分钟前   ← 有人、最近干过活（最常见 —— 显示它）
+         *   待命                ← 有人、但从没见它跑过（如风控官，全 skip 时它休息）
+         *   （planned 岗位走它自己的徽章，不进这里）
+         * ```
+         * ⚠️ 判据是 `lastSeenAt`（历史轮里出现过）—— `idle` 只是"这轮没叫"。
+         */
+        (() => {
+          const seenLabel = lastSeenLabel(lastSeenAt, now);
+          return seenLabel !== null ? (
+            <span
+              className="num shrink-0 text-[11px] tabular-nums text-ink-faint"
+              title={`这个岗位按需出勤 —— 最近一次干活是 ${new Date(lastSeenAt!).toLocaleString()}`}
+            >
+              {seenLabel}
+            </span>
+          ) : (
+            <span
+              className="shrink-0 text-xs text-ink-faint"
+              title="在岗但还没被叫到过 —— 团队按需出勤，这不是异常"
+            >
+              待命
+            </span>
+          );
+        })()
       )}
     </div>
   );
