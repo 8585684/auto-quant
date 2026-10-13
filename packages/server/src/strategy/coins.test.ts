@@ -29,6 +29,7 @@ import { defaultStrategyConfig, type StrategyConfig } from '@aq/shared';
 import { candidateBudget, PROMPT_TOKEN_BUDGET } from './prompt.js';
 import { selectCandidates, CANDIDATE_HARD_CAP } from './coins.js';
 import type { MarketDataService } from '../market/service.js';
+import type { FunnelStageReport } from '../market/funnel.js';
 
 /* -------------------------------------------------------------------------- */
 /*  夹具                                                                       */
@@ -354,4 +355,97 @@ test('返回值带 trimmedFrom 与 budget —— 调用方要靠它们说明裁�
     (result.trimmedFrom ?? 0) > result.symbols.length,
     'trimmedFrom 是裁**前**的数量，必须大于裁后的数量',
   );
+});
+
+/**
+ * ★★★ **团队模式走分层漏斗**（2026-10-12 接线）。
+ *
+ * 用户的要求：「交易所有 500 个可以交易的币……**层层筛选**」。
+ *
+ * ⚠️ 关键约束：**另两种模式的选池行为必须逐字节不变** ——
+ * 用户明确要求「现阶段得也得保留……用户可以自行切换用现有模式」。
+ * 所以这是一个**新的 `sourceType: 'funnel'`**，而不是改 `coinpool`。
+ */
+test('★★★ funnel 走分层漏斗，且每层的淘汰可解释', async () => {
+  /* 造全市场：少部分大成交额 + 大部分小成交额。 */
+  const rows = Array.from({ length: 300 }, (_, i) => ({
+    symbol: `SYM${String(i).padStart(3, '0')}USDT`,
+    quoteVolume24h: i < 50 ? 500_000_000 - i * 1_000_000 : 1_000_000,
+    changePercent24h: 5,
+    amplitudePercent: 8,
+  }));
+  const market = {
+    async screenUniverseRows() {
+      return rows;
+    },
+  } as unknown as MarketDataService;
+
+  /*
+   * ⚠️ 用**数组**收集而不是 `let reported = null`：
+   * TS 的控制流分析看不到"闭包会在调用期间给它赋值"，
+   * 于是把它收窄成 `null`（进而 `.stages` 报 "does not exist on type never"）。
+   * 数组的 `push` 不会被那样收窄。
+   */
+  const reported: Array<{ stages: readonly FunnelStageReport[]; survivors: number }> = [];
+  const picked = await selectCandidates(
+    configWith({ coinSource: { ...defaultStrategyConfig().coinSource, sourceType: 'funnel' } }),
+    market,
+    {
+      onFunnelReport: (stages: readonly FunnelStageReport[], survivors: number) => {
+        reported.push({ stages, survivors });
+      },
+    },
+  );
+
+  assert.ok(picked.symbols.length > 0, '要选出标的');
+  assert.equal(reported.length, 1, '★ 必须回调漏斗报告 —— 否则操作员看不到"为什么没被看到"');
+  assert.ok(reported[0]!.stages.length >= 2, '★ 应当是【多层】而不是一层');
+  assert.ok(
+    reported[0]!.stages.some((s) => s.dropped > 0),
+    '★ 至少有一层真的淘汰了东西（否则"层层筛选"名不副实）',
+  );
+  assert.ok(
+    reported[0]!.survivors <= 50,
+    `最终应显著收敛（300 → ${reported[0]!.survivors}）`,
+  );
+});
+
+test('★★ coinpool 的行为【没有】被改动（增量更新的硬约束）', async () => {
+  /*
+   * 用户要求：「这次大更新做增量……现阶段得也得保留，用户可以自行切换」。
+   * 所以 `coinpool`（另两种模式在用）必须保持原样 —— 它只做**一层**排序取前 N。
+   *
+   * ⚠️ **断言不能写"结果等于 20"**（我第一版就是这么写的，被测试当场纠正）：
+   * `selectCandidates` 之后还有 **`candidateBudget()` 的提示词预算裁剪** ——
+   * 实测 20 个来源标的最终只剩 **7 个**进池。
+   *
+   * 那 7 不是 BUG：`coins.test.ts` 文件头就记着这段历史 ——
+   * 「曾经因为提示词预算写死 6 万而把候选池饿到 7 个」。
+   * 所以这里要验的是"**行为未变**"，而"最终几个"由预算决定，不该在这里钉死。
+   */
+  const market = {
+    async screenUniverse() {
+      return rankedSymbols(20);
+    },
+  } as unknown as MarketDataService;
+  const picked = await selectCandidates(
+    configWith({ coinSource: { ...defaultStrategyConfig().coinSource, sourceType: 'coinpool' } }),
+    market,
+    {},
+  );
+  assert.ok(picked.symbols.length > 0, '★ coinpool 仍能选出标的（行为未变）');
+  assert.ok(
+    picked.symbols.length <= 20,
+    `★ 不该超过来源给的 20 个（实际 ${picked.symbols.length}）`,
+  );
+  /*
+   * ⚠️ **不能断言 `symbols[0]` 等于来源的第一个**（我第一版就是这么写的，被测试纠正）：
+   * 实测第一个是 **`BTCUSDT`** —— 它被**无条件**加进候选池（大盘参照标的，
+   * 见日志「候选池按提示词预算从 **21** 个裁剪到 7 个」：20 个来源 + 1 个 BTC）。
+   *
+   * 这是**既有行为、不是 BUG**：模型需要一个稳定的市场参照。
+   * 所以这里验的是"来源给的标的确实进了池"，而不是"谁排第一"。
+   */
+  const fromSource = picked.symbols.filter((s) => rankedSymbols(20).includes(s));
+  assert.ok(fromSource.length >= 5, `★ 来源标的应当大量进池（实际 ${fromSource.length} 个）`);
 });

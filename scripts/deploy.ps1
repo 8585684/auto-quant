@@ -200,6 +200,7 @@ Remove-Item $archive -Force
 
 $remote = @"
 set -e
+
 export PATH=/usr/local/node22/bin:`$PATH
 cd $RemoteDir
 
@@ -227,6 +228,70 @@ fi
 
 chown -R autoquant:autoquant $RemoteDir 2>/dev/null || true
 chmod 600 .env 2>/dev/null || true
+
+# ---------------------------------------------------------------------------
+# magpie 网关 key 副本（团队模式的模型出口 + 联网搜索都要它）
+# ---------------------------------------------------------------------------
+# ## 为什么需要（实测踩到）
+#
+# `caller-keys.json` 权限同样是 `-rw-------`（属主 UID 65532，容器内用户），
+# 服务以 `autoquant` 身份跑，**读不到**它。
+#
+# 后果非常具体（实测日志）：
+#
+#     [error] AI 团队模式未启用：找不到 magpie 网关配置
+#
+# 也就是说：**AI 团队模式静默退回了单模型**，而界面上还写着"AI 团队"。
+# 与 `plugin-providers.json` 是同一类问题 —— 上一轮我只修了那个档案文件、
+# **漏了这个 key 文件**，于是同一个坑换个文件又踩一次。
+#
+# 团队模式的模型出口与联网搜索**都依赖这个 key**，所以它是硬依赖。
+#
+# ⚠️ 复制失败**不阻断部署**，但会在 `MAGPIE_GATEWAY_KEY` 缺席时
+# 让团队模式明确报告"未启用"（而不是静默降级）。
+MAGPIE_KEY_SRC=/var/lib/docker/volumes/magpie-config/_data/magpie/caller-keys.json
+MAGPIE_KEY_DST=$RemoteDir/data/magpie-caller-keys.json
+if [ -r "`$MAGPIE_KEY_SRC" ]; then
+  mkdir -p $RemoteDir/data
+  cp "`$MAGPIE_KEY_SRC" "`$MAGPIE_KEY_DST" 2>/dev/null && chown autoquant:autoquant "`$MAGPIE_KEY_DST" 2>/dev/null || true
+  chmod 600 "`$MAGPIE_KEY_DST" 2>/dev/null || true
+  echo "  magpie 网关 key 已同步"
+else
+  echo "  ⚠️  读不到 magpie 网关 key（`$MAGPIE_KEY_SRC）—— 团队模式将不可用"
+fi
+
+# ---------------------------------------------------------------------------
+# magpie 模型档案副本（供"自动发现"读免费/付费标注）
+# ---------------------------------------------------------------------------
+# ## 为什么要复制一份，而不是直接读原文件
+#
+# magpie 的 `plugin-providers.json` 权限是 `-rw-------`（属主 UID 65532，
+# 那是容器内的用户）。服务以 `autoquant` 身份运行，**读不到它**（实测确认）。
+#
+# 而这份文件是"哪些模型免费不限量、哪些要消耗积分"的**唯一来源** ——
+# `/v1/models` 只给 context/reasoning，**没有 `free` 也没有 `cost`**（实测）。
+#
+# 拿不到它的后果很具体：自动发现会把所有模型标成"未知免费状态"，
+# 于是"体力活优先用免费模型"的策略**静默失效**（实测日志：
+# 「模型目录已刷新：共 105 个（免费 0 个）」—— 而实际有 14+ 个免费模型）。
+#
+# ## 为什么用复制而不是改权限
+#
+# 改 magpie 的文件权限会影响容器内的 magpie 自身，且 magpie 每次写配置都可能重置它。
+# **复制一份只读副本**对 magpie 零影响，且部署脚本每次都刷新它。
+#
+# ⚠️ 复制失败**不阻断部署** —— 那只是让免费标注退化（`free: 'unknown'`），
+# 团队模式仍能用静态档案跑，只是少了"优先用免费模型"这一层优化。
+MAGPIE_SRC=/var/lib/docker/volumes/magpie-config/_data/magpie/plugin-providers.json
+MAGPIE_DST=$RemoteDir/data/magpie-plugin-providers.json
+if [ -r "`$MAGPIE_SRC" ]; then
+  mkdir -p $RemoteDir/data
+  cp "`$MAGPIE_SRC" "`$MAGPIE_DST" 2>/dev/null && chown autoquant:autoquant "`$MAGPIE_DST" 2>/dev/null || true
+  chmod 640 "`$MAGPIE_DST" 2>/dev/null || true
+  echo "  magpie 模型档案已同步：`$(wc -c < "`$MAGPIE_DST" 2>/dev/null || echo 0) 字节"
+else
+  echo "  ⚠️  读不到 magpie 档案（`$MAGPIE_SRC）—— 免费/付费标注将退化为"未知""
+fi
 "@
 
 $remote += @"
@@ -252,11 +317,24 @@ if [ "`$(cat `$STAMP_FILE 2>/dev/null)" != "`$LOCK_HASH" ]; then
     echo "==> 依赖有变化，正在安装（npm ci --omit=dev）"
     mkdir -p /tmp/aqhome
     chown autoquant:autoquant /tmp/aqhome 2>/dev/null || true
-    if sudo -u autoquant env PATH=/usr/local/node22/bin:`$PATH HOME=/tmp/aqhome npm ci --omit=dev --no-audit --no-fund 2>&1 | tail -2; then
+    # ⚠️ **不能用 `npm ci … 2>&1 | tail -2` 放在 if 里（2026-10-11 审查发现）。**
+    #
+    # 管道的退出码是 `tail` 的 0，于是**安装失败也走 then 分支**、把 lock hash 写进 stamp，
+    # 下次部署直接"依赖未变化，跳过安装" —— 服务带着缺包重启，而本地照常打印「完成」。
+    #
+    # 修法是**先落到文件、再看退出码**，而不是给整个脚本加 `set -o pipefail`：
+    # 后者会改变脚本里**所有**管道的语义（实测直接把部署打断：`tail: option used in
+    # invalid context -- 2`，而本地不检查 ssh 退出码、照样打印「完成」）。
+    # **只改有问题的那一行，别动全局语义。**
+    if sudo -u autoquant env PATH=/usr/local/node22/bin:`$PATH HOME=/tmp/aqhome npm ci --omit=dev --no-audit --no-fund > /tmp/aq-npm.log 2>&1; then
+        tail -2 /tmp/aq-npm.log
         echo "`$LOCK_HASH" > `$STAMP_FILE
         chown autoquant:autoquant `$STAMP_FILE 2>/dev/null || true
     else
-        echo "    ✗ 依赖安装失败 —— 服务会起不来，请先看上面的 npm 输出"
+        echo "    ✗ 依赖安装失败 —— 服务会起不来。npm 输出："
+        tail -20 /tmp/aq-npm.log
+        # **必须让部署失败**，不能带着缺包重启：写 stamp 的下一次会跳过安装。
+        exit 1
     fi
 else
     echo "==> 依赖未变化，跳过安装"
@@ -289,6 +367,55 @@ StandardError=append:/opt/autoquant/data/server.log
 LOGCONF
     systemctl daemon-reload
     echo "    已配置日志落盘（drop-in）"
+fi
+
+#
+# ⚠️ **给"跑完在途那一轮"留够时间**（用户要求的"两全其美"）。
+#
+# ## 问题
+#
+# 用户的原话：
+#
+# > 「你改代码的时候（提交更新部署代码到服务器后，服务器会重启对吧，
+# >  这时候运行中的机器人会被停止-启动……**这个你得自己看着修**……
+# >  应该是**两全其美**」
+#
+# 实测证据（生产日志）：
+#
+# ```
+#   01:08:33  停止时上一轮决策未在时限内结束，可能留下未挂保护单的仓位
+#   01:08:41  机器人已启动（实盘）      ← 部署在 01:08 打断了一轮决策
+# ```
+#
+# 一轮跑到"入场已成交、保护单还没挂"时被掐掉 → 循环也停了 →
+# **没有任何人会去补那张保护单**，直到下次启动对账。中间就是**裸奔窗口**。
+#
+# ## 修法（两侧都要改，缺一不可）
+#
+# | 侧 | 改动 |
+# |---|---|
+# | 应用 | `stop(persist=false)` **不掐断**在途轮次，最多等 `SHUTDOWN_DRAIN_TIMEOUT_MS`（3 分钟）|
+# | systemd | `TimeoutStopSec` 从默认 **90 秒** 提到 **210 秒** |
+#
+# ⚠️ **只改应用是没用的**：systemd 在 90 秒就 SIGKILL，
+# 那 3 分钟的等待**永远等不到**（实测 `TimeoutStopUSec=1min 30s`）。
+#
+# 210 秒 = 应用的 3 分钟 + 30 秒余量（留给进程收尾）。
+#
+# 为什么可以这么长：部署时**没人在等**（不像操作员点停止）。
+# 而"操作员点停止"那条路径仍然是 60 秒 + 立刻掐断 —— 快的那条没变。
+TIMEOUTUNIT=/etc/systemd/system/autoquant.service.d/timeout.conf
+if ! grep -q "TimeoutStopSec=210" "`$TIMEOUTUNIT" 2>/dev/null; then
+    mkdir -p /etc/systemd/system/autoquant.service.d
+    cat > "`$TIMEOUTUNIT" <<'TIMECONF'
+[Service]
+# 见 deploy.ps1 的说明：让部署重启时"跑完在途那一轮"，
+# 避免掐断在"入场已成交、保护单未挂"的窗口里（裸奔仓位）。
+# 应用侧上限是 3 分钟，这里给 210 秒（3 分钟 + 30 秒收尾余量）。
+TimeoutStopSec=210
+TIMECONF
+    systemctl daemon-reload
+    echo "    已配置停机超时 210 秒（drop-in）"
 fi
 
 #

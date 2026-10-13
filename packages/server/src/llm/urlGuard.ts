@@ -131,12 +131,96 @@ function blockedIpv6Reason(bytes: readonly number[]): string | null {
 }
 
 /**
+ * 解析"允许访问的内网主机"清单。
+ *
+ * ## 为什么需要它（2026-10-11，用户的实际需求）
+ *
+ * 用户要把 `baseUrl` 指向**自己内网里的 LLM 服务**（`http://172.19.0.1:8317/v1`），
+ * 被本模块的私网规则挡住了。而**自建网关 / 私有部署**正是这个白名单一开始就
+ * 明确保留支持的场景（见文件头注释）。
+ *
+ * ## 为什么不是"直接放开私网"
+ *
+ * 那会把**云元数据**那条路一起放开 —— 文件头注释里写的
+ * `169.254.169.254/latest/meta-data/...` 正是要挡的东西：
+ * 一个能登录控制台的人会因此拿到云主机的临时凭据。
+ *
+ * 所以做成**显式声明**：默认仍然全挡，只有操作员亲手写进来的目标才放行。
+ * 一个"我允许访问 172.19.0.1"的声明，不会顺带允许 169.254.169.254。
+ *
+ * ## 支持的写法
+ *
+ *   `172.19.0.1`      精确主机
+ *   `172.19.0.0/16`   IPv4 CIDR
+ *   `.corp.lan`       域名后缀（与上面被挡的 `.internal` 等同一形式）
+ *   `my-gateway`      精确主机名
+ *
+ * 逗号或空白分隔。
+ */
+export function parseHostAllowlist(raw: string | undefined): string[] {
+  if (!raw) return [];
+  return raw
+    .split(/[\s,]+/)
+    .map((entry) => entry.trim().toLowerCase().replace(/\.$/, ''))
+    .filter((entry) => entry.length > 0);
+}
+
+/** IPv4 CIDR 匹配（只支持 IPv4 —— 内网白名单够用，且 IPv6 的掩码语义更易写错）。 */
+function ipv4InCidr(bytes: readonly number[], cidr: string): boolean {
+  const [base, bitsText] = cidr.split('/');
+  if (base === undefined || bitsText === undefined) return false;
+  const baseBytes = parseIpv4(base);
+  if (!baseBytes) return false;
+  const bits = Number(bitsText);
+  if (!Number.isInteger(bits) || bits < 0 || bits > 32) return false;
+  let remaining = bits;
+  for (let i = 0; i < 4; i += 1) {
+    const take = Math.min(8, Math.max(0, remaining));
+    remaining -= take;
+    const mask = take === 0 ? 0 : (0xff << (8 - take)) & 0xff;
+    if ((bytes[i]! & mask) !== (baseBytes[i]! & mask)) return false;
+  }
+  return true;
+}
+
+/**
+ * 这个主机是否在操作员声明的白名单里。
+ *
+ * ⚠️ **只用来放行"私网/内部"这一类拒绝** —— 协议校验、空主机名校验
+ * 在这之前就已经返回了，白名单不能绕过它们。
+ */
+function hostIsAllowlisted(
+  host: string,
+  literal: string,
+  family: number,
+  list: readonly string[],
+): boolean {
+  if (list.length === 0) return false;
+  const bytes = family === 4 ? parseIpv4(literal) : null;
+  for (const entry of list) {
+    if (entry.startsWith('.')) {
+      if (host.endsWith(entry)) return true;
+      continue;
+    }
+    if (entry.includes('/')) {
+      if (bytes && ipv4InCidr(bytes, entry)) return true;
+      continue;
+    }
+    if (host === entry || literal === entry) return true;
+  }
+  return false;
+}
+
+/**
  * 判断一个出站 `baseUrl` 是否允许。
  *
  * 只允许 http / https：`file:`、`gopher:` 这类协议在别的组件里可能被当成读取原语。
  * http 保留是因为自建网关与内网反代经常没有证书，而这里已经按地址挡掉了内网目标。
+ *
+ * `allowPrivateHosts` 是**操作员显式声明的内网目标**（见 `parseHostAllowlist`）；
+ * 不传 = 行为与从前完全一致（全挡）。
  */
-export function checkOutboundUrl(raw: string): UrlGuardVerdict {
+export function checkOutboundUrl(raw: string, allowPrivateHosts: readonly string[] = []): UrlGuardVerdict {
   const trimmed = raw.trim();
   if (!trimmed) return { allowed: false, reason: '地址为空。' };
 
@@ -161,21 +245,26 @@ export function checkOutboundUrl(raw: string): UrlGuardVerdict {
   if (family === 4) {
     const bytes = parseIpv4(literal);
     const reason = bytes ? blockedIpv4Reason(bytes) : null;
+    /* 操作员显式放行的内网目标：**只在这里放行**，协议与空主机名的检查已经在上面做过。 */
+    if (reason && hostIsAllowlisted(host, literal, family, allowPrivateHosts)) return { allowed: true };
     return reason ? { allowed: false, reason } : { allowed: true };
   }
   if (family === 6) {
     const bytes = parseIpv6(host);
     const reason = bytes ? blockedIpv6Reason(bytes) : null;
+    if (reason && hostIsAllowlisted(host, literal, family, allowPrivateHosts)) return { allowed: true };
     return reason ? { allowed: false, reason } : { allowed: true };
   }
 
   // 主机名：这些后缀不可能指向一个合法的公网 LLM 端点，
   // 但它们经常指向内网服务或云厂商的元数据别名（metadata.google.internal）。
   if (host === 'localhost' || host.endsWith('.localhost')) {
+    if (hostIsAllowlisted(host, literal, 0, allowPrivateHosts)) return { allowed: true };
     return { allowed: false, reason: '目标是本机（localhost）。' };
   }
   for (const suffix of ['.internal', '.local', '.home.arpa']) {
     if (host.endsWith(suffix)) {
+      if (hostIsAllowlisted(host, literal, 0, allowPrivateHosts)) return { allowed: true };
       return { allowed: false, reason: `目标主机名属于内部 DNS（${suffix}）。` };
     }
   }
@@ -184,8 +273,8 @@ export function checkOutboundUrl(raw: string): UrlGuardVerdict {
 }
 
 /** 允许则返回裁剪后的地址，否则抛出中文错误（调用方直接回显给操作员）。 */
-export function assertOutboundUrlAllowed(raw: string): string {
-  const verdict = checkOutboundUrl(raw);
+export function assertOutboundUrlAllowed(raw: string, allowPrivateHosts: readonly string[] = []): string {
+  const verdict = checkOutboundUrl(raw, allowPrivateHosts);
   if (!verdict.allowed) {
     throw new Error(`baseUrl 不被允许：${verdict.reason}`);
   }

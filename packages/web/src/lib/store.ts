@@ -187,6 +187,22 @@ export interface LiveCycle {
   cycleNumber: number;
   /** epoch ms —— `cycle_start` 事件的时间戳，组件用它算已等待秒数。 */
   startedAt: number;
+  /**
+   * **这一轮正在做的事，逐条累积**（`cycle_step` 事件）。
+   *
+   * ## 为什么放在 `liveCycle` 里而不是 `TraderLive` 上
+   *
+   * 它属于**某一轮**，轮次结束就该跟着消失 —— 挂在 `liveCycle` 上，
+   * 就自动继承了 `clearLiveCycle` 已有的三条清理路径（`decision` / `cycle_end` /
+   * 断开连接）。挂在外面则要再造一套"什么时候清"的判断，而那正是
+   * `clearLiveCycle` 那段注释警告过的坑：**漏一条就留下一个与真实状态无关的残留**。
+   *
+   * ## 为什么只留最近 N 条
+   *
+   * 一轮可能推几十条。界面折叠时只显示**最后一条**（"现在在做什么"），
+   * 展开才看全 —— 所以留一个够看的窗口即可，不无限增长。
+   */
+  steps: { at: string; level: 'info' | 'warn' | 'error'; message: string }[];
 }
 
 export interface TraderLive {
@@ -205,6 +221,8 @@ export interface TraderLive {
 }
 
 const MAX_LOGS = 600;
+/** 一轮在界面上保留的**步骤**条数上限 —— 折叠时只看最后一条，展开看这一窗也够。 */
+const MAX_CYCLE_STEPS = 60;
 const MAX_PER_TRADER = 120;
 
 function emptyTraderLive(): TraderLive {
@@ -516,7 +534,26 @@ export const useEvents = create<EventState>((set, get) => ({
           next.liveCycle = {
             cycleNumber: event.cycleNumber,
             startedAt: Number.isFinite(Date.parse(event.timestamp)) ? Date.parse(event.timestamp) : now,
+            steps: [],
           };
+          break;
+        /*
+         * 一轮**内部**的每一步 —— 用户 2026-10-10 要的"能展开看系统到底在做什么"。
+         *
+         * 只认**同一轮**的步骤：迟到的旧轮步骤不该混进新一轮的列表里
+         *（与 `clearLiveCycle` 的 `cycleNumber` 校验同一个理由）。
+         */
+        case 'cycle_step':
+          if (next.liveCycle && next.liveCycle.cycleNumber === event.cycleNumber) {
+            next.liveCycle.steps = [...next.liveCycle.steps, {
+              at: event.at,
+              level: event.level,
+              message: event.message,
+              /* 团队模式会带角色与阶段；其他模式是 `undefined`（界面据此判断）。 */
+              ...(event.role !== undefined ? { role: event.role } : {}),
+              ...(event.phase !== undefined ? { phase: event.phase } : {}),
+            }].slice(-MAX_CYCLE_STEPS);
+          }
           break;
         case 'trader_status':
           next.status = event.status;

@@ -105,6 +105,21 @@ class SimulatedBroker {
 
   constructor(private readonly priceOf: (symbol: string) => number) {}
 
+  /**
+   * ⚠️ **必须实现它（2026-10-11 审查发现）。**
+   *
+   * `AutoTrader` 每轮都会无条件调 `broker.getMaxLeverage(symbol)`（见杠杆上限缓存那段）。
+   * 真实 broker 有这个方法，而演示用的 `SimulatedBroker` 原来没有 ——
+   * 于是 `npm run demo` **必然首轮就失败**：方法不存在是同步 TypeError，
+   * 连 `.catch(() => null)` 都接不住（错误发生在 `.catch` 挂上之前）。
+   *
+   * 演示器的作用是"让人看到一轮完整跑通"，而它在第一轮就炸，等于这个工具是坏的。
+   * 返回 `null` 与真实 broker 在 `dryRun` 下的行为一致（不设上限）。
+   */
+  async getMaxLeverage(): Promise<number | null> {
+    return null;
+  }
+
   async getAccountState() {
     const unrealized = this.positions.reduce((sum, p) => sum + p.unrealizedPnl, 0);
     return {

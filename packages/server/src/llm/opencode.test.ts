@@ -113,3 +113,22 @@ test('★ 文档端点表里同属 /messages 的另外几族也要走 Anthropic'
 test('provider 本身就是 anthropic 时，与模型 id 无关', () => {
   assert.equal(usesAnthropicProtocol('anthropic', '任何模型'), true);
 });
+test('★ 其他供应商的 claude/minimax 模型【不能】被按模型名改道 —— 2026-10-11 审查发现的真 BUG', () => {
+  /*
+   * 这是我自己引入的 bug（581ea5d）：判定原来对**任何** provider 都按模型名前缀，
+   * 于是 `commandcode`（OpenAI 兼容聚合网关）选 claude 系模型、或任何自有部署的
+   * MiniMax / qwen3.7-3.8，都会被发到 `/messages` —— 而那些网关**只有 OpenAI 兼容端点**，
+   * 等于把请求发到一个不存在的路径上。
+   *
+   * 判据是"**这个网关会不会按模型换协议**"，不是"模型叫什么名字"。
+   * 所以这条用例钉住：**只有 opencode（与显式声明为 anthropic 的供应商）才改道**。
+   */
+  for (const provider of ['commandcode', 'custom', 'deepseek', 'minimax', 'gemini']) {
+    assert.equal(
+      usesAnthropicProtocol(provider, 'claude-haiku-5-5'),
+      false,
+      `★ ${provider} 上选 claude 模型时不该被改到 /messages —— 那个网关没有这个端点`,
+    );
+    assert.equal(usesAnthropicProtocol(provider, 'qwen3.8-max'), false, `${provider} 的 qwen 同理`);
+  }
+});

@@ -34,6 +34,7 @@ import {
 import {
   AutoTrader,
   CYCLE_HARD_TIMEOUT_MS,
+  detectSharpMove,
   describeCycleFailure,
   LEDGER_GAP_TOLERANCE_ABS,
   ledgerGapTolerance,
@@ -6337,5 +6338,185 @@ test('★ 未平仓仓位的持有成本符号不能混 —— 手续费【减�
     Math.abs(Number(check.gap)) < 1e-9,
     `★ 符号正确时 gap 必须是 0（平台侧 ${check.platformNet} vs 交易所 ${check.exchangeNet}）—— ` +
       `符号写反时它会是 2 × 未平仓手续费（这里应为 1.0）`,
+  );
+});
+/* -------------------------------------------------------------------------- */
+/*  部署重启不该打断决策周期（用户 2026-10-12 反复诟病的问题）                    */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * 造一个"上一次决策发生在 X 毫秒之前"的 AutoTrader。
+ *
+ * ## 为什么不改数据库
+ *
+ * `traders.update()` **不支持写 `lastCycleAt`** —— 那一列只有 `recordCycle()` 会写，
+ * 而它写的是 `now()`（当前时刻）。所以"把上次决策设成 10 秒前"这件事
+ * **在数据库层面做不到**（除非真的等 10 秒）。
+ *
+ * 而 `start()` 读的是 `this.deps.trader.lastCycleAt` —— 那是**构造时的对象**。
+ * 所以直接构造一个带目标时刻的 trader 对象即可：**精确、无等待**。
+ */
+function buildTraderWithLastCycle(
+  broker: FakeBroker,
+  model: DecisionModel,
+  lastCycleAt: string | null,
+  cycleMinutes: number,
+): AutoTrader {
+  const trader = traders.get(traderId)!;
+  const strategy = strategyStore.get(trader.strategyId!)!;
+  return new AutoTrader({
+    trader: { ...trader, lastCycleAt, cycleIntervalMinutes: cycleMinutes },
+    config: strategy.config,
+    registry: fakeRegistry,
+    market: {} as never,
+    marketData: fakeMarketData,
+    broker: broker as unknown as BinanceBroker,
+    model,
+  });
+}
+
+test('★★ 刚跑过一轮的机器人被重启时【不重复分析】，只等剩余时间', async () => {
+  /*
+   * 用户原话：
+   * > 「你改代码的时候（提交更新部署代码到服务器后，服务器会重启对吧，
+   * >  这时候运行中的机器人会被停止-启动，导致**决策周期刷新**……
+   * >  就例如我运行中的赚大钱，**这一分钟才运行了 AI 分析，你下一分钟更新了程序，
+   * >  机器人会被重新启动又马上进行分析**，你自己看着修，
+   * >  不要为了机器人正常而影响你更新，**应该是两全其美**」
+   *
+   * 根因：`start()` 里无条件 `void this.tick()` —— 每次启动都立刻跑一轮。
+   * 那句注释（"so the operator is not left waiting"）对**手动启动**是对的，
+   * 但对**部署重启**是错的。
+   *
+   * 这条测试钉住修好的行为：**距上次决策不足一个周期时，不得立刻再跑一轮**。
+   */
+  const broker = new FakeBroker();
+  let calls = 0;
+  const model: DecisionModel = {
+    async complete() {
+      calls += 1;
+      return { text: OPEN_LONG_RESPONSE, latencyMs: 1, usage: { promptTokens: 1, completionTokens: 1 } };
+    },
+  };
+
+  /* 上次决策在 10 秒前；周期 15 分钟 → 远未到点。 */
+  const trader = buildTraderWithLastCycle(broker, model, new Date(Date.now() - 10_000).toISOString(), 15);
+  await trader.start();
+  await new Promise((r) => setTimeout(r, 80));
+
+  assert.equal(calls, 0, '★ 距上次决策仅 10 秒，不该重复分析');
+  assert.ok(trader.nextCycleAt !== null, '★ 应当已排好下一轮时刻（界面倒计时要用）');
+  await trader.stop();
+});
+
+test('★★ 停机很久（超过一个周期）重启时【立刻跑】—— 行情已经变了', async () => {
+  /*
+   * 另一半：不能因为"怕重复"就把该跑的也推迟。
+   * 停机 40 分钟（周期 15 分钟）之后重启，应当立刻分析。
+   */
+  const broker = new FakeBroker();
+  let calls = 0;
+  const model: DecisionModel = {
+    async complete() {
+      calls += 1;
+      return { text: OPEN_LONG_RESPONSE, latencyMs: 1, usage: { promptTokens: 1, completionTokens: 1 } };
+    },
+  };
+
+  const trader = buildTraderWithLastCycle(broker, model, new Date(Date.now() - 40 * 60_000).toISOString(), 15);
+  await trader.start();
+  await new Promise((r) => setTimeout(r, 150));
+
+  assert.ok(calls > 0, '★ 停机超过一个周期后重启，应当立刻分析');
+  await trader.stop();
+});
+
+test('★ 从没跑过的机器人（lastCycleAt 为空）重启时【立刻跑】', async () => {
+  /* 新建的机器人没有 lastCycleAt —— 操作员在等结果，不能让它干等一个周期。 */
+  const broker = new FakeBroker();
+  let calls = 0;
+  const model: DecisionModel = {
+    async complete() {
+      calls += 1;
+      return { text: OPEN_LONG_RESPONSE, latencyMs: 1, usage: { promptTokens: 1, completionTokens: 1 } };
+    },
+  };
+
+  const trader = buildTraderWithLastCycle(broker, model, null, 15);
+  await trader.start();
+  await new Promise((r) => setTimeout(r, 150));
+
+  assert.ok(calls > 0, '★ 首次启动应当立刻分析');
+  await trader.stop();
+});
+test('★★★ 持仓剧变检测：超阈值才触发，且报出最极端的那个', () => {
+  /*
+   * ## 为什么需要它（"持续工作"缺的最后一块）
+   *
+   * 已有的提前唤醒只有一个触发源：**成交**（`manager.ts` 里那句
+   * `requestEarlyCycle('有成交')`）。而真正需要"立刻看一眼"的情形里，
+   * **大多数没有成交**：
+   * ```
+   *   · 持仓标的突然拉升 8% —— 该考虑止盈/移动止损，但没成交就不唤醒
+   *   · 大盘急跌 —— 该考虑减仓，但没成交就不唤醒
+   * ```
+   * 于是团队只能等到下一个周期（最长 120 分钟）——
+   * **而止损可能已经被打掉了，团队还在按"持有"思考**。
+   */
+  /* 阈值内 → 不触发（1 分钟的噪音不是"重新评估"的理由）。 */
+  assert.equal(
+    detectSharpMove({ moves: [{ symbol: 'BTCUSDT', changePercent: 0.8 }], threshold: 3 }),
+    null,
+    '★ 阈值内的波动不该唤醒',
+  );
+  /* 超阈值 → 触发，且带方向与幅度。 */
+  const up = detectSharpMove({ moves: [{ symbol: 'ETHUSDT', changePercent: 5.5 }], threshold: 3 });
+  assert.ok(up !== null && up.includes('ETHUSDT') && up.includes('涨') && up.includes('5.50'), `★ 实际：${up}`);
+  const down = detectSharpMove({ moves: [{ symbol: 'SOLUSDT', changePercent: -4.2 }], threshold: 3 });
+  assert.ok(down !== null && down.includes('跌') && down.includes('4.20'), `★ 实际：${down}`);
+});
+
+test('★★★ 多个剧变时报【最极端】的，并说明还有几个', () => {
+  /*
+   * ⚠️ 若只报第一个，操作员会以为是"唯一的一个" ——
+   * 而实际有三个标的在剧变。**省略必须说出来**（本项目的既有纪律）。
+   */
+  const r = detectSharpMove({
+    moves: [
+      { symbol: 'AAAUSDT', changePercent: 3.2 },
+      { symbol: 'BBBUSDT', changePercent: -9.8 },
+      { symbol: 'CCCUSDT', changePercent: 4.0 },
+    ],
+    threshold: 3,
+  });
+  assert.ok(r !== null);
+  assert.ok(r!.includes('BBBUSDT'), '★ 应当报绝对值最大的那个');
+  assert.ok(r!.includes('另有 2 个'), `★ 必须说出还有几个（实际：${r}）`);
+});
+
+test('★ 非有限数不参与判断（NaN 不该被当成"没变化"）', () => {
+  /*
+   * ⚠️ `NaN >= 3` 是 `false` —— 若不显式过滤，一个 NaN 会**静默地**
+   * 让那个标的永远不被检测到（而它不是"没变化"，是"数据坏了"）。
+   */
+  const r = detectSharpMove({
+    moves: [
+      { symbol: 'BADUSDT', changePercent: Number.NaN },
+      { symbol: 'OKUSDT', changePercent: 6 },
+    ],
+    threshold: 3,
+  });
+  assert.ok(r !== null && r!.includes('OKUSDT'), '★ 坏数据不该掩盖好数据');
+  assert.ok(!r!.includes('BADUSDT'), '★ 坏数据不该被报出来');
+});
+
+test('★ 空列表 / 全部在阈值内 → 不触发（这是常态，必须静默）', () => {
+  assert.equal(detectSharpMove({ moves: [], threshold: 3 }), null);
+  assert.equal(
+    detectSharpMove({
+      moves: [{ symbol: 'A', changePercent: 1 }, { symbol: 'B', changePercent: -2 }],
+      threshold: 3,
+    }),
+    null,
   );
 });

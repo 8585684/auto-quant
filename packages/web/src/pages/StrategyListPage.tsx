@@ -26,6 +26,7 @@ import { Badge, Button, Empty, ErrorNote, Modal, Panel, Spinner3, TextInput } fr
 import { SectionHeading } from '../components/Badges';
 import { PageShell, SectionLabel } from '../components/shell';
 import { StrategyCheckButton, StrategyCheckModal } from '../components/StrategyCheckModal';
+import { PageActions } from '../templates/lib/PageActions';
 import { fmtDateTime } from '../lib/format';
 
 /** 首屏渲染多少行策略；再多就分批展开，避免一次挂出上百行。 */
@@ -197,10 +198,15 @@ export function StrategyListPage() {
         title="策略工坊"
         sub="策略是一整套交易法则：币种池、指标、硬性风控限制以及提示词本身。整行可点即可编辑。"
         right={
-          <Button variant="primary" onClick={() => setPresetOpen(true)}>
-            <Plus aria-hidden className="h-3.5 w-3.5" />
-            新建策略
-          </Button>
+          /* 页面级动作 → 统一接口（控制台模板收进工具栏，经典模板就地显示）。 */
+          <PageActions
+            end={
+              <Button variant="primary" onClick={() => setPresetOpen(true)}>
+                <Plus aria-hidden className="h-3.5 w-3.5" />
+                新建策略
+              </Button>
+            }
+          />
         }
       />
 

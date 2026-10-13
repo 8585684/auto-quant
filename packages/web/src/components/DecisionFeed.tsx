@@ -133,18 +133,37 @@ import {
   FileText,
   LoaderCircle,
   Lock,
+  Maximize2,
   RotateCw,
   Sparkles,
   TriangleAlert,
   X,
 } from 'lucide-react';
-import { exchangeErrorLabel, type DecisionRecord, type Decision, type ExecutionLogEntry } from '@aq/shared';
+import { exchangeErrorLabel, type DecisionRecord, type Decision, type ExecutionLogEntry, type TraderMode } from '@aq/shared';
 import { api, type MarketSymbol } from '../lib/api';
 import { useLiveCycle, useEvents, type LiveCycle } from '../lib/store';
+import { FeedErrorBoundary } from './FeedErrorBoundary';
+import { parseTeamTrace } from '../lib/teamTrace';
+import { DebateView } from './DebateView';
+/**
+ * **团队看板**（2026-10-12 重做）。
+ *
+ * ⚠️ **只在 `mode === 'ai_team'` 时渲染** —— 另两种模式的界面必须逐字节不变。
+ * 新组件放在 `./TeamBoard/` 下，与旧的那三个（`TeamRoster` / `FirmRoster` /
+ * `DebateView`）并存：旧三个仍在团队模式下用于「组织架构」等既有内容，
+ * 而 `TeamBoard` 替换的是**实时工作流区**与**决策行**这两个主视图。
+ *
+ * 为什么另起一套而不是继续改旧组件：旧那三个用了一整批**本项目 Tailwind
+ * 配置里根本不存在**的类（`border-base-700` / `bg-base-850` / `bg-up`…），
+ * 实测渲染出来没有边框、没有底色、状态灯没有颜色 —— 见 `TeamBoard/roster.ts`
+ * 文件头的完整对照表。那是"改不动"的，只能重写。
+ */
+import { TeamBoard } from './TeamBoard/TeamBoard';
+import { TeamCycleBlock } from './TeamBoard/TeamCycleBlock';
 import { usePolled } from '../lib/hooks';
 import { Badge, Empty, Panel, Spinner3, cn } from './ui';
 import { ActionBadge, STATUS_LABELS, actionLabel, isOpenAction } from './DecisionAudit';
-import { fmtInt, fmtLatency, fmtPriceUsd, fmtQty, fmtUsd, timeAgo } from '../lib/format';
+import { fmtInt, fmtLatency, fmtPriceUsd, fmtQty, fmtUsd, isNum, timeAgo } from '../lib/format';
 
 /**
  * 一页多少轮。
@@ -255,6 +274,148 @@ function elapsedLabel(seconds: number): string {
  * 它回答的是"卡住了还是只是慢"这个问题，只有在这个条目内部才读得通
  * （`LAYOUT.md` §5 禁止把诊断值放进状态区）。
  */
+/**
+ * 这一轮的**步骤流水** —— 默认折叠，点开看每一步。
+ *
+ * ## 用户的原话（2026-10-10）
+ *
+ * > 「智能模式下，每一期最近决策里面能展开（就像你 DSH 一样），能折叠实时显示当前步骤
+ * >  （默认是缩起来的，用户可以手动展开），这样用户可以手动展开看系统到底在做什么，
+ * >  也可以判断系统到底是否正常工作」
+ * > 「如果不展开，就默认显示一条:关键的摘要，能大概看到在做什么，是否在做事，
+ * >  如果想看详情，再手动展开查看，里面就完全展示这一轮具体再做什么」
+ *
+ * ## 两条形态约束
+ *
+ * · **折叠态只有一行**：`步数 │ 最新那一步 │ 已用时`。它要回答的就是
+ *   "在做事吗、卡在哪一步"，所以取的必须是**最新一条**，不是第一条。
+ * · **展开态是完整流水**（带每步的时刻），后端只给最近 60 条。
+ *
+ * 用 `<button>` + 条件渲染而不是 `<details>`：`<details>` 的展开态不进 React 状态，
+ * 而这里要跟着 `steps` 增长自动滚到最新（列表本身在增长，不能用一次性快照）。
+ */
+function CycleSteps({ steps, elapsedSec }: { steps: LiveCycle['steps']; elapsedSec: number }) {
+  const [open, setOpen] = useState(false);
+  if (steps.length === 0) return null;
+  const last = steps[steps.length - 1]!;
+  const lastAt = Date.parse(last.at);
+  /*
+   * ⚠️ **两个数必须是同一口径，否则屏幕上会出现两个对不上的时间（用户 2026-10-10 实测）。**
+   *
+   * 上一版这里算的是"首步→末步的跨度"，而下面那个盒子写的是"从开始等到现在" ——
+   * 于是同一屏出现 `93s` 与 `已等待 2 分 39 秒`。用户的原话是「你自己看看你做的这个
+   * 合理吗？……用了多少时间？」。
+   *
+   * 现在：`elapsedSec` 由父组件给（与盒子同一个来源），
+   * `currentSec` 是**当前这一步**已经走了多久 —— 它们相减没有意义，因为回答的是两个问题。
+   */
+  const mmss = (s: number): string => `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+  return (
+    <div className="mb-1.5 min-w-0 rounded-md border border-base-700 bg-base-850/60 px-2.5 py-2 text-xs">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        title={open ? '收起这一轮的步骤' : '展开这一轮在做的每一步'}
+        className="group flex w-full min-w-0 items-center gap-2 text-left"
+      >
+        <span aria-hidden className="shrink-0 text-ink-lo transition group-hover:text-ink-hi">
+          {open ? '▾' : '▸'}
+        </span>
+        {/*
+          运行指示点：折叠时也要一眼看出"它还在动"。
+          与元数据行那个点是同一个类名 —— 同一个含义用同一个标记
+          （`animate-pulse-soft` 是 `tailwind.config.js` 里注册的名字）。
+        */}
+        <span aria-hidden className="h-1.5 w-1.5 shrink-0 animate-pulse-soft rounded-full bg-accent" />
+
+        {/* 最新一步 —— 折叠时这一格就是"它现在在做什么"。**最亮的一档**：它是本体。 */}
+        <span className="min-w-0 truncate text-ink-hi">{last.message}</span>
+        {/*
+          两个数回答两个问题，**同一口径**（见上面 `elapsedSec` 的说明）：
+          · `mmss(elapsedSec)`   —— 这一轮一共跑了多久
+          · `currentSec`         —— **当前这一步**已经卡了多久（它才是"是不是卡住"的答案）
+        */}
+        {/*
+          ⚠️ **就一个计时器，别的都不写（2026-10-10）。**
+          
+          上一版这里是「已 1:53 · 这一步 1s」。用户的原话是
+          「这表述我他妈看得一头雾水，你就直接显示计时不就好了吗？
+            搞些什么奇奇怪怪得非主流语言在上面」。
+          
+          **他说得对**：`已` / `这一步` 是我自己发明的说法，一个读数不需要前缀；
+          计时器本身就是"从开始到现在"，跳动的秒数已经回答了"它还在动吗"。
+          每一步各花了多久，去展开视图里看（那里是表格，列本身有含义）。
+          
+          唯一保留的判断是**颜色**：超过 2 分钟转琥珀色 —— 那是"比平常久"的
+          无声提示，不占字。
+        */}
+        <span
+          className={
+            'num ml-auto shrink-0 tabular-nums ' +
+            (elapsedSec >= 120 ? 'text-accent' : 'text-ink-hi')
+          }
+        >
+          {mmss(elapsedSec)}
+        </span>
+      </button>
+      {open && (
+        <ol className="mt-2 space-y-1 border-t border-base-700 pt-2">
+          {steps.map((s, i) => {
+            const at = Date.parse(s.at);
+            const prevAt = i > 0 ? Date.parse(steps[i - 1]!.at) : at;
+            /*
+             * **这一步花了多久** = 它自己的时刻 − 上一步的时刻。
+             * 这是"慢在哪一步"唯一的答案 —— 只给绝对时刻的话，
+             * 人还得自己心算相邻两行的差。
+             */
+            const deltaSec =
+              Number.isFinite(at) && Number.isFinite(prevAt)
+                ? Math.max(0, Math.round((at - prevAt) / 1000))
+                : 0;
+            const isCurrent = i === steps.length - 1;
+            return (
+              <li key={`${s.at}-${i}`} className="flex min-w-0 items-start gap-2">
+                {/* 时刻与耗时都是**读数**，用能看清的一档。 */}
+                <span className="num shrink-0 text-ink-lo">
+                  {new Date(s.at).toLocaleTimeString('en-GB', { hour12: false })}
+                </span>
+                {/*
+                  ⚠️ **状态标记说的是实话，不编造成功/失败。**
+                  服务端只给了"发生过"与日志级别，没给"这一步成没成" ——
+                  所以：最后一条 = **正在这一步**（转圈），其余 = **已发生**（对勾）；
+                  级别是 error/warn 时用红/黄把**那一条日志本身**的严重性标出来。
+                  **不要**把"日志级别"伪装成"步骤成败"：那正是本项目反复在消灭的
+                  "一个字段说做成了、另一个字段说什么都没有"。
+                */}
+                <span
+                  aria-hidden
+                  className={
+                    'w-3 shrink-0 text-center ' +
+                    (isCurrent ? 'animate-pulse-soft text-accent' : 'text-ink-faint')
+                  }
+                >
+                  {isCurrent ? '⟳' : '✓'}
+                </span>
+                <span className="num w-11 shrink-0 text-right text-ink-lo">
+                  {deltaSec === 0 ? '—' : `${deltaSec}s`}
+                </span>
+                <span
+                  className={
+                    'min-w-0 break-words ' +
+                    /* 正文比读数更亮一档：它是主角，时刻与耗时是配角。 */
+                    (s.level === 'error' ? 'text-down' : s.level === 'warn' ? 'text-accent' : 'text-ink-hi')
+                  }
+                >
+                  {s.message}
+                </span>
+              </li>
+            );
+          })}
+        </ol>
+      )}
+    </div>
+  );
+}
 function LiveCycleBlock({ live }: { live: LiveCycle }) {
   const startedAt = live.startedAt;
   const [seconds, setSeconds] = useState(() => Math.max(0, Math.floor((Date.now() - startedAt) / 1000)));
@@ -292,16 +453,24 @@ function LiveCycleBlock({ live }: { live: LiveCycle }) {
           │
         </span>
         <span className="num">周期 #{live.cycleNumber}</span>
-        <span aria-hidden className="text-ink-faint">
-          │
-        </span>
-        <span className="animate-pulse-soft">正在请求模型…</span>
+        {/*
+          ⚠️ **这一格不再重复"当前步骤"（2026-10-10，用户实测）。**
+          
+          加了步骤流水之后，这里和下面折叠行的摘要显示的是**同一句话**，
+          屏幕上连着两行一模一样的字 —— 用户的原话是「这 2 行重复了」。
+          
+          "现在在做什么"只该有一个出处：下面那一行（它同时还带步数与用时，
+          并且是**可点的展开入口**）。这里保留状态与周期号即可。
+        */}
       </div>
 
       {/*
         盒子：虚线边框 + 更弱的底色，**不是**成品的 `bg-base-850`。
         实线 + 抬升底色是"这一轮已经出结果"的语言，用在这里会被读成成品（§1）。
       */}
+      {/* 步骤流水：默认折叠成一行摘要，点开看这一轮在做的每一步。 */}
+      <CycleSteps steps={live.steps} elapsedSec={seconds} />
+
       <div className="min-w-0 rounded-lg border border-dashed border-base-600 bg-base-900/40 px-3 py-3">
         <div className="flex min-w-0 items-start gap-2">
           <LoaderCircle aria-hidden className="mt-0.5 h-4 w-4 shrink-0 animate-spin text-accent" />
@@ -369,16 +538,93 @@ function CycleCountdown({ nextCycleAt }: { nextCycleAt: number | null }) {
   );
 }
 
+/**
+ * **最新一轮的结论**（2026-10-13 加）—— 团队模式左栏。
+ *
+ * ## 用户的要求
+ *
+ * > 「这一块UI展示区域太小了，根本显示不了这么多，直接跳转把这块占用全部页面。
+ * >  **把结论那块移动到左边**」
+ *
+ * ## 为什么单独抽一个组件（而不是复用下面的列表）
+ *
+ * 下面的 `runs.map()` 渲染的是**历史全部轮次**（滚动的决策流水）——
+ * 而这一栏要回答的是**"现在这一轮决定了什么"**，两者职责不同：
+ * ```
+ *   左栏（本组件）：最新一轮的结论 —— 常驻可见，不滚走
+ *   下方滚动区   ：历史轮次        —— 要看过去时才滚
+ * ```
+ *
+ * ⚠️ 用**同一个 `TeamCycleBlock`** 渲染，不另写一套 ——
+ * 那样"结论长什么样"只有一个定义处，不会两处漂移。
+ */
+function LatestConclusion({
+  record,
+  symbols,
+  mode,
+}: {
+  record: DecisionRecord | null;
+  symbols: readonly MarketSymbol[];
+  mode: 'strategy' | 'ai_managed' | 'ai_team';
+}): React.ReactElement {
+  if (record === null) {
+    return (
+      <p className="px-1 py-2 text-xs text-ink-faint">
+        还没有决策记录 —— 跑一轮之后这里会显示它决定了什么。
+      </p>
+    );
+  }
+  return (
+    <div className="min-w-0">
+      {/*
+        ⚠️ 单独包错误边界：与下方列表同一个理由 ——
+        一条字段不全的记录不该让整个看板白屏。
+      */}
+      <FeedErrorBoundary>
+        {mode === 'ai_team' ? (
+          <TeamCycleBlock record={record} symbols={[...symbols]} />
+        ) : (
+          <CycleBlock record={record} symbols={[...symbols]} mode={mode} />
+        )}
+      </FeedErrorBoundary>
+    </div>
+  );
+}
+
 export function DecisionFeed({
   traderId,
   running,
   actions,
   nextCycleAt = null,
+  mode = 'strategy',
+  focusMode = false,
+  onToggleFocus,
 }: {
   traderId: number;
   running?: boolean;
   actions?: ReactNode;
   nextCycleAt?: number | null;
+  /**
+   * 机器人模式 —— **决定实时区显示什么**（用户 2026-10-12 要求三种模式看板分开）。
+   *
+   * · `ai_team` —— 显示**团队编制表**（谁在做什么、什么分工、并行还是串行）
+   * · 其他 —— 显示原来的线性步骤列表
+   *
+   * ⚠️ 默认值是 `'strategy'`，所以**既有调用点（另两种模式）行为完全不变** ——
+   * 不传 `mode` 就与改动前逐字节一致。
+   */
+  mode?: 'strategy' | 'ai_managed' | 'ai_team';
+  /**
+   * **是否处于"决策流占满整页"的聚焦模式**（2026-10-13 用户要求）。
+   *
+   * 用户原话：
+   * > 「这一块UI展示区域太小了，根本显示不了这么多，**直接跳转把这块占用全部页面**」
+   *
+   * ⚠️ 默认 `false` —— 不传就与改动前完全一致（三种模式都不受影响）。
+   */
+  focusMode?: boolean;
+  /** 退出聚焦模式（聚焦时在工具栏显示「返回」）。 */
+  onToggleFocus?: () => void;
 }) {
   const live = useEvents((s) => s.byTrader[traderId]?.decisions);
   const liveCycle = useLiveCycle(traderId);
@@ -536,6 +782,47 @@ export function DecisionFeed({
   const listMounted = records.length > 0 || showLive;
 
   /**
+   * **最近一轮里各岗位的步骤** —— 没有在途轮次时，固定工作流区显示这个。
+   *
+   * ## 为什么需要它
+   *
+   * `liveCycle` 只在周期**进行中**存在。若工作流区只在那一刻显示，
+   * 操作员在绝大部分时间里看到的是一个空白的头 —— 而那正是
+   * 「**看不清 AI 运行状态**」的成因之一。
+   *
+   * ## 为什么从 `rawResponse` 解析、而不是读 `cycle_step`
+   *
+   * `cycle_step` **不落库**（见 `domain.ts` 的说明），所以页面刷新之后就没了。
+   * 而每一轮的 `<team>` 块**已经落库**在 `decision_records.raw_response` 里，
+   * 里面有每个角色的产出摘要与模型名（见 `deskOutput.ts` 的 `renderDeskOutcome`）。
+   *
+   * 所以"最近一轮谁做了什么"可以从**任意一条已落库的团队记录**里重建 ——
+   * 不需要给数据库加列、不需要迁移（迁移要动挂着实盘的 `traders` 表，风险不值得）。
+   *
+   * ⚠️ **只取团队记录**：普通/智能托管模式的 `rawResponse` 里没有 `<team>` 块，
+   * `parseTeamTrace` 返回 `null` → 跳过。不然会把别家模式的记录当成团队产出。
+   */
+  const latestTeamSteps = useMemo(() => {
+    for (const record of records) {
+      const trace = parseTeamTrace(record.rawResponse);
+      if (trace === null || trace.members.length === 0) continue;
+      return trace.members.map((member) => ({
+        at: record.timestamp,
+        level: 'info',
+        message: member.text,
+        role: member.role,
+        /*
+         * 阶段：`<team>` 块里没有记阶段，所以**不编造** ——
+         * 传 `null`，界面上那一格就不显示。编一个"分析"出来会让
+         * "这个岗位在哪个阶段"变成一个不可信的数。
+         */
+        phase: null,
+      }));
+    }
+    return [];
+  }, [records]);
+
+  /**
    * 取下一页（更早的 20 条），追加到下面。
    *
    * 游标是"手里最小的 id"，不是偏移量，所以**不会**因为这会儿又跑完了一轮而错位：
@@ -667,7 +954,20 @@ export function DecisionFeed({
    */
   const headerActions = (
     <span className="flex items-center gap-1.5">
-      <CycleCountdown nextCycleAt={nextCycleAt} />
+      {/*
+        ⚠️ **团队模式不显示"下一轮倒计时"**（用户 2026-10-12 的反馈）。
+
+        用户的原话：
+        > 「**为什么还有下一轮次倒计时，本模式应该是 7X24 不间断工作**，
+        >  不是之前那两种定时分析判断的了，是多 AI 全自动自动工作
+        >  那么这个**倒计时也不应该存在**」
+
+        **他是对的**，而且这不只是显示问题：
+        · 团队模式的运行方式是"有人有活就干"（成交后立即唤醒、AI 自己决定下次什么时候看），
+          而倒计时传达的是"**到点了才会干活**"—— 与它的实际行为矛盾；
+        · 另两种模式（普通 / 智能托管）确实是周期性的，倒计时对它们**仍然是准确信息**。
+        */}
+      {mode !== 'ai_team' && <CycleCountdown nextCycleAt={nextCycleAt} />}
       {actions}
       <button
         type="button"
@@ -682,6 +982,25 @@ export function DecisionFeed({
       <Link to="/data" className="text-xs text-ink-lo transition hover:text-accent">
         全部记录
       </Link>
+      {/*
+        ── **全屏切换**（2026-10-13 用户要求）──────────────────────────────
+        用户原话：
+        > 「这一块UI展示区域太小了，根本显示不了这么多，**直接跳转把这块占用全部页面**」
+
+        ⚠️ 只在**调用方提供了 `onToggleFocus`** 时显示 ——
+        于是其他页面（概览、常见问题）的用法完全不变。
+      */}
+      {onToggleFocus !== undefined && (
+        <button
+          type="button"
+          onClick={onToggleFocus}
+          title={focusMode ? '返回常规视图（图表与账户卡）' : '让决策流占满整页 —— 团队看板在 40% 宽度下装不下'}
+          className="inline-flex items-center gap-1 rounded px-1.5 py-1 text-xs text-ink-lo transition hover:text-ink-hi"
+        >
+          <Maximize2 aria-hidden className="h-3.5 w-3.5" />
+          {focusMode ? '退出全屏' : '全屏'}
+        </button>
+      )}
     </span>
   );
 
@@ -716,42 +1035,306 @@ export function DecisionFeed({
           hint="每个周期都会连同完整提示词与原始响应一起持久化 — 运行一次后这里就会填满。"
         />
       ) : (
-        // One scroll container. 每轮 = 元数据行 + 盒子 + 两个文字按钮。
-        //
-        // `flex-1 min-h-0`：高度来自右栏（`h-full` 的确定高度），不是 `max-height`。
-        // `min-h-0` 不能省 —— flex 子项默认 `min-height: auto`，那一项会让滚动区
-        // 永远不肯比内容矮，于是滚动条跑到整栏外面去。
-        //
-        // `max-h-[calc(100dvh-16rem)]` 只在 `xl` 以下生效：那时右栏塌到主内容下面，
-        // 高度是内容高度，没有这个上限就会把整页撑长。
-        //
-        // `space-y-2.5` 而不是相邻的 `border-b`：40 个周期用一条接一条的分隔线排下来，
-        // 会连成一整片、分不清哪里是上一个周期的结尾。
-        <div
-          /*
-           * `ref` + `onScroll` 是**分页与滚动位置**要的两样东西：
-           * 前者给 `IntersectionObserver` 当 `root`（哨兵必须在容器里比较，不能和窗口比），
-           * 也给那个把视口钉住的 `useLayoutEffect` 当测量对象；
-           * 后者维护"提交前"的 `scrollTop`（滚动不触发 React 重渲染，只能自己记）。
-           */
-          ref={scrollerRef}
-          onScroll={(event) => {
-            scrollTopRef.current = event.currentTarget.scrollTop;
-          }}
-          className="min-h-0 flex-1 space-y-2.5 overflow-y-auto p-2.5 max-h-[calc(100dvh-16rem)] xl:max-h-none"
-        >
+        <>
           {/*
-            在途周期钉在**最上面**，早于最新的成品（列表是按周期号倒序的）。
-            它是"现在正在发生的事"，扫视时的第一落点必须是它 ——
-            放在下面等于要操作者先划过一整盒已经结束的决策才看见"它在动"。
-            它不受分页影响：它不属于任何一页，只是钉在这个列表的顶部。
+            ══════════════════════════════════════════════════════════════════
+             **AI 工作流（固定区）** —— 团队模式专属（2026-10-12 用户要求）
+            ══════════════════════════════════════════════════════════════════
+
+            用户原话：
+            > 「在我想象中应该是**固定展示 AI 工作流**，一部分**滚动展示最终决策**
+            >  等关键信息」
+            > 「应该是上面固定展示**各智能体工作状态和摘要**，用户有需要可以手动点击
+            >  打开查看详情」
+
+            ## 为什么是"真正固定"，而不是 `sticky`
+
+            上一版把编制表放在滚动容器**内部**、靠 `sticky top-0` 钉住。那不够：
+            `sticky` 元素仍然是滚动内容的一部分，它参与 `space-y` 布局、
+            会跟着容器一起被裁切，而且它的可用高度会随内容变化 ——
+            工作流区越高，下面的决策区就越矮，而"最高的那一轮"恰好最该看得清。
+
+            现在的工作流区是滚动容器**外面**的兄弟节点（`shrink-0`）：
+            它有自己的高度，决策区拿**剩下**的高度自己滚。
+            于是"上面固定、下面滚动"是布局事实，不是视觉巧合。
+
+            ## 为什么没有在途轮次时**也显示**它
+
+            `liveCycle` 只在周期进行中存在。如果只在那一会儿显示，操作员在
+            绝大部分时间里看到的是一个**空白的头** —— 而这正是"看不清 AI 运行状态"
+            的成因之一。所以：
+              · 有在途轮次 → 显示这一轮的实时状态（谁在进行中/已完成/失败）；
+              · 没有在途轮次 → 仍然显示**完整编制表**（谁在岗、谁规划中、
+                以及最近一轮各岗位的产出摘要），只是时间轴停在最后一轮。
+
+            这样"这家公司有哪些人、各自在干什么"是**常驻**信息，
+            而不是"碰巧抓到了才有"。
           */}
-          {showLive && liveCycle && <LiveCycleBlock key={liveCycle.cycleNumber} live={liveCycle} />}
+          {mode === 'ai_team' && (
+            /*
+             * ⚠️ **固定区的高度上限用【百分比】，不能用 `vh`**（2026-10-12 实测）。
+             *
+             * 第一版给编制表写了 `max-h-[38vh]`。在 900px 高的视口上那是 342px，
+             * 但固定区还要加上看板头（45px）与外层内边距（20px）——
+             * **实测整块变成 429px，而决策区只剩 123px**。
+             *
+             * 123px 装不下一轮决策，于是"上面固定工作流、下面滚动决策"这条
+             * 需求实际上**没有成立**：决策区被压成了装饰。
+             *
+             * 而 `vh` 在这里本来就是个错的量：决策面板的高度来自右栏
+             * （`h-full` 那条高度链），**不是**视口高度。视口很矮时
+             * （右栏被 `max-h` 截断）`38vh` 会大过整个面板。
+             *
+             * 改成 `max-h-[45%]`：百分比解析的正是**面板内容区的确定高度**
+             * （上面那个 `min-h-0 flex-1` 的 div），于是决策区**至少**拿到 55%。
+             * 这个上限与视口无关，与面板实际多高有关 —— 那才是对的量。
+             *
+             * 面板高度不确定时（`xl` 以下整页流式布局）百分比 max-height 不解析，
+             * 等价于没有上限；那种形态下页面本来就整页滚，不会互相挤。
+             */
+            <div
+              /*
+               * ── **团队模式改成左右两栏**（2026-10-13 用户要求）──────────────
+               *
+               * 用户原话：
+               * > 「这一块UI展示区域太小了，根本显示不了这么多，直接跳转把这块占用全部页面。
+               * >  **把结论那块移动到左边**」
+               *
+               * ## 之前是单列纵向：工作流在上、决策在下
+               *
+               * 两者**抢同一份高度**（固定区 `max-h-[45%]`），于是：
+               * ```
+               *   工作流区越高 → 决策区越矮 → 而"最复杂的那一轮"恰好最该看得清
+               * ```
+               * 而它们是**两类不同的信息**：
+               * ```
+               *   左：结论 —— 这一轮决定了什么（人最常看的）
+               *   右：过程 —— 谁在干什么（要细看时才看的）
+               * ```
+               * 横向并排让两者**各自拿到完整高度**，不再互相挤压。
+               *
+               * ⚠️ 窄屏（`lg` 以下）仍然纵向堆叠 —— 两栏在手机上会挤成两条缝。
+               */
+              className={cn(
+                /*
+                 * ⚠️ **工作流区吃掉【全部剩余高度】`flex-1`**（2026-10-13 用户要求）。
+                 *
+                 * 用户原话：
+                 * > 「比例要改啊，图 2 这部分要占到 90% 才对
+                 * >  （先临时快速做修改后续再调整）」
+                 * > 「我没看到你改的结果啊，工作流这个区块还是不行」
+                 *
+                 * ## 三次尝试的过程（诚实记录）
+                 *
+                 * ```
+                 *   ① max-h-[90%]   → 无效：max-height 只是上限，
+                 *                      实际高度仍由内容决定（实测 444px）
+                 *   ② basis-[90%]   → 数学正确但不够：90% 的基准是【父级】656px
+                 *                      → 590px（视口是 1000px）
+                 *   ③ flex-1（现在）→ 吃掉面板内容区的【全部剩余高度】
+                 * ```
+                 * **①② 都不够狠** —— 它们都在"争一个比例"，而这个区块本来就该
+                 * **占主导**（用户的原话是"这部分要占到 90%"）。
+                 *
+                 * ## 为什么 `flex-1` 才是对的
+                 *
+                 * ```
+                 *   面板内容区（656px）
+                 *     ├─ 工作流区   flex-1        → 吃掉全部剩余
+                 *     └─ 决策记录区 固定小高度上限  → 只留一条（见下面那个兄弟节点）
+                 * ```
+                 * 决策记录是**回看**用的，它不该和工作流抢空间 ——
+                 * 给它一个"能看见最近 1–2 轮"的小高度上限就够。
+                 *
+                 * ⚠️ `min-h-0` 不能省：flex 子项默认 `min-height: auto`，
+                 * 那一项会让它不肯比内容矮，内部的滚动条就永远不会出现。
+                 */
+                'flex min-h-0 flex-1 flex-col gap-2 border-b border-base-800 p-2.5',
+                /*
+                 * ⚠️ **两栏只在全屏时用**（2026-10-13 实测修正）。
+                 *
+                 * 第一版无条件两栏 —— 而常规视图的右栏只有 40% 宽
+                 *（实测 723px），拆成两栏后工作流只剩 **295px**，
+                 * **比改动前更窄**。那与用户"展示区域太小"的抱怨正好相反。
+                 *
+                 * 所以：
+                 * ```
+                 *   常规视图（右栏 40%）→ 单列（结论在上、工作流在下）
+                 *   全屏视图（整页宽）  → 两栏（结论在左、工作流在右）
+                 * ```
+                 */
+                focusMode && 'lg:flex-row',
+              )}
+            >
+              {/*
+                ⚠️ **左栏（结论）只在全屏时渲染**（2026-10-13 实测修正）。
+
+                常规视图（右栏仅 40% 宽）里，如果把结论也放进来，两者就**各拿
+                一半的 45%** —— 实测工作流只剩 **226px**，比改动前的 308px 更矮，
+                与用户"展示区域太小"的抱怨正好相反。
+                （⚠️ 那段实测是在 `max-h` 还是 45% 时做的；现在上限已改成 90%，
+                   但"常规视图不拆两栏"这个结论不变 —— 见下面。）
+
+                而常规视图**本来就不缺结论**：下面的滚动列表里每一轮都有结论行。
+                所以：
+                ```
+                  常规视图：只有工作流（拿满上限）+ 下面滚动的全部轮次
+                  全屏视图：左栏结论（常驻不滚走）+ 右栏工作流
+                ```
+              */}
+              {focusMode && (
+                <div className="min-h-0 min-w-0 flex-1 overflow-y-auto">
+                  <LatestConclusion
+                    record={records[0] ?? null}
+                    symbols={symbolsQuery.data ?? []}
+                    mode={mode}
+                  />
+                </div>
+              )}
+              {/*
+                右栏：**工作流**（谁在干什么）。
+
+                ⚠️⚠️ **这里必须是 `flex-1 min-h-0`，不能是 `shrink-0`**
+                （2026-10-13 实测抓到重叠 BUG）。
+
+                ## 事故现象
+
+                用户截图：工作流区**溢出并压住了下面的决策记录**
+                （"周期 #13"、"其余岗位 15 个"被盖住）。
+
+                ## 根因：`shrink-0` 让这一层**按内容长高**，高度链断掉
+
+                `TeamBoard` 内部是 `flex-1 min-h-0` —— 它要拿"父容器给它的那份高度"。
+                而这一层如果 `shrink-0`（且没有 `flex-1`），它的高度就等于**内容高度**：
+                ```
+                  外层 max-h-[45%]（有确定高度上限）
+                    └─ 右栏 div  shrink-0  → 高度 = 内容高度（不收缩！）
+                         └─ TeamBoard flex-1 → 父没有确定高度 → 也按内容长高
+                              → 整块溢出外层 max-h → 压住下面
+                ```
+                也就是说：**`shrink-0` 把"上限"变成了"没有上限"**。
+
+                ## 修法：让它参与 flex 分配
+
+                ```
+                  单列（常规）：左栏 flex-1 + 右栏 flex-1 → 各拿一半，各自滚
+                  两栏（全屏）：左栏 flex-1 + 右栏 固定 42% 宽（flex-none）
+                ```
+                `min-h-0` 两个都不能省 —— flex 子项默认 `min-height: auto`，
+                那一项会让它们永远不肯比内容矮，滚动条与 `max-h` 都会失效。
+              */}
+              <div
+                className={cn(
+                  'flex min-h-0 flex-1 flex-col',
+                  focusMode && 'lg:w-[42%] lg:flex-none',
+                )}
+              >
+                <TeamBoard
+                  steps={liveCycle?.steps ?? latestTeamSteps}
+                  cycleNumber={liveCycle?.cycleNumber ?? records[0]?.cycleNumber ?? 0}
+                  /*
+                   * ⚠️ **没有在途轮次时传 `null`**，不传 `Date.now()`：
+                   * 计时器从 0 开始跳会因为拿不到真实起点而显示一个编造的时长，
+                   * 而"这一轮跑了 50000 秒"会把操作员引去查一个不存在的事故。
+                   */
+                  startedAt={liveCycle?.startedAt ?? null}
+                />
+              </div>
+            </div>
+          )}
+
+          {/*
+            ══════════════════════════════════════════════════════════════════
+             **决策流水（滚动区）** —— 只有这一块滚
+            ══════════════════════════════════════════════════════════════════
+
+            `flex-1 min-h-0`：高度来自右栏（`h-full` 的确定高度）减去上面的固定区，
+            不是 `max-height`。
+            `min-h-0` 不能省 —— flex 子项默认 `min-height: auto`，那一项会让滚动区
+            永远不肯比内容矮，于是滚动条跑到整栏外面去。
+
+            `max-h-[calc(100dvh-16rem)]` 只在 `xl` 以下生效：那时右栏塌到主内容下面，
+            高度是内容高度，没有这个上限就会把整页撑长。
+
+            `space-y-2.5` 而不是相邻的 `border-b`：40 个周期用一条接一条的分隔线排下来，
+            会连成一整片、分不清哪里是上一个周期的结尾。
+          */}
+          <div
+            /*
+             * `ref` + `onScroll` 是**分页与滚动位置**要的两样东西：
+             * 前者给 `IntersectionObserver` 当 `root`（哨兵必须在容器里比较，不能和窗口比），
+             * 也给那个把视口钉住的 `useLayoutEffect` 当测量对象；
+             * 后者维护"提交前"的 `scrollTop`（滚动不触发 React 重渲染，只能自己记）。
+             */
+            ref={scrollerRef}
+            onScroll={(event) => {
+              scrollTopRef.current = event.currentTarget.scrollTop;
+            }}
+            className="min-h-0 flex-none space-y-2.5 overflow-y-auto p-2.5 max-h-[10%] xl:max-h-[10%]"
+          >
+          {/*
+            非团队模式的在途周期条。
+            团队模式**不再**渲染它 —— 那一轮的状态已经由上面的固定工作流区
+            按岗位摊开了，再插一条线性步骤列表就是同一个事实说两遍
+            （用户对重复信息的容忍度很低，见 `LiveCycleBlock` 里那段注释）。
+          */}
+          {showLive && liveCycle && mode !== 'ai_team' && (
+            <LiveCycleBlock key={liveCycle.cycleNumber} live={liveCycle} />
+          )}
+          {/*
+            ══════════════════════════════════════════════════════════════════
+             **组织架构** —— ⚠️ 团队模式下**已删除**（2026-10-12 重做）
+            ══════════════════════════════════════════════════════════════════
+
+            原来这里挂着一个 `FirmRoster`（20 个岗位按部门展开，默认收起）。
+
+            现在它**合并进上面的固定工作流区**了 —— `TeamBoard` 的编制表已经
+            把同一批岗位按部门摊开，并且**每个岗位都带实时状态**
+            （进行中 / 已完成 / 失败 / 在岗未参与 / 规划中）。
+
+            保留两份的后果是用户已经抱怨过的那种：
+            > 「**为什么还原封不动保留**了…（这模式不是团队了吗？…）」
+            同一个事实在屏幕上出现两次，操作员就要花时间判断"这两处说的是一回事吗"。
+            而 `FirmRoster` 那份**没有实时状态**，它只会让"谁在干活"更难看清。
+
+            ⚠️ 另两种模式本来就不渲染它（`mode === 'ai_team'` 才渲染），
+            所以删掉这段对 `strategy` / `ai_managed` **没有任何影响**。
+          */}
 
           {runs.map((run) => (
             <div key={run.record.id}>
-              <CycleBlock record={run.record} symbols={symbolsQuery.data ?? []} />
-              {run.repeats.length > 0 && <RepeatedCycles repeats={run.repeats} />}
+              {/*
+                ⚠️ **每一轮单独包错误边界**（本轮实测踩到）。
+
+                一条字段不全的记录会让**整个页面白屏**（浏览器实测：
+                `Cannot read properties of undefined (reading 'length')` → BODY 为空）。
+                而决策记录是从模型输出解析来的，字段缺失/类型不对是**常态** ——
+                模型不总是听话。
+
+                包在"每一轮"而不是"整页"：这样一条坏记录只影响它自己那一块，
+                其余决策与页面照常可用。
+              */}
+              <FeedErrorBoundary>
+                {/*
+                  ⚠️ **团队模式用另一套决策块**（2026-10-12 重做）。
+
+                  差别不只是排版，而是"一轮的答案是什么"：
+                  · `CycleBlock`（前两种模式）—— 一轮的元数据行是
+                    `in/out token │ 缓存 │ 思考占比 │ 耗时`，点开看**一个模型的**
+                    思考过程与提示词；
+                  · `TeamCycleBlock`（团队模式）—— 元数据行是
+                    `时刻 │ 周期 │ **结论**`（六个成本数字进悬停说明，一个都没丢），
+                    点开看**风控官结论 → 各角色产出 → 原始材料**。
+
+                  另两种模式**逐字节不变**（`mode === 'ai_team'` 才走新分支）。
+                */}
+                {mode === 'ai_team' ? (
+                  <TeamCycleBlock record={run.record} symbols={symbolsQuery.data ?? []} />
+                ) : (
+                  <CycleBlock record={run.record} symbols={symbolsQuery.data ?? []} mode={mode} />
+                )}
+                {run.repeats.length > 0 && <RepeatedCycles repeats={run.repeats} />}
+              </FeedErrorBoundary>
             </div>
           ))}
 
@@ -802,7 +1385,8 @@ export function DecisionFeed({
           {records.length > 0 && !hasMore && (
             <p className="pt-1 text-center text-xs text-ink-faint">已到最早一轮</p>
           )}
-        </div>
+          </div>
+        </>
       )}
     </Panel>
   );
@@ -817,16 +1401,32 @@ export function DecisionFeed({
  *
  * 返回 `null` 表示这一轮不参与合并。
  */
-function cycleSignature(record: DecisionRecord): string | null {
+export function cycleSignature(record: DecisionRecord): string | null {
   // 失败的轮次永远单独显示：要读的是那一次具体的错误，不是"又失败了一次"。
   if (record.error !== null) return null;
 
+  /*
+   * ⚠️ **两个数组都要兜底**（2026-10-12 实测抓到的真 BUG）。
+   *
+   * 原来只有 `executionLog` 有 `?? []`，而 `decisions` 直接读 —— 于是
+   * 一条**缺 `decisions` 的历史记录**会让这里抛
+   * `Cannot read properties of undefined (reading 'length')`，
+   * 而这发生在**渲染路径**上：`FeedErrorBoundary` 于是把**整块决策看板**
+   * 换成一张错误卡（实测现象就是"最近决策"里出现"这一块渲染失败"，
+   * 团队看板完全不显示）。
+   *
+   * 为什么历史记录会缺字段：决策记录是**跨版本累积**的，
+   * 早先的写入路径/测试数据未必带全字段（实测本地库里就有一条
+   * `[{"symbol":"BTCUSDT","action":"open_long"}]` —— 缺 `confidence`）。
+   * **看板必须容忍旧数据**，否则一次版本升级就会让历史全部打不开。
+   */
   const log = record.executionLog ?? [];
+  const decisions = record.decisions ?? [];
   // 完全空白的一轮也不合并 —— 它本身信息就少，再折起来等于让它消失。
-  if (record.decisions.length === 0 && log.length === 0) return null;
+  if (decisions.length === 0 && log.length === 0) return null;
 
   return JSON.stringify([
-    record.decisions.map((decision) => [decision.action, decision.symbol, decision.confidence]),
+    decisions.map((decision) => [decision.action, decision.symbol, decision.confidence]),
     log.map((entry) => [entry.status, entry.action, entry.symbol, entry.detail]),
   ]);
 }
@@ -910,7 +1510,74 @@ function priceOf(symbols: MarketSymbol[], symbol: string): number | null {
  * `export` 只是为了 SSR 验证脚本能够直接渲染它（`scripts/ssr-decision-feed.tsx`）。
  * 它在页面里的唯一调用点是下面的 `DecisionFeed`。
  */
-export function CycleBlock({ record, symbols }: { record: DecisionRecord; symbols: MarketSymbol[] }) {
+/**
+ * **一轮团队决策的审计块** —— 谁参与了、各自说了什么、用的什么模型。
+ *
+ * ## 为什么折叠
+ *
+ * 一轮团队有 7 个角色，每段产出几百字。默认展开会把决策流刷满 ——
+ * 而决策流的第一落点是"这一轮做了什么决定"，不是"每个角色的论证全文"。
+ *
+ * 所以默认只显示**摘要 + 角色名列表**（一行能看完），点开才看全文。
+ * 这与项目里 `skip` 折叠、`CycleSteps` 折叠是同一个原则：
+ * **信息一条不丢，但首屏只留需要看的。**
+ */
+function TeamTraceBlock({ rawResponse }: { rawResponse: string }): React.ReactElement | null {
+  const [open, setOpen] = useState(false);
+  const trace = parseTeamTrace(rawResponse);
+  if (trace === null) return null;
+
+  return (
+    <div className="mb-1.5 rounded-md border border-accent/25 bg-accent/5 px-2.5 py-1.5 text-xs">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        className="flex w-full items-center gap-2 text-left"
+      >
+        <span className="shrink-0 font-medium text-accent">智能体团队</span>
+        {trace.summary !== null && <span className="min-w-0 flex-1 truncate text-ink-soft">{trace.summary}</span>}
+        <span className="shrink-0 text-ink-faint">{open ? '收起' : `${trace.members.length} 个角色`}</span>
+      </button>
+      {open && (
+        <ul className="mt-1.5 space-y-1.5 border-t border-accent/15 pt-1.5">
+          {trace.members.map((m) => (
+            <li key={m.role} className="flex gap-2">
+              <span className="w-32 shrink-0 truncate font-medium text-ink-soft" title={m.role}>
+                {m.role}
+              </span>
+              <span className="min-w-0 flex-1">
+                {m.modelId !== null && (
+                  <span className="mr-1.5 text-ink-faint" title="这个角色用的模型">
+                    {m.modelId}
+                  </span>
+                )}
+                <span className="text-ink-lo">{m.text}</span>
+              </span>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+export function CycleBlock({ record, symbols, mode = 'strategy' }: { record: DecisionRecord; symbols: MarketSymbol[]; mode?: TraderMode }) {
+  /*
+   * ⚠️ **这两个字段要在这里兜一次底，不能假设它们一定存在。**
+   *
+   * 数据有两个来源，形状**不一样**：
+   *
+   *   · **库里的记录**（`GET /traders/:id/decisions`）—— `decisions` 与
+   *     `executionLog` 一定存在（服务端把 `NULL` 归一成了 `[]`）；
+   *   · **WebSocket 实时推送**的周期 —— 它由服务端在周期进行中逐段发出，
+   *     尚未落库，所以这两个字段都可能**还没有**。
+   *
+   * 实测（示例数据 + `/traders/:id`）：`undefined` 在这里抛
+   * `Cannot read properties of undefined`，而它抛在**渲染期** ——
+   * 整页白屏（`#root` 变空），连外壳都不剩，三套模板全部复现。
+   */
+  const decisions = record.decisions ?? [];
+  const executionLog = record.executionLog ?? [];
+
   /*
    * 把执行日志按 `action` + `symbol` 配到各自的决策上。
    *
@@ -918,7 +1585,7 @@ export function CycleBlock({ record, symbols }: { record: DecisionRecord; symbol
    * 分居盒子上下两处，操作者要把上面的提案和下面的小字自己对起来 ——
    * 而熔断真正拦下的是**那一条**提案，答案必须写在那一条旁边。
    */
-  const plan = planExecution(record.executionLog, record.decisions);
+  const plan = planExecution(executionLog, decisions);
   const skipped = plan.counts.skipped;
   const rejected = plan.counts.rejected;
   const failed = plan.counts.failed;
@@ -939,7 +1606,7 @@ export function CycleBlock({ record, symbols }: { record: DecisionRecord; symbol
    * 的下标对齐**的（见 `planExecution` 的说明），过滤之后下标会错位 ——
    * 那样"这张卡片的结果"就会挂到别的决策上去。折叠块里那批也一样要带。
    */
-  const visible = record.decisions
+  const visible = decisions
     .map((decision, index) => ({ decision, index }))
     .filter(({ decision }) => decision.action !== 'skip');
 
@@ -966,7 +1633,7 @@ export function CycleBlock({ record, symbols }: { record: DecisionRecord; symbol
     return { decision, index, nth, total: totalBySymbol.get(decision.symbol) ?? 1 };
   });
 
-  const skippedRows = record.decisions
+  const skippedRows = decisions
     .map((decision, index) => ({ decision, index }))
     .filter(({ decision }) => decision.action === 'skip');
   /** 被跳过的那批里分最高的一个 —— 折叠标题上给一个可比较的数，省得非展开不可。 */
@@ -987,6 +1654,28 @@ export function CycleBlock({ record, symbols }: { record: DecisionRecord; symbol
      */
     <article className="min-w-0" data-record-id={record.id}>
       <CycleMeta record={record} />
+
+      {/*
+        ══════════════════════════════════════════════════════════════════════
+         ⚠️ **团队模式不再走 `CycleBlock`**（2026-10-12 重做）
+         ══════════════════════════════════════════════════════════════════════
+
+         `DecisionFeed` 里那个分支是
+         `mode === 'ai_team' ? <TeamCycleBlock/> : <CycleBlock/>` ——
+         所以团队模式下这三块（`TeamTraceBlock` / `DebateView` / 下面那对
+         「思考过程 · 提示词」按钮）**都不会被渲染**。
+
+         它们没有丢，职责被 `TeamCycleBlock` + `TeamDecisionRow` 接过去了，
+         而且**换了位置**：
+         · `<team>` 块的各角色产出 → 团队决策行展开后的「各角色产出」
+           （带中文角色名与模型名，比这里原来显示 role id 更可读）；
+         · 多空辩论 → 同上（多头/空头/裁决就是三个角色）；
+         · 思考过程 / 提示词 → 团队决策行展开后的「原始材料」，
+           而且要**再点一次**才取（懒加载）—— 它们是排查用的原料，不是主视图。
+
+         留在 `CycleBlock` 里是因为**另两种模式仍然用它**，
+         删掉会破坏 `strategy` / `ai_managed` 的现有界面（用户要求旧模式完全不变）。
+      */}
 
       {/*
         决策盒子：**一轮只有这一个**边框。每条决策只是里面的一段，没有自己的边框。
@@ -1038,13 +1727,11 @@ export function CycleBlock({ record, symbols }: { record: DecisionRecord; symbol
           （回撤守卫平仓、失败重试），此时说"没有给出任何决策"是把一次**执行**
           说成了模型的沉默。
         */}
-        {record.error === null &&
-          record.decisions.length === 0 &&
-          record.executionLog.length === 0 && (
+        {record.error === null && decisions.length === 0 && executionLog.length === 0 && (
             <p className="text-xs text-ink-faint">本周期模型没有给出任何决策。</p>
           )}
 
-        {record.decisions.length > 0 && (
+        {decisions.length > 0 && (
           // 决策之间只用**间距**分隔（§3），不加分隔线：一条细线在深色底上会
           // 变成第二层边框，而这个盒子里只该有一层。
           <div className="space-y-2.5">
@@ -1120,10 +1807,27 @@ export function CycleBlock({ record, symbols }: { record: DecisionRecord; symbol
         )}
       </div>
 
-      <CycleDetails
-        record={record}
-        counts={{ failed, rejected, skipped }}
-      />
+      {/*
+        ⚠️ **团队模式不显示这两个按钮**（用户 2026-10-12 的反馈）。
+
+        用户的原话：
+        > 「为什么还原封不动保留了**思考过程、提示词查看功能**（这模式不是团队了吗？
+        >  这个就很莫名其妙，如之前我所说应该是**上面固定展示各智能体工作状态和摘要**，
+        >  用户**有需要可以手动点击打开查看详情**）」
+
+        **他说得对**：团队模式该看的是"谁在干什么、结论是什么"，
+        而"某个模型这一轮的思维链"是**排查用的原料**，不是主视图。
+
+        它并没有丢 —— 团队的 `<team>` 审计块里**每个角色都有自己的产出**
+        （见 `TeamTraceBlock`），那才是团队模式下"打开详情"该看到的东西。
+        融合两种模式的原料视图会让主视图永远停在"怎么做出来的"而不是"做了什么"。
+      */}
+      {mode !== 'ai_team' && (
+        <CycleDetails
+          record={record}
+          counts={{ failed, rejected, skipped }}
+        />
+      )}
     </article>
   );
 }
@@ -1168,10 +1872,31 @@ function pairKey(action: string, symbol: string): string {
  * 配不上的日志进 `leftover`（界面照旧列出来，一条都不丢）。
  */
 function planExecution(log: ExecutionLogEntry[], decisions: Decision[]): ExecutionPlan {
+  /*
+   * ⚠️ **两个参数都要防 `undefined`，不能只防一个。**
+   *
+   * 调用方在 826 行已经写了 `record.executionLog ?? []`，但那只保护了
+   * **库里读出来的记录**。而 `DecisionFeed` 还有第二条数据来源：
+   * **WebSocket 实时推送**的记录（`useEvents` 的 `byTrader[].decisions`）——
+   * 它由服务端在周期进行中逐段发出，**形状与库里那条不同**（尚未落库，
+   * 所以 `executionLog` / `decisions` 都可能还没填）。
+   *
+   * 实测（用示例数据打开 `/traders/:id`）：这里读到 `undefined` 就抛
+   * `Cannot read properties of undefined (reading 'length')`，而它在
+   * **渲染期**抛出 —— 整页白屏（`<div id="root">` 变空），连外壳都不剩。
+   * 三套模板**全都**复现，所以它不是某个模板的问题。
+   *
+   * 修在这里而不是调用处：`planExecution` 是一个纯函数，它的契约就该是
+   * "给什么都能算出结果"，而不是"调用方必须保证参数完整" ——
+   * 后者每加一条数据来源就要重新检查一遍。
+   */
+  const safeLog = log ?? [];
+  const safeDecisions = decisions ?? [];
+
   /** 每个配对键下**还没被认领**的日志下标，按出现顺序排队。 */
   const queue = new Map<string, number[]>();
-  for (let index = 0; index < log.length; index += 1) {
-    const entry = log[index];
+  for (let index = 0; index < safeLog.length; index += 1) {
+    const entry = safeLog[index];
     if (!entry) continue;
     const key = pairKey(entry.action, entry.symbol);
     const bucket = queue.get(key);
@@ -1181,7 +1906,7 @@ function planExecution(log: ExecutionLogEntry[], decisions: Decision[]): Executi
 
   const outcomes: Array<ExecutionLogEntry | null> = [];
   const claimed = new Set<number>();
-  for (const decision of decisions) {
+  for (const decision of safeDecisions) {
     const bucket = queue.get(pairKey(decision.action, decision.symbol));
     // 每认领一条就把它从队列头移走：同一个币种的第二条决策因此拿到**下一条**日志。
     const index = bucket?.shift();
@@ -1190,7 +1915,7 @@ function planExecution(log: ExecutionLogEntry[], decisions: Decision[]): Executi
       continue;
     }
     claimed.add(index);
-    outcomes.push(log[index] ?? null);
+    outcomes.push(safeLog[index] ?? null);
   }
 
   const counts: Record<ExecutionLogEntry['status'], number> = {
@@ -1201,11 +1926,11 @@ function planExecution(log: ExecutionLogEntry[], decisions: Decision[]): Executi
     skipped: 0,
     data: 0,
   };
-  for (const entry of log) counts[entry.status] += 1;
+  for (const entry of safeLog) counts[entry.status] += 1;
 
   return {
     outcomes,
-    leftover: log.filter((_, index) => !claimed.has(index)),
+    leftover: safeLog.filter((_, index) => !claimed.has(index)),
     counts,
   };
 }
@@ -1540,7 +2265,30 @@ function DecisionOutcome({
    * 都不会因为这次改动而消失。
    */
   const [expanded, setExpanded] = useState(false);
-  const notes = entry?.adjustments?.length ? entry.adjustments : decision.adjustments;
+  /*
+   * ⚠️ **回落到的那一份也要兜底**（两处独立修复合并后的版本）。
+   *
+   * 这一行的意图是"执行记录上那份优先，没有就用决策自己带的那份"。但两份
+   * **都可能没有**：WebSocket 实时推送的决策与执行条目尚未落库，字段是缺的。
+   *
+   * ## 为什么这是真 BUG（不是"测试数据的问题"）
+   *
+   * 原来写的是 `entry?.adjustments?.length ? entry.adjustments : decision.adjustments`：
+   * 前半段对 `entry` 用了可选链，**但兜底那一侧直接读 `decision.adjustments`** ——
+   * 而 `decision` 缺这个字段时它就是 `undefined`。
+   *
+   * 下一个表达式（`notes.length`）于是抛
+   * `Cannot read properties of undefined (reading 'length')`。
+   *
+   * 而决策记录**跨版本累积**，`adjustments` 是后来才加上的字段 ——
+   * 本地库里实测就有 `[{"symbol":"BTCUSDT","action":"open_long"}]` 这种旧记录。
+   * 崩溃发生在**渲染路径**：`FeedErrorBoundary` 会把**整块决策看板**
+   * 换成一张错误卡（实测现象：团队看板完全不显示）。**一条旧记录足以让整个看板打不开。**
+   *
+   * ⚠️ `?.length ?` 这个写法本身是对的（它要区分"空数组"与"有内容"），
+   * 缺的是最后那一层 `?? []`。
+   */
+  const notes = (entry?.adjustments?.length ? entry.adjustments : decision.adjustments) ?? [];
 
   if (!entry) {
     return (
@@ -1799,14 +2547,31 @@ export function figureParts(decision: Decision, price: number | null): Figure[] 
    * `add_to_position` = 0、`reduce_position` = 0）。所以这段渲染目前没有线上样本，
    * 但**"没用过"不等于"不该显示"** —— 它一被用上，操作员就得看懂它。
    */
+  /*
+   * ⚠️ **判据必须是"真的是个数字"，不能是 `!== null`**（2026-10-12 实测抓到的真 BUG）。
+   *
+   * 现象：界面上一条开仓决策显示成 `止盈 -- · 止损 -- · undefinedx` ——
+   * 那个 `undefinedx` 是 `` `${decision.leverage}x` `` 里的 `${undefined}`。
+   *
+   * 原因：这些字段判的是 `!== null`，而**字段缺失时它是 `undefined`**，
+   * 而 `undefined !== null` **为真** —— 代码"以为有值"。
+   *
+   * 为什么字段会缺：决策记录**跨版本累积**，这些字段都是后来才加上的
+   *（实测库里有一条只有 `symbol`+`action` 两个字段的旧记录）。
+   *
+   * 判据选 `typeof === 'number'` + `Number.isFinite`（而不是 `!= null`）：
+   * 后者挡得住 `null`/`undefined`，但**挡不住 `NaN`** —— 而 `NaN` 会让
+   * `fmtPriceUsd` 输出 `NaN`，同样是坏数据。
+   */
+  const num = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v);
   if (decision.action === 'add_to_position') {
     const parts: Figure[] = [
       /* 加仓金额比"仓位"更贴切：它说的是"再投多少"。 */
       { key: 'size', label: '加仓', value: fmtUsd(decision.positionSizeUsd, 2) },
     ];
     if (decision.leverage > 0) parts.push({ key: 'leverage', label: '', value: `${decision.leverage}x` });
-    if (decision.stopLoss !== null) parts.push({ key: 'stop', label: '止损', value: fmtPriceUsd(decision.stopLoss) });
-    if (decision.takeProfit !== null)
+    if (num(decision.stopLoss)) parts.push({ key: 'stop', label: '止损', value: fmtPriceUsd(decision.stopLoss) });
+    if (num(decision.takeProfit))
       parts.push({ key: 'target', label: '止盈', value: fmtPriceUsd(decision.takeProfit) });
     return parts;
   }
@@ -1818,7 +2583,7 @@ export function figureParts(decision: Decision, price: number | null): Figure[] 
      * 所以按"哪个有值显示哪个"来渲染 —— 两个都空就只显示保护位。
      */
     const parts: Figure[] = [];
-    if (decision.reducePercent !== null) {
+    if (num(decision.reducePercent)) {
       /*
        * ⚠️ `reducePercent` 是**百分数**，不是比例。
        *
@@ -1827,21 +2592,21 @@ export function figureParts(decision: Decision, price: number | null): Figure[] 
        * 那会把 50% 显示成 0.50%，让操作员以为它只象征性地减了一点点。
        */
       parts.push({ key: 'reduce', label: '减仓', value: `${decision.reducePercent.toFixed(1)}%` });
-    } else if (decision.reduceQuantity !== null) {
+    } else if (num(decision.reduceQuantity)) {
       parts.push({ key: 'reduce', label: '减仓', value: fmtQty(decision.reduceQuantity) });
     }
-    if (decision.stopLoss !== null) parts.push({ key: 'stop', label: '止损', value: fmtPriceUsd(decision.stopLoss) });
-    if (decision.takeProfit !== null)
+    if (num(decision.stopLoss)) parts.push({ key: 'stop', label: '止损', value: fmtPriceUsd(decision.stopLoss) });
+    if (num(decision.takeProfit))
       parts.push({ key: 'target', label: '止盈', value: fmtPriceUsd(decision.takeProfit) });
     return parts;
   }
 
   if (decision.action === 'adjust_protection') {
     const adjusted: Figure[] = [];
-    if (decision.stopLoss !== null) {
+    if (num(decision.stopLoss)) {
       adjusted.push({ key: 'stop', label: '止损 →', value: fmtPriceUsd(decision.stopLoss) });
     }
-    if (decision.takeProfit !== null) {
+    if (num(decision.takeProfit)) {
       adjusted.push({ key: 'target', label: '止盈 →', value: fmtPriceUsd(decision.takeProfit) });
     }
     /*
@@ -1853,19 +2618,62 @@ export function figureParts(decision: Decision, price: number | null): Figure[] 
 
   if (!isOpenAction(decision.action)) return [];
 
-  const parts: Figure[] = [{ key: 'size', label: '', value: fmtUsd(decision.positionSizeUsd, 2) }];
+  /*
+   * ⚠️ **判据必须是"真的是个数字"，不能是 `!== null`**（2026-10-12 实测抓到的真 BUG）。
+   *
+   * ## 现象
+   *
+   * 界面上一条开仓决策显示成：
+   * ```
+   *   止盈 --  ·  止损 --  ·  undefinedx
+   * ```
+   * **`undefinedx`** —— 那是 `` `${decision.leverage}x` `` 里的 `${undefined}`。
+   *
+   * ## 原因
+   *
+   * 这些字段原本判的是 `!== null`，但**字段缺失时它是 `undefined`**，
+   * 而 `undefined !== null` **为真** —— 于是代码"以为有值"，把 `undefined`
+   * 送进了模板串 / `fmtPriceUsd`。
+   *
+   * ## 为什么字段会缺
+   *
+   * 决策记录**跨版本累积**：`leverage` / `stopLoss` / `takeProfit` 都是
+   * 后来才加上的字段（实测库里有一条 `[{"symbol":"BTCUSDT","action":"open_long"}]`
+   * 只有两个字段的旧记录）。
+   *
+   * ## 判据选 `typeof === 'number'`（而不是 `!= null`）
+   *
+   * `!= null`（松等于）能同时挡 `null` 和 `undefined`，但**挡不住 `NaN`** ——
+   * 而 `NaN` 会让 `fmtPriceUsd` 输出 `NaN`，也是坏数据。
+   * `typeof === 'number'` 配合 `Number.isFinite` 是最严的"这是个能显示的数字"。
+   */
+  const parts: Figure[] = [{ key: 'size', label: '', value: fmtUsd(num(decision.positionSizeUsd) ? decision.positionSizeUsd : null, 2) }];
   if (price !== null) parts.push({ key: 'entry', label: '开仓', value: fmtPriceUsd(price) });
-  if (decision.stopLoss !== null) parts.push({ key: 'stop', label: '止损', value: fmtPriceUsd(decision.stopLoss) });
-  if (decision.takeProfit !== null)
+  if (num(decision.stopLoss)) parts.push({ key: 'stop', label: '止损', value: fmtPriceUsd(decision.stopLoss) });
+  if (num(decision.takeProfit))
     parts.push({ key: 'target', label: '止盈', value: fmtPriceUsd(decision.takeProfit) });
-  if (price !== null && decision.stopLoss !== null && decision.takeProfit !== null) {
+  if (price !== null && num(decision.stopLoss) && num(decision.takeProfit)) {
     // `Math.abs` 两侧：做空时价格在止损之上、止盈之下，直接相减会得到一个**负数**
     // 的风险回报比 —— 那是一个不存在的比例，看起来像算错了。
     const risk = Math.abs(price - decision.stopLoss);
     const reward = Math.abs(decision.takeProfit - price);
     if (risk > 0) parts.push({ key: 'reward', label: '', value: `1:${(reward / risk).toFixed(2)}` });
   }
-  parts.push({ key: 'leverage', label: '', value: `${decision.leverage}x` });
+  /*
+   * ⚠️ **杠杆也要判一次，不能无条件拼。**
+   *
+   * 这一行的上面几行全都写着 `!== null` 的判断，只有它没有 —— 而模型**确实
+   * 会漏字段**：实测某次打开 `/traders/:id` 时这一格渲染成了字面量
+   * `undefinedx`（`${undefined}x` 的字符串拼接结果），就挂在"止盈 —"后面。
+   * 那看起来像界面出了故障，而实际是"模型这一条没给杠杆"。
+   *
+   * 判据用 `isNum` 而不是 `!== null`：实时推送的记录里缺字段时值是
+   * `undefined`，而 `undefined !== null` 为真 —— 上面那几行的判断在这个
+   * 来源下同样会漏（它们的 `fmtPriceUsd` 兜住了，所以没露出来）。
+   */
+  if (isNum(decision.leverage) && decision.leverage > 0) {
+    parts.push({ key: 'leverage', label: '', value: `${decision.leverage}x` });
+  }
 
   return parts;
 }

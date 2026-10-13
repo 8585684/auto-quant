@@ -12,7 +12,6 @@ import type { EquitySnapshot } from '@aq/shared';
 import { fmtInt, fmtNum, fmtTime } from '../lib/format';
 import {
   axisTicks,
-  CHART_INK,
   equityAxisFormatter,
   filterByRange,
   HOURLY_AXIS_MAX_MS,
@@ -20,6 +19,7 @@ import {
   type EquityPoint,
   type EquityRange,
 } from './equityCurve';
+import { useChartInk } from './useChartInk';
 
 /* -------------------------------------------------------------------------- */
 /*  Equity chart                                                               */
@@ -80,7 +80,13 @@ function deltaText(delta: number, base: number | undefined, digits = 2): string 
  * 它相对**初始权益**（图上那条虚线）的涨幅 —— 一个孤零零的绝对值和曲线的关系，
  * 用户没法自己看出来。
  */
-function EquityTooltip({ active, payload, baseline, asset = 'USDT' }: EquityTooltipProps) {
+function EquityTooltip({
+  active,
+  payload,
+  baseline,
+  asset = 'USDT',
+  ink,
+}: EquityTooltipProps & { ink: ReturnType<typeof useChartInk> }) {
   if (!active) return null;
   const point = payload?.[0]?.payload;
   if (!point) return null;
@@ -91,15 +97,24 @@ function EquityTooltip({ active, payload, baseline, asset = 'USDT' }: EquityTool
   return (
     <div
       className="pointer-events-none min-w-[13rem] rounded-md border border-base-600 px-2.5 py-1.5 shadow-overlay"
-      style={{ backgroundColor: CHART_INK.surface }}
+      style={{ backgroundColor: ink.surface }}
     >
       <div className="num mb-1 text-xs text-ink-faint">
         {new Date(point.t).toLocaleString('en-GB', { hour12: false })}
       </div>
 
       <div className="flex items-baseline justify-between gap-3">
-        {/* 「归属权益」而不是「权益」：这条曲线是该机器人自己的账，不是共享钱包。 */}
-        <span className="text-xs text-ink-lo">归属权益</span>
+        {/*
+         * ⚠️ **「账户权益」而不是「归属权益」**（2026-10-13 用户要求）。
+         *
+         * 这条曲线现在画的是 `accountEquity`（共享钱包的真实权益）——
+         * 与上方「账户余额」指标卡同一个数。标签必须说对，
+         * 否则用户会以为在看另一个口径（那正是他两次反馈的困惑）。
+         *
+         * ⚠️ 归属口径没有消失：它在「交易盈亏」指标卡里回答
+         * "这个机器人赚了多少"（那是另一个问题，不该画成曲线）。
+         */}
+        <span className="text-xs text-ink-lo">账户权益</span>
         <span className="num text-sm text-ink-hi">
           {fmtNum(point.equity, 2)} {asset}
         </span>
@@ -139,10 +154,16 @@ function EquityTooltip({ active, payload, baseline, asset = 'USDT' }: EquityTool
  * Recharts' default is a wide translucent grey band; over a dark chart that
  * reads as a smudge across the curve rather than as a pointer at one snapshot.
  */
-function EquityCursor({ points }: { points?: Array<{ x?: number; y?: number }> }) {
+function EquityCursor({
+  points,
+  ink,
+}: {
+  points?: Array<{ x?: number; y?: number }>;
+  ink: ReturnType<typeof useChartInk>;
+}) {
   const x = points?.[0]?.x;
   if (typeof x !== 'number') return null;
-  return <line x1={x} x2={x} y1={0} y2="100%" stroke={CHART_INK.rule} strokeWidth={1} />;
+  return <line x1={x} x2={x} y1={0} y2="100%" stroke={ink.rule} strokeWidth={1} />;
 }
 
 /*
@@ -156,19 +177,89 @@ export function DashboardEquityChart({
   height = 240,
   baseline,
   asset,
+  /*
+   * ⚠️ **默认画【账户口径】**（2026-10-13，用户要求）。
+   *
+   * ## 用户的反馈（原话）
+   *
+   * > 「图表不就是最真实准确简单的，账号余额、总盈亏能对上的吗？」
+   *
+   * 他是对的。原来的实现画的是 `snapshot.equity`（**归属**口径：
+   * `initial_equity + Σ本机器人已平仓净额`），而页面上方的指标卡
+   * 「账户余额」显示的是 `accountEquity`（**共享钱包**的真实权益）——
+   * 于是同一屏两个数字，用户第一反应就是"对不上"。
+   *
+   * ## 两个口径的定义（见 `db/schema.ts` 的 M4 迁移说明）
+   *
+   * ```
+   *   equity         = initial_equity + Σ(本机器人已平仓净额)  ← 只算自己
+   *   accountEquity  = 共享钱包的真实权益（含同账户其他机器人）  ← 账户真实值
+   * ```
+   * 实测 `#10`：`equity` 108.47 vs `accountEquity` 97.80（差 10.67 = 同钱包其他机器人）。
+   *
+   * ## 为什么改成账户口径是对的
+   *
+   * **图表是"账户在这段时间怎么走的"** —— 那正是操作员要去交易所核对的数字。
+   * 归属口径适合回答"我这个机器人赚了多少"（那是指标卡的事），
+   * 但它**不适合画成曲线**：它与钱包余额不一致，而曲线给人的直觉就是
+   * "这是我的钱的变化"。
+   *
+   * ⚠️ 归属口径**没有消失** —— 「本段变化」那一行仍然算它（标签写明
+   * "本机器人归属"），因为它回答的是另一个问题。
+   */
+  metric = 'account',
 }: {
   snapshots: EquitySnapshot[];
   range: EquityRange;
-  height?: number;
+  /**
+   * 图表高度。
+   *
+   * 收 `string | number` 而不是只有 `number`：机器人详情页要传
+   * `clamp(120px, 22vh, 260px)` —— 那一页的主栏在 722 高的窗口下只剩
+   * 三百来像素，写死的高度会把页面顶出滚动条（见 `TraderPage` 里
+   * `EQUITY_CHART_HEIGHT` 的说明）。recharts 的 `ResponsiveContainer`
+   * 本来就接受字符串，这里只是别把它挡在类型外面。
+   */
+  height?: string | number;
   baseline?: number;
   /** Settlement unit for the readout. Defaults to USDT, the only one in practice. */
   asset?: string;
+  /**
+   * 画哪个口径。
+   *
+   * ```
+   *   'account'    —— 共享钱包的真实权益（默认；与「账户余额」指标卡一致）
+   *   'attributed' —— 本机器人归属（只算自己的已平仓净额）
+   * ```
+   * ⚠️ 默认是 `'account'`：**曲线必须能和指标卡对上**，
+   * 否则用户看到两个数就会问"为什么对不上"。
+   */
+  metric?: 'account' | 'attributed';
 }) {
+  /*
+   * ⚠️ hook 必须在"点数不足"那个提前 return **之前**调用 ——
+   * React 要求每次渲染的 hook 顺序一致，条件调用会让"有数据/没数据"两种
+   * 渲染的 hook 数量不同，直接抛"Rendered fewer hooks than expected"。
+   */
+  const ink = useChartInk();
   const windowed = filterByRange(snapshots, range);
   const points: EquityPoint[] = windowed
     .map((snapshot) => ({
       t: new Date(snapshot.timestamp).getTime(),
-      equity: snapshot.equity,
+      /*
+       * ⚠️ 按 `metric` 取口径 —— 见 props 里那段说明。
+       *
+       * ⚠️ **`accountEquity` 为 0 时回落到 `equity`**：迁移前的旧行
+       * `account_equity` 是回填的，而完全没有值时它是 `0`
+       *（见 `db/schema.ts` 的 M4 取舍说明）。直接用 0 会把曲线砸到地板，
+       * 而那条曲线**看起来完全正常** —— 只是数字全错。
+       */
+      equity:
+        metric === 'account'
+          ? snapshot.accountEquity > 0
+            ? snapshot.accountEquity
+            : snapshot.equity
+          : snapshot.equity,
       unrealizedPnl: snapshot.unrealizedPnl,
       openPositions: snapshot.openPositions,
     }))
@@ -206,7 +297,7 @@ export function DashboardEquityChart({
   const first = values[0] ?? 0;
   const last = values[values.length - 1] ?? 0;
   const rising = last >= first;
-  const stroke = rising ? CHART_INK.up : CHART_INK.down;
+  const stroke = rising ? ink.up : ink.down;
   const referenceValue = baseline ?? first;
   const unit = asset?.trim() || 'USDT';
 
@@ -230,7 +321,7 @@ export function DashboardEquityChart({
         </defs>
         {/* Horizontal only: vertical lines land on the time labels and turn a
             dense window into a barcode. */}
-        <CartesianGrid stroke={CHART_INK.grid} strokeDasharray="3 3" vertical={false} />
+        <CartesianGrid stroke={ink.grid} strokeDasharray="3 3" vertical={false} />
         <XAxis
           dataKey="t"
           type="number"
@@ -242,16 +333,16 @@ export function DashboardEquityChart({
            */
           {...(ticks.length > 0 ? { ticks } : {})}
           tickFormatter={axisTick}
-          tick={{ fill: CHART_INK.axis, fontSize: 11 }}
+          tick={{ fill: ink.axis, fontSize: 11 }}
           tickLine={false}
-          axisLine={{ stroke: CHART_INK.grid }}
+          axisLine={{ stroke: ink.grid }}
           minTickGap={44}
           tickMargin={6}
         />
         <YAxis
           domain={domain}
           tickFormatter={equityAxisFormatter}
-          tick={{ fill: CHART_INK.axis, fontSize: 11 }}
+          tick={{ fill: ink.axis, fontSize: 11 }}
           tickLine={false}
           axisLine={false}
           width={62}
@@ -263,17 +354,17 @@ export function DashboardEquityChart({
            * ⚠️ `baseline` 必须传进去，否则提示框只能给出一个孤零零的绝对权益，
            * 回答不了"我在这一刻是赚还是亏"。它就是图上那条「初始」虚线。
            */
-          content={<EquityTooltip baseline={baseline} asset={unit} />}
-          cursor={<EquityCursor />}
+          content={<EquityTooltip baseline={baseline} asset={unit} ink={ink} />}
+          cursor={<EquityCursor ink={ink} />}
           shared={false}
           isAnimationActive={false}
           wrapperStyle={{ outline: 'none' }}
         />
         <ReferenceLine
           y={referenceValue}
-          stroke={CHART_INK.rule}
+          stroke={ink.rule}
           strokeDasharray="4 4"
-          label={{ value: '初始', fill: CHART_INK.axis, fontSize: 10, position: 'insideTopRight' }}
+          label={{ value: '初始', fill: ink.axis, fontSize: 10, position: 'insideTopRight' }}
           ifOverflow="extendDomain"
         />
         <Area
@@ -287,7 +378,7 @@ export function DashboardEquityChart({
              scratch every few seconds flickers in peripheral vision — which is
              exactly where a trading terminal lives. */
           isAnimationActive={false}
-          activeDot={{ r: 3, fill: stroke, stroke: CHART_INK.surface, strokeWidth: 2 }}
+          activeDot={{ r: 3, fill: stroke, stroke: ink.surface, strokeWidth: 2 }}
         />
       </AreaChart>
     </ResponsiveContainer>
@@ -306,6 +397,7 @@ export function DashboardEquityChart({
  * 同一个数在一屏里出现两次同等权重（DESIGN.md §4"不要把所有东西做成一样大"）。
  */
 export function WinLossBar({ wins, losses }: { wins: number; losses: number }) {
+  const ink = useChartInk();
   const total = wins + losses;
   const winPercent = total > 0 ? (wins / total) * 100 : 0;
 
@@ -324,11 +416,11 @@ export function WinLossBar({ wins, losses }: { wins: number; losses: number }) {
        */}
       <div
         className="flex h-1 w-full overflow-hidden rounded-full"
-        style={{ backgroundColor: CHART_INK.track }}
+        style={{ backgroundColor: ink.track }}
         role="img"
         aria-label={`${fmtInt(wins)} 笔盈利，${fmtInt(losses)} 笔亏损`}
       >
-        <div className="h-full" style={{ width: `${winPercent}%`, backgroundColor: CHART_INK.up }} />
+        <div className="h-full" style={{ width: `${winPercent}%`, backgroundColor: ink.up }} />
       </div>
       <div className="mt-0.5 flex items-center justify-between text-xs">
         <span className="num text-up">{fmtInt(wins)} 盈</span>

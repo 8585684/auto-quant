@@ -52,12 +52,27 @@ export function PageShell({
   aside,
   children,
   className,
+  mainClassName,
   fillHeight = true,
 }: {
   /** 右侧伴随栏。命名不用 `rail`：它现在是"伴随信息"而不是指标栏，内容也不一定是指标。 */
   aside?: ReactNode;
   children: ReactNode;
   className?: string;
+  /**
+   * 主内容列的附加类名。
+   *
+   * ## 为什么需要它
+   *
+   * 主栏默认是 `space-y-4`（区块之间 16px）。机器人详情页在 722 高的窗口下
+   * 主栏只有三百来像素，而里面有五个区块 —— 五个 16px 就是 80px，
+   * 相当于一整张指标卡的高度。那一页传 `space-y-2.5` 把它收到 10px，
+   * 省下来的高度正好让「指标 + 账户 + 图表」不用滚动就能看全。
+   *
+   * 传进来的是**覆盖**而不是追加：内部用 `cn()`（twMerge），
+   * `space-y-2.5` 会替换掉默认的 `space-y-4`，不会两个都留在 class 里。
+   */
+  mainClassName?: string;
   /**
    * 两栏是否**撑满可视区高度**。
    *
@@ -93,6 +108,7 @@ export function PageShell({
         className={cn(
           'min-w-0 space-y-4 xl:flex-[3_1_0%] xl:pr-1',
           fillHeight && 'xl:min-h-0 xl:overflow-y-auto',
+          mainClassName,
         )}
       >
         {children}

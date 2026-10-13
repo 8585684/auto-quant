@@ -12,7 +12,7 @@ import { z } from 'zod';
  * - `oi_top`  : symbols with the fastest open-interest growth
  * - `mixed`   : union of the above, de-duplicated, multi-source tags preserved
  */
-export const CoinSourceTypeSchema = z.enum(['static', 'coinpool', 'oi_top', 'mixed']);
+export const CoinSourceTypeSchema = z.enum(['static', 'coinpool', 'oi_top', 'mixed', 'funnel']);
 export type CoinSourceType = z.infer<typeof CoinSourceTypeSchema>;
 
 /** How the dynamic `coinpool` universe is ranked. */
@@ -36,6 +36,17 @@ export const CoinSourceConfigSchema = z.object({
 
   /** How many symbols the dynamic universe contributes. */
   coinPoolLimit: z.number().int().min(1).max(200).default(20),
+  /**
+   * **团队模式：漏斗的第一层要拉多少全市场候选**（`sourceType: 'funnel'` 用）。
+   *
+   * ⚠️ **这是"漏斗的入口宽度"，不是"最终候选数"** —— 最终数量由
+   * `market/funnel.ts` 的 `DEFAULT_FUNNEL` 每层 `keep` 决定（默认 60 → 30）。
+   *
+   * 为什么不复用 `coinPoolLimit`：那是**另两种模式**在用的（只做一层排序取前 N），
+   * 而漏斗需要**先拿到全市场** —— 否则"每层淘汰了多少"这个可解释性会失真
+   *（第一层会显示"淘汰 0"，因为上游已经砍过了）。
+   */
+  funnelUniverseLimit: z.number().int().min(1).max(1500).default(500),
   coinPoolRank: CoinPoolRankSchema.default('quote_volume'),
 
   /** Drop stablecoin pairs and anything below this 24h turnover (USDT). */
@@ -165,6 +176,83 @@ export const RiskControlConfigSchema = z.object({
   minRiskRewardRatio: z.number().min(0).max(50).default(3),
   /** Model confidence floor (0-100). */
   minConfidence: z.number().int().min(0).max(100).default(75),
+
+  /**
+   * **单笔交易的风险预算**（占权益的百分比）。默认 **2**。
+   *
+   * ## ⚠️ 为什么把它从"提示词里的硬编码常量"变成真字段（2026-10-13）
+   *
+   * ### 它原来是一个**死锁**
+   *
+   * `strategy/prompt.ts` 里有这么一段（**它一直对模型这么说**）：
+   * > 「造成"空集"的两个变量 —— **规则、风险参数** —— 都在**你自己的权限里**。
+   * >  （权益不归你管，那是账户所有者的。）」
+   *
+   * 而那个 2% 当时是 `prompt.ts` 里的 `const riskPerTradePercent = 2;` ——
+   * **一个硬编码常量，不在任何 schema 里**。
+   *
+   * 也就是说：
+   * ```
+   *   提示词告诉模型「你可以改风险参数」
+   *   而模型用 set_params 只能改 riskControl 里的字段 → 改不到这个 2%
+   *   → 它「只能一直用 2% 熬着」（decisionTools.ts 里早就写下了这句话）
+   * ```
+   *
+   * ### 死锁的代价（实测）
+   *
+   * ```
+   *   权益 20.75 · 单笔风险 2% = 0.415 USDT
+   *   币安最小名义 50 USDT → 止损上限只能 0.83%
+   *   而 15m ATR 的常态是 2–4%
+   *   → 差 2.4–5 倍 → **没有任何标的能通过** → 40+ 轮零决策
+   * ```
+   * 而 `#10`（ai_managed）的历史里，模型把 `minPositionSize` **连改 5 次**
+   *（12→6→6→5.5→5.1），每次理由都是"账户太小、门槛不可达"，**每次结算都是负的** ——
+   * 它在改一个**不是瓶颈**的参数。
+   *
+   * ### 所以把它做成字段
+   *
+   * 现在模型可以 `set_params({"riskControl":{"riskPerTradePercent":5}})` ——
+   * **提示词那句话从此是真的**。
+   *
+   * ⚠️ **上界 20%**：那已经不是"风险预算"而是"押注"了。
+   * 留出这个上界是为了不让一次误判毁掉账户；但**它不是"系统替你按 2% 走"**。
+   */
+  riskPerTradePercent: z.number().min(0.1).max(20).default(2),
+
+  /**
+   * **用"自身保证金"替代"权益百分比"作为单笔上限**（2026-10-13 用户要求）。
+   *
+   * ## 用户的原话
+   *
+   * > 「**不要限制单笔上限**（由于系统【逐仓】运行，所以一笔交易最多亏损保证金，
+   * >  所以用户会自己控制，不需要系统限制最大止损金额），
+   * >  改成**以自身保证金为限制**」
+   *
+   * ## 为什么这个改动是对的（逐仓的数学）
+   *
+   * 在**逐仓**下，一笔交易的**最大亏损就是它自己的保证金** ——
+   * 强平不会动到别的仓位的钱（这正是 `marginMode: 'isolated'` 的含义）。
+   * 所以：
+   * ```
+   *   旧口径：单笔亏损 ≤ 权益 2%    → 一个【人为的】比例
+   *   新口径：单笔最多亏掉它的保证金 → 一个【物理的】事实
+   * ```
+   * 旧口径在**小账户**上会算出一个荒谬的窄止损带（实测：权益 20.75 × 2%
+   * 在最小名义 50 上只能给 **0.83%**，而实际需要 2–4%）→ **40+ 轮零决策**。
+   *
+   * ## 打开时会发生什么
+   *
+   * ```
+   *   · 不再用 `riskPerTradePercent` 反推止损带上限（提示词那一段会换掉）
+   *   · `minRiskRewardRatio` 仍然**保留**（用户明确说："盈亏比和胜率的要求可以保留"）
+   *   · 模型**自己决定每笔划多少保证金**（用户选的就是这个）
+   * ```
+   *
+   * ⚠️ **默认 `false`** —— 既有机器人（尤其实盘 `#10`）的行为**逐字节不变**。
+   * 打开必须是一次显式选择。
+   */
+  marginBasedLimit: z.boolean().default(false),
 
   /** Force an exchange-side stop loss on every entry. Strongly recommended. */
   requireStopLoss: z.boolean().default(true),
@@ -474,6 +562,137 @@ export function unboundedAiManagedConfig(): StrategyConfig {
 }
 
 /**
+ * **AI 团队模式**的初始配置。
+ *
+ * ## 为什么不复用 `unboundedAiManagedConfig()`
+ *
+ * 那份配置是**单智能体**的口径：上限顶格、门槛归零，让那一个模型自己决定。
+ * 它**没有候选标的池**（默认 `staticCoins: []`）——
+ * 而团队模式如果没有标的，会**跑得起来但永远不会交易任何东西**
+ *（实测：日志报「配置里没有任何候选标的」，而界面显示"运行中"）。
+ *
+ * 用户 2026-10-12 的原话：
+ * > 「开启以后，整个智能体团队就开始并发工作……然后做相应的动作
+ * >  （**开仓、平仓、调仓**等等）」
+ *
+ * 一个不交易任何标的的机器人**不满足这个要求** —— 所以团队模式必须
+ * 自带一个**可用的起点**。
+ *
+ * ## 风控口径：与智能托管一致的"不设边界"
+ *
+ * 用户明确要求「系统不再设置内置风控……风格由智能体负责」，
+ * 而团队模式另有**风控官**在裁决之后把关（见 `riskOfficer.ts`）。
+ * 所以数值口径与 `unboundedAiManagedConfig` 一致：上限顶格、门槛归零，
+ * **唯一保留的是 `requireStopLoss`**（那是结构要求，不是策略偏好 ——
+ * 没有止损的仓位等于没有下限）。
+ *
+ * ## 标的池为什么用**动态**而不是写死几个币
+ *
+ * 团队模式要「模拟真实专业量化机构」—— 而机构不会永远只盯两个币。
+ * 用 `coinpool`（按成交额排序的全市场筛选）让它**每轮都能看到当下的机会**，
+ * 同时用 `coinPoolLimit` 限制数量（候选太多会把提示词吃满）。
+ */
+export function defaultAiTeamConfig(): StrategyConfig {
+  return StrategyConfigSchema.parse({
+    coinSource: {
+      /* 动态池 + 成交额排序：最主流、流动性最好的那些。 */
+      sourceType: 'coinpool',
+      useCoinPool: true,
+      coinPoolLimit: 8,
+      coinPoolRank: 'quote_volume',
+      /* 同时看持仓量增长最快的 —— 那往往是"有新资金进来"的信号。 */
+      useOITop: true,
+      oiTopLimit: 4,
+      /* 过滤掉稳定币与成交额太小的（滑点会把利润吃光）。 */
+      excludeStablecoins: true,
+      /* ⚠️ 字段名必须是 minQuoteVolume24h —— 写成 minQuoteVolume 会被 schema 静默丢弃。 */
+      minQuoteVolume24h: 50_000_000,
+    },
+    riskControl: {
+      maxPositions: 20,
+      btcEthMaxLeverage: 125,
+      altcoinMaxLeverage: 125,
+      btcEthMaxPositionValueRatio: 50,
+      altcoinMaxPositionValueRatio: 50,
+      maxMarginUsage: 100,
+      minRiskRewardRatio: 0,
+      minConfidence: 0,
+      requireTakeProfit: false,
+      /* ⚠️ **保留**：没有止损的仓位等于没有下限。这是结构要求，不是策略偏好。 */
+      requireStopLoss: true,
+    },
+    /*
+     * ══════════════════════════════════════════════════════════════════════════
+     *  ⚠️⚠️ **`promptSections` 必须有内容**（2026-10-13 实测抓到 —— 一个真问题）
+     * ══════════════════════════════════════════════════════════════════════════
+     *
+     * ## 事故：团队模式的机器人**连"我是谁、怎么决策"都没被告知**
+     *
+     * 实测 `#11` 的 `promptSections`：
+     * ```
+     *   roleDefinition    0 字   ← 空
+     *   tradingFrequency  0 字   ← 空
+     *   entryStandards    0 字   ← 空（后来由策略师自己填了 941 字）
+     *   decisionProcess   0 字   ← 空
+     *   customPrompt      0 字   ← 空
+     * ```
+     * 而 `defaultAiTeamConfig()` **没有设 `promptSections`** ——
+     * 于是它走 schema 的 `.default({})`，**四个字段全是空串**。
+     *
+     * ## 而这是策略师**自己诊断出来的**（`agent_experiments #81` 的 reason 原文）
+     *
+     * > 「All promptSections are **empty strings** — the decision agent has
+     * >  **no behavioral guidance**, so it **defaults to inaction**.
+     * >  Writing minimal entryStandards addresses the 'no instruction = no action'…」
+     *
+     * **它的诊断是对的**：一个没有被告知"什么时候该出手"的交易员，
+     * 最自然的默认行为就是**什么都不做**（那永远不会有亏损）。
+     *
+     * ## ⚠️ 为什么这不违反"不设内置风控 / 风格由智能体负责"
+     *
+     * 两者的区别是**"边界"与"指引"**：
+     * ```
+     *   ✗ 边界（不该有）：「单笔风险 ≤ 权益 2%」「最少 75 分置信度」
+     *                     —— 那是系统替它决定"多保守"
+     *   ✓ 指引（该有）  ：「你是谁」「你的决策流程是什么」
+     *                     —— 那是【工作说明书】，不是策略偏好
+     * ```
+     * 一个公司不会规定交易员"必须多保守"，但**会告诉他岗位职责**。
+     * 没有后者，他不是"自由"，而是**茫然**。
+     *
+     * ## 所以这里给的是**流程与职责**，不是门槛
+     *
+     * ```
+     *   roleDefinition   —— 你是团队的首席决策者（职责）
+     *   decisionProcess  —— 你按什么步骤做决定（流程）
+     *   tradingFrequency —— 节奏由你自己定（**不写死"少交易"**）
+     *   entryStandards   —— **故意留空**：入场标准是**它的判断**，
+     *                       而实测证明它自己会写（941 字，且写得很好）
+     * ```
+     * ⚠️ **`entryStandards` 留空是刻意的** —— 那正是"风格由智能体负责"的落点。
+     */
+    promptSections: {
+      roleDefinition:
+        '你是一支量化交易团队的首席决策者。团队里有行情分析师、技术分析师、' +
+        '新闻整理员、情绪分析师、多空辩论者与风控官 —— 他们各自给你一份产出，' +
+        '而**最终决定由你做出**。\n' +
+        '⚠️ 你不是执行规则的机器：**市场变了，你的判断也该变**。',
+      decisionProcess:
+        '每一轮按这个顺序走：\n' +
+        '1. **先看持仓**：已有仓位的逻辑是否还成立？被破坏就平掉（那是优先级最高的动作）。\n' +
+        '2. **再看候选**：逐个问"这个标的现在有没有可执行的失效位"。\n' +
+        '3. **再定方向**：多空都要看 —— 而"两边都不做"也是合法结论。\n' +
+        '4. **最后定大小**：逐仓下你一笔最多亏掉它自己的保证金，所以**划多少是你的判断**。\n' +
+        '⚠️ 每一步的结论都要能说出**依据**（哪个指标、哪条消息、什么结构）。',
+      tradingFrequency:
+        '节奏**由你自己决定**：系统没有规定你该多频繁交易。\n' +
+        '⚠️ 但"不行动"必须是**一个结论**，不是**默认值** —— ' +
+        '它应当来自"我看过了，确实没有可执行的机会"，而不是"我没找到理由动手"。',
+    },
+  });
+}
+
+/**
  * Style presets mirroring the three trading modes. These only seed the
  * *prompt* sections and a few numeric knobs — the user is free to edit
  * everything afterwards.
@@ -618,7 +837,7 @@ export const STRATEGY_PRESETS: StrategyPreset[] = [
         coinPoolRank: 'volatility',
         minQuoteVolume24h: 50_000_000,
         minOpenInterestUsd: 5_000_000,
-        oiTopLimit: 10,
+        oiTopLimit: 4,
         oiTopWindowHours: 1,
       },
       indicators: {

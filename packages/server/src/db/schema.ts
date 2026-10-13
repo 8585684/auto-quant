@@ -599,6 +599,105 @@ const M11_PENDING_ENTRY = /* sql */ `
 ALTER TABLE positions ADD COLUMN entry_order_id TEXT;
 `;
 
+/**
+ * **成交的情报归因**（2026-10-12）—— `intel/signalHealth.ts` 的数据来源。
+ *
+ * ## 为什么需要它
+ *
+ * 消息面失效检测（胜率崩塌 / 连续亏损 / **反应衰减**）需要
+ * "**由某个信号驱动的成交**"。而实测核查发现这条信息**系统从未记录过**：
+ *
+ * ```
+ *   trades.source     → 只有 bot / reconciled（不是"哪个信号"）
+ *   open_reasoning    → 技术面理由
+ *   Decision          → 之前没有任何情报来源字段
+ * ```
+ *
+ * 所以 `signalHealth` 一直是**空转**（永远 `insufficient_data`）。
+ *
+ * ## 为什么存在 `trades` 上（而不是新建一张表）
+ *
+ * 归因是**成交的属性**：一笔成交对应"开仓时那条决策依据了哪些信号"。
+ * 新建表会带来"两处都要维护一笔成交"的问题（本项目在别处踩过：
+ * `positions` 与 `trade_events` 的一致性）。
+ *
+ * ## 格式
+ *
+ * JSON 数组，元素是 `signalKeyOf()` 的产出：`<域名>|<方向>|<标的>`。
+ * · **空数组 = 纯技术面成交**（没有情报依据）—— 与"列不存在"语义相同；
+ * · 只写**通过 `filterKnownIntelKeys` 校验**的键（编造的被剔除）。
+ *
+ * ⚠️ `DEFAULT '[]'` 让既有 225 笔历史成交**自然落到"纯技术面"**，
+ * 不需要 backfill —— 那也符合事实（它们确实没有情报归因）。
+ */
+/**
+ * **成交的情报归因**（2026-10-12）—— `intel/signalHealth.ts` 的数据来源。
+ *
+ * ## 为什么需要它
+ *
+ * 消息面失效检测（胜率崩塌 / 连续亏损 / **反应衰减**）需要
+ * "**由某个信号驱动的成交**"。而实测核查发现这条信息**系统从未记录过**：
+ *
+ * ```
+ *   trades.source     → 只有 bot / reconciled（不是"哪个信号"）
+ *   open_reasoning    → 技术面理由
+ *   Decision          → 之前没有任何情报来源字段
+ * ```
+ *
+ * 所以 `signalHealth` 一直是**空转**（永远 `insufficient_data`）。
+ *
+ * ## 格式
+ *
+ * JSON 数组，元素是 `signalKeyOf()` 的产出：`<域名>|<方向>|<标的>`。
+ * · **空数组 = 纯技术面**（没有情报依据）；
+ * · 只写**通过 `filterKnownIntelKeys` 校验**的键（编造的被剔除）。
+ *
+ * ⚠️ `DEFAULT '[]'` 让既有 225 笔历史成交**自然落到"纯技术面"**，
+ * 不需要 backfill —— 那也符合事实。
+ */
+const M16_TRADE_INTEL_ATTRIBUTION = /* sql */ `
+ALTER TABLE trades ADD COLUMN intel_keys TEXT NOT NULL DEFAULT '[]';
+`;
+
+/**
+ * **持仓的情报归因**（2026-10-12）—— 归因链的中间一环。
+ *
+ * ## ⚠️ 为什么这是 M17 而不是并进 M16（我犯过这个错）
+ *
+ * 我第一版把 `positions` 的 `ADD COLUMN` 直接**加进了 M16** ——
+ * 而 **M16 已经在线上跑过**（`user_version = 16`）。
+ *
+ * 而迁移的跳过判据是（`db/index.ts` L55）：
+ * ```js
+ * if (migration.version <= current) continue;
+ * ```
+ *
+ * **所以改一个已发布的迁移 = 那段 SQL 永远不会再执行** ——
+ * 我给 `positions` 加的列在线上**根本没生效**，而**没有任何报错**。
+ *
+ * > **已发布的迁移是只读的。要改就加新的一段。**
+ * > （这条教训值得写在这里：它不报错，只是静默不生效。）
+ *
+ * ## 为什么 `positions` 需要它
+ *
+ * 归因链的形状是：
+ * ```
+ *   开仓 → positions 行（此时决策的 intelKeys 在手边）
+ *   平仓 → trades 行（把上面那份带过来）
+ * ```
+ *
+ * 若只在 `trades` 上有列，平仓时就**必须回查"当初那条决策"** ——
+ * 而"哪条决策开的这个仓"要靠 `symbol + 时间` 去猜
+ *（决策记录里没有仓位 id）。**那正是我拒绝过的"猜测式归因"。**
+ *
+ * 而 `positions.open_reasoning` 就是**现成的先例**：它存的就是
+ * "开仓时那条决策的技术面理由"。`intel_keys` 是它的**兄弟字段**
+ *（一个记技术面依据，一个记消息面依据）。
+ */
+const M17_POSITION_INTEL_ATTRIBUTION = /* sql */ `
+ALTER TABLE positions ADD COLUMN intel_keys TEXT NOT NULL DEFAULT '[]';
+`;
+
 const M12_STRATEGY_OPTIONAL = /* sql */ `
 -- ---------------------------------------------------------------------------
 -- AI 托管与策略**彻底解耦**：strategy_id 允许为空，删策略时置空而不是阻止
@@ -771,4 +870,6 @@ export const MIGRATIONS: readonly Migration[] = [
   { version: 13, name: 'order-margin-used', sql: M13_ORDER_MARGIN_USED },
   { version: 14, name: 'order-margin-type', sql: M14_ORDER_MARGIN_TYPE },
   { version: 15, name: 'pending-wait-minutes', sql: M15_PENDING_WAIT_MINUTES },
+  { version: 16, name: 'trade-intel-attribution', sql: M16_TRADE_INTEL_ATTRIBUTION },
+  { version: 17, name: 'position-intel-attribution', sql: M17_POSITION_INTEL_ATTRIBUTION },
 ];

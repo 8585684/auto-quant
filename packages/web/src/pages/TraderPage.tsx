@@ -23,6 +23,7 @@ import { Badge, Button, Empty, ErrorNote, Panel, Spinner3, cn } from '../compone
 import { TraderStatusBadge } from '../components/Badges';
 import { PageShell, Metric } from '../components/shell';
 import { DecisionFeed } from '../components/DecisionFeed';
+import { AgentAuditPanel } from '../components/AgentAuditPanel';
 import { isOpenOrder, TraderTables, type TraderTabId } from '../components/TraderTables';
 import { NET_PNL_FORMULA, PnlBreakdown, pnlFormulaText, statsCosts } from '../components/PnlBreakdown';
 import { DashboardEquityChart, WinLossBar } from '../components/DashboardCharts';
@@ -30,7 +31,6 @@ import { LeverageArc } from '../components/LeverageArc';
 import {
   EQUITY_RANGES,
   filterByRange,
-  hasEquityVariation,
   type EquityRange,
 } from '../components/equityCurve';
 import { CandlestickChart } from '../components/CandlestickChart';
@@ -59,13 +59,72 @@ type ChartTab = 'equity' | 'candles';
 /**
  * 展开后的权益曲线高度。
  *
- * 220px 在 900px 视口上约 24% 屏高：有形状时够看清趋势，没形状时根本不会画出来
- * （见 `EquityMiniStrip`，`LAYOUT.md` §3「图表只在有数据可看时才占大块」）。
+ * 220px 在 900px 视口上约 24% 屏高。
+ *
+ * ⚠️ **这个高度不再随数据变化。** 曲线以前会在"数据太薄"时塌成
+ * `EquityMiniStrip` 的 36px 细条，于是同一块版面会随数据变高变矮 ——
+ * 用户明确要求"不管有没有数据都保持展开状态一致"（总览页那条的同一句话）。
+ * 细条现在只在**用户自己点了「收起」**时出现，那是显式动作，不是数据决定的。
  *
  * 决策流**不再有对应的常量**：它住在右栏，高度由外壳那份"可视区 − 顶栏"给，
  * 页面手算一个视口高度必然算错（见 `DecisionFeed` 顶部注释）。
  */
-const EQUITY_CHART_HEIGHT = 220;
+/*
+ * 权益曲线的高度：**跟随视口，而不是写死 220px**。
+ *
+ * ## 为什么
+ *
+ * 用户的原话：「这一整块区域，内容你想办法压缩一下，尽最大可能让用户不翻页
+ * 就能看完整信息（尽量不出现滚动条翻页）」。
+ *
+ * 实测 1405x722（主栏可视高度只有 322px，而内容有 622px）：
+ *
+ *     header 62 + 指标卡 90 + 账户条 37 + 图表面板 321 + 间距 112 = 622
+ *
+ * 图表面板里的 220px 是写死的，而主栏在 722 高的窗口下只剩这么点地方 ——
+ * 它必须能被压。改成 `clamp(120px, 22vh, 260px)` 之后：
+ *
+ *   · 722 高的窗口 → 115px
+ *   · 900 高的窗口 → 144px
+ *   · 1080 高的窗口 → 173px（大屏上仍然是一张像样的图）
+ *
+ * 下限 110px 保证曲线还看得出走势（扣掉 X 轴标签后绘图区约 70px）；
+ * 上限 260px 防止 4K 屏上图表变成一块占满半屏的空白。
+ *
+ * ⚠️ **必须是数字，不能是 `clamp(...)` 这种 CSS 字符串。**
+ *
+ * 第一版写成 `clamp(110px, 16vh, 260px)`：recharts 的 `ResponsiveContainer`
+ * 把 `height` 原样写进内联样式（浏览器认），但它**内部还要把这个值解析成
+ * 数字**去算画布尺寸 —— 解析失败就什么都不画。实测症状是容器高度 116px、
+ * 里面 `<svg>` 为 `null`、`path` 数量 0：一块**空白的框**，看起来像"没有数据"。
+ * 所以改由 `useEquityChartHeight()` 在 JS 里算出像素值。
+ */
+const EQUITY_CHART_MIN = 110;
+const EQUITY_CHART_MAX = 260;
+const EQUITY_CHART_RATIO = 0.16;
+
+/**
+ * 图表高度 = `clamp(110, 16vh, 260)`，但**在 JS 里算**。
+ *
+ * 监听 `resize`（而不是 `ResizeObserver` 盯某个容器）：图表高度只跟视口有关，
+ * 而视口变化一定会触发 `resize`。初始值直接读 `window.innerHeight`，
+ * 所以首帧就是对的，不会先画一个错的高度再跳。
+ */
+function useEquityChartHeight(): number {
+  const compute = () =>
+    Math.round(
+      Math.min(EQUITY_CHART_MAX, Math.max(EQUITY_CHART_MIN, window.innerHeight * EQUITY_CHART_RATIO)),
+    );
+  const [height, setHeight] = useState(compute);
+
+  useEffect(() => {
+    const onResize = () => setHeight(compute());
+    window.addEventListener('resize', onResize);
+    return () => window.removeEventListener('resize', onResize);
+  }, []);
+
+  return height;
+}
 
 function num(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
@@ -175,14 +234,52 @@ export function TraderPage() {
   const [tableTab, setTableTab] = useState<TraderTabId>('positions');
   const [chartTab, setChartTab] = useState<ChartTab>('equity');
   const [range, setRange] = useState<EquityRange>('ALL');
+  /* 权益曲线高度跟随视口（见 `useEquityChartHeight` 的说明）。 */
+  const equityChartHeight = useEquityChartHeight();
   /**
-   * 手动覆盖"要不要展开曲线"。
+   * 手动覆盖"要不要收起曲线"。
    *
-   * `null` = 交给数据判断（有形状就展开，平线就收起）；`true` = 操作者自己点开了
-   * 一条平线；`false` = 自己收起了有形状的曲线。切区间时清空覆盖，重新按数据判断 ——
-   * 换一段窗口本来就该重新看一眼。
+   * ⚠️ **默认永远是展开的**（`null` 就走展开），不再由数据形状决定。
+   *
+   * 原来的规则是"有形状（≥3 点且有波动）才展开，否则塌成 36px 的缩略条"。
+   * 那条规则让**同一块版面随数据变高变矮**：机器人刚开始跑时是一行细条，
+   * 跑够两个周期后突然长成 220px 图表，下面的持仓表和决策流跟着上下跳。
+   * 用户的原话是「也是同理」—— 与总览页那条同一个要求：**不管有没有数据，
+   * 展开状态都要一致**。
+   *
+   * 保留手动开关：`true` = 用户自己点开（现在等于默认），`false` = 用户自己
+   * 收起。那是个**显式动作**，与"数据一变版面就跳"是两回事。
    */
   const [chartOverride, setChartOverride] = useState<boolean | null>(null);
+  /*
+   * **决策流聚焦模式**（2026-10-13 用户要求）。
+   *
+   * 用户的原话：
+   * > 「这一块UI展示区域太小了，根本显示不了这么多，**直接跳转把这块占用全部页面**。
+   * >  把结论那块移动到左边」
+   *
+   * ## 为什么用"聚焦开关"而不是直接改成全宽
+   *
+   * 右栏（决策流）在 xl 下只占 `flex-[2]`（40%），而团队看板要显示
+   * 总管 + 4 分析师 + 辩论 + 裁决 + 风控，**40% 宽确实装不下**。
+   *
+   * 但**直接改成全宽会牺牲行情图表与账户卡片** —— 那些也是操作员要看的东西。
+   * 所以做成**一个可切换的视图**：需要细看团队时点「全屏」，看完点「返回」。
+   *
+   * ⚠️ 三态（2026-10-13 实测后改）：
+   * ```
+   *   null  → 跟随模式默认（团队模式 = 全屏，另两种 = 常规）
+   *   true  → 强制全屏
+   *   false → 强制常规
+   * ```
+   * **为什么需要"跟随默认"**：团队模式**本来就该全屏** ——
+   * 它的看板在 40% 宽里装不下（实测工作流只剩 226px）。
+   * 而如果初始值是 `false`，用户每次进团队模式都要**手动点一次全屏** ——
+   * 那正是他说的"直接跳转把这块占用全部页面"（他要的是**默认就这样**）。
+   *
+   * 另两种模式的默认值仍是常规 —— **逐字节不变**。
+   */
+  const [feedFocusOverride, setFeedFocusOverride] = useState<boolean | null>(null);
   const { runOnce, busyId: runOnceBusyId } = useRunOnce();
   const { requestReview, busyId: reviewBusyId } = useAgentReview();
 
@@ -288,6 +385,28 @@ export function TraderPage() {
   const settleAsset = typeof rawAsset === 'string' && rawAsset.trim() ? rawAsset.trim() : DEFAULT_SETTLE_ASSET;
 
   const trader: TraderRow | null = tradersQuery.data?.find((row) => row.id === traderId) ?? null;
+  /*
+   * 决策流是否聚焦 —— 见 `feedFocusOverride` 的三态说明。
+   *
+   * ⚠️⚠️ **默认必须是 `false`（2026-10-13 用户纠正）**。
+   *
+   * 我曾把团队模式的默认值设成"全屏"，理由是"团队看板在 40% 宽里装不下"。
+   * 用户看到后的反应：
+   * > 「这是什么鬼UI BUG？**我是让你把右边策略上下占满，不是把整个网页占满了！**
+   * >  这其他功能怎么展示」
+   *
+   * **他说得对，而我理解错了两件事**：
+   * ```
+   *   用户要的：右栏【上下】占满 —— 纵向的高度，不要留白
+   *   我做的：  决策流【左右】占满整页 —— 把主内容（图表、账户卡）整个挤掉了
+   * ```
+   * 而"占满整页"会让**其他功能根本没有地方展示** —— 那是把一个问题
+   * 换成了更大的一个问题。
+   *
+   * 所以全屏只作为**手动开关**（工具栏「全屏」），默认仍是两栏布局。
+   * 而"右栏上下占满"是布局本身该做到的事（见 `PageShell` 的 `fillHeight`）。
+   */
+  const feedFocus = feedFocusOverride ?? false;
   /**
    * 这个机器人用的钱包名。取不到时回落到通用称呼，不显示空。
    *
@@ -699,19 +818,87 @@ export function TraderPage() {
   /*
    * 图表与缩略条共用同一份"可见区间"数据。
    *
-   * `filterByRange` 必须在这里调用一次，而不是让图表自己筛：收起与否取决于
-   * **当前区间**里有没有形状，两处各筛一次就会出现"图表画的是 7D、判断用的是全部"
-   * 这种自相矛盾的状态。
+   * `filterByRange` 在这里调用一次，而不是让图表自己筛：图表与缩略条用的是
+   * **当前区间**的同一份数据，两处各筛一次会出现"图表画的是 7D、另一处用的是
+   * 全部"这种自相矛盾的状态。
    */
   const windowed = useMemo(() => filterByRange(snapshots, range), [snapshots, range]);
-  const windowFirst = windowed[0]?.equity ?? equity;
-  const windowDelta = equity - windowFirst;
+
+  /*
+   * ══════════════════════════════════════════════════════════════════════════
+   *  ⚠️ **曲线与「本段变化」一律走【账户口径】**（2026-10-13，用户两次反馈后定稿）
+   * ══════════════════════════════════════════════════════════════════════════
+   *
+   * ## 用户的反馈（第二次，原话）
+   *
+   * > 「图标完全乱套了，上面叫归属权益、同期账户、本段变化，一大堆莫名其妙的，
+   * >  搞这么多没用的画蛇添足，无端增加BUG？图标不就是最真实准确简单的，
+   * >  **账号余额、总盈亏能对上的吗**？」
+   *
+   * **他是对的。** 我第一版的修法是"把两个口径并排显示 + 解释差额来源"——
+   * 那等于把一个"数字对不上"的问题，换成了一个"要读两行解释才懂"的问题。
+   * 而图表的正确职责是：**画账户在这段时间怎么走的**，和指标卡直接对上。
+   *
+   * ## 两个口径（见 `db/schema.ts` 的 M4 迁移说明）
+   *
+   * ```
+   *   equity         = initial_equity + Σ(本机器人已平仓净额)  ← 只算自己
+   *   accountEquity  = 共享钱包的真实权益（含同账户其他机器人）  ← 账户真实值
+   * ```
+   * 实测 `#10`：`equity` 108.47 vs `accountEquity` 97.80
+   *（差 10.67 = 同钱包上 `#9`/`#11` 的亏损）。
+   *
+   * ## 为什么账户口径才是对的
+   *
+   * ```
+   *   账户口径  → 回答"我的钱现在多少"      → 与「账户余额」指标卡一致 ✅
+   *   归属口径  → 回答"这个机器人赚了多少"  → 那是指标卡「交易盈亏」的事
+   * ```
+   * 而**曲线给人的直觉就是"我的钱的变化"** —— 用归属口径画它，
+   * 用户第一反应必然是"对不上"。
+   *
+   * ⚠️ 归属口径没有消失：它仍在「交易盈亏」指标卡里（那是它该在的地方）。
+   */
+  const windowAccountFirst = windowed[0]?.accountEquity ?? 0;
+  const windowFirst =
+    windowAccountFirst > 0
+      ? windowAccountFirst
+      : /* 旧快照没有账户口径（迁移前回填，缺值时是 0）→ 回落到归属口径，
+           否则曲线会砸到地板而看起来完全正常。 */
+        (windowed[0]?.equity ?? equity);
+  /*
+   * 末端用**实时账户权益**（60 秒轮询）优先 —— 与指标卡「账户余额」同源，
+   * 这样曲线末端与卡片显示的数字**严格相等**，用户不会看到"差一点"。
+   *
+   * ⚠️ 优先级：实时值 → 末快照的账户口径 → 末快照的归属口径。
+   * 逐级回落的原因同上：旧快照可能没有账户口径。
+   */
+  const lastSnap = windowed[windowed.length - 1];
+  const liveAccountEquityForCurve = num(accountQuery.data?.account?.equity);
+  const windowLast =
+    liveAccountEquityForCurve ??
+    ((lastSnap?.accountEquity ?? 0) > 0 ? lastSnap?.accountEquity : undefined) ??
+    lastSnap?.equity ??
+    equity;
+  const windowDelta = windowLast - windowFirst;
   const windowPercent = windowFirst !== 0 ? (windowDelta / Math.abs(windowFirst)) * 100 : 0;
-  const curveHasShape = useMemo(
-    () => hasEquityVariation(windowed.map((snapshot) => snapshot.equity)),
-    [windowed],
-  );
-  const curveCollapsed = chartOverride ?? !curveHasShape;
+
+  /*
+   * 默认展开（`chartOverride === null`）—— 不再看 `windowed` 有没有形状。
+   * 理由见上面 `chartOverride` 的声明。
+   *
+   * ── 合并说明（2026-10-13）────────────────────────────────────────────
+   * 这一处两边**各自修了同一个问题**：
+   * · 我：`chartOverride ?? (!curveHasNoData && !curveHasShape)`
+   *   —— 排除"没有数据"，但"有数据但太平"仍会折叠；
+   * · 协作者：`chartOverride ?? false` —— **彻底不再随数据变化**。
+   *
+   * **采用协作者的**：更彻底。用户的抱怨是"没有数据就折叠"，
+   * 而根因正是"折叠与否由数据决定" —— 只排除一种情况治不了根。
+   * 现在细条**只在用户显式点「收起」时**出现（`chartOverride === true`），
+   * 那是人的动作，不是数据的动作。
+   */
+  const curveCollapsed = chartOverride ?? false;
 
   const model = modelsQuery.data?.find((row) => row.id === trader?.aiModelId) ?? null;
   const strategy = strategiesQuery.data?.find((row) => row.id === trader?.strategyId) ?? null;
@@ -1154,6 +1341,13 @@ export function TraderPage() {
             size="lg"
             title="这个机器人还没有完成过任何一次开仓—平仓回合，所以胜率与盈亏比都没有意义。"
             sub={stats ? '完成第一个回合后这里会显示胜率与盈亏比' : '等待统计'}
+            /*
+             * `sub` 带 `truncate`，在窄栏里这句话会被切掉尾巴 —— 而没有 `title`
+             * 时切掉的部分**永远看不到**（`ui:check` 在真实浏览器里抓到过这一条）。
+             * 用 `subTitle` 而不是 `title`：卡片的 `title` 已经在解释"为什么没有
+             * 胜率"，两个提示挤在同一个属性上会互相盖掉。
+             */
+            subTitle={stats ? '完成第一个回合后这里会显示胜率与盈亏比' : '等待统计'}
           />
         )}
       </MetricCard>
@@ -1180,11 +1374,33 @@ export function TraderPage() {
   const secondaryFacts = (
     <div className="flex flex-wrap items-baseline gap-x-4 gap-y-1 px-1 text-xs text-ink-lo">
       <span>
-        AI 模型{' '}
-        <Link to="/models" className="text-accent hover:underline" title="决定它看什么、怎么下单的模型。">
-          {model ? model.label : `#${trader.aiModelId}`}
-        </Link>
-        {model?.model && <span className="ml-1 text-ink-faint">{model.model}</span>}
+        {/*
+          ⚠️ **团队模式不显示「AI 模型」**（用户 2026-10-12 明确要求）。
+
+          原话：
+          > 「团队多智能体模式，在创建/修改的时候就**不应该采用 AI 模型列表里面的**，
+          >  而是**直接采用系统的 magpie**，（系统 AI 列表里面添加的那些
+          >  **不应该给这个模式使用**）」
+
+          团队模式的模型出口来自**独立的 magpie 网关配置**，所以这里显示
+          "AI 模型 #4" 是**误导** —— 那个值是数据库外键要求的占位，
+          团队模式从不读它。浏览器实测确实看到了「AI 模型 [DEMO] 脚本化模型」，
+          而那不是它在用的东西。
+        */}
+        {trader.mode === 'ai_team' ? (
+          <span title="团队模式的模型由独立的 magpie 网关调度，与「AI 模型」列表无关。">
+            模型调度{' '}
+            <span className="text-ink-faint">系统 magpie 网关（按角色分档）</span>
+          </span>
+        ) : (
+          <>
+            AI 模型{' '}
+            <Link to="/models" className="text-accent hover:underline" title="决定它看什么、怎么下单的模型。">
+              {model ? model.label : `#${trader.aiModelId}`}
+            </Link>
+            {model?.model && <span className="ml-1 text-ink-faint">{model.model}</span>}
+          </>
+        )}
       </span>
       <span>
         {/*
@@ -1202,6 +1418,16 @@ export function TraderPage() {
           <span title="参数与交易提示词由 AI 自主设定并持续调整；生效的配置不在策略里。">
             智能托管
           </span>
+        ) : trader.mode === 'ai_team' ? (
+          /*
+           * ⚠️ **团队模式也不显示策略** —— 而且原来的代码会渲染成「策略 #null」。
+           *
+           * 因为 `ai_team` 与 `ai_managed` 一样**不引用策略**（`strategyId` 是 `null`），
+           * 而这里的分支只判了 `ai_managed`，于是团队模式落进 `else` 分支，
+           * 把 `null` 渲染成「策略 #null」并链到 `/strategy/null` ——
+           * 一个**指向不存在页面的链接**，浏览器实测确实看到了「策略 #null」。
+           */
+          <span title="AI 团队模式不引用策略；参数由团队按角色自行管理。">AI 团队（多智能体）</span>
         ) : (
           <>
             策略{' '}
@@ -1255,15 +1481,169 @@ export function TraderPage() {
      * 于是 `flex-1` 失效、高度链断掉，决策流拿不到确定高度、内部滚动条随之消失。
      * 这条链是：这里 → `PageShell` 的 `xl:h-full` → 右栏 `max-h-full` → 决策流 `h-full`。
      */
-    <div className="flex h-full min-h-0 flex-col gap-4">
+    /*
+     * ══════════════════════════════════════════════════════════════════════
+     *  **合并说明（2026-10-13）** —— 这一处两边各自重写了同一段布局
+     * ══════════════════════════════════════════════════════════════════════
+     *
+     * ## 我做了什么（保留）
+     *
+     * 一个**全屏开关**：点「全屏」时决策流独占整页。
+     * ⚠️ **默认关闭** —— 用户纠正过我一次：
+     * > 「我是让你把右边策略**上下**占满，不是把整个网页占满了！这其他功能怎么展示」
+     *
+     * 所以全屏是**包在外面的一个可选分支**（见下面 `feedFocus`），
+     * 不影响常规视图里的高度分配 —— 两者解决的是两个不同的问题：
+     * ```
+     *   协作者的：常规视图里，垂直空间该给谁（主栏优先）—— 这是默认行为
+     *   我的：    想看团队细节时，临时要更多宽度     —— 这是显式动作
+     * ```
+     *
+     * ## 协作者做了什么（其实测与"主栏优先"的结论采用，落点改在表格区）
+     *
+     * 重新分配**主栏与表格区**的高度。依据是实测 1405x722（内容区 514px）：
+     *
+     *     平分（两边各 `flex-1`）时，主栏 251px，而固定内容
+     *     （页头 62 + 配置摘要 16 + 指标卡 82 + 模型策略 16 + 账户条 37 + 间距）
+     *     就要 213px → 留给图表只剩 38px，图表基本不可读；
+     *     反过来表格那 251px 里有 122px 是空的。
+     *
+     * 主栏是**盯盘要看的东西**（指标、账户、图表），表格是**参考材料**
+     * （11 列成交明细）—— 所以**主栏优先是对的，这个取舍方向采用**。
+     *
+     * ⚠️ 但"主栏优先"的**落点**与协作者不同，两边各自被用户实测纠过一次：
+     *
+     * ```
+     *   协作者：主栏 flex-none（按内容要高度）+ 表格区 flex-1
+     *   最终：  主栏 flex-1 min-h-0（吸收剩余、自己内部滚）
+     *          + 表格区 flex-none + max-h-[30vh]（按内容，行多了才滚）
+     * ```
+     *
+     *   1. 主栏 `flex-none` 会**按内容撑高** → 右侧决策流"无限膨胀"；
+     *   2. 表格区 `flex-1` 与 `max-h-[30vh]` 撞在一起 → 页面底部**空一大截**。
+     *
+     * 两条都是用户实测报上来的。详细论证分别见下面常规视图与表格区两段注释。
+     */
+    <div className="flex h-full min-h-0 flex-col gap-3">
+      {/*
+        ══════════════════════════════════════════════════════════════════════
+         **全屏分支**（可选，默认关闭）—— 决策流临时独占整页
+        ══════════════════════════════════════════════════════════════════════
+
+        ⚠️ **默认永远是 `false`**。用户纠正过我一次：
+        > 「我是让你把右边策略**上下**占满，不是把整个网页占满了！这其他功能怎么展示」
+
+        所以它只是工具栏「全屏」按钮触发的一个**临时视图**，
+        常规视图（下面那个分支）才是默认 —— 而常规视图里
+        "上下占满"由 `PageShell` 的 `fillHeight` + 主栏的高度分配保证。
+      */}
+      {feedFocus ? (
+        <div className="flex h-full min-h-0 flex-col">
+          <div className="mb-2 flex shrink-0 items-center gap-2">
+            <Button variant="ghost" onClick={() => setFeedFocusOverride(false)} title="返回常规视图（图表与账户卡）">
+              ← 返回
+            </Button>
+            <span className="text-sm text-ink-faint">
+              决策流占了整页 —— 这是临时视图，点「返回」回到图表与账户卡
+            </span>
+          </div>
+          <div className="min-h-0 flex-1">
+            <DecisionFeed
+              traderId={traderId}
+              running={running}
+              mode={trader?.mode ?? 'strategy'}
+              nextCycleAt={trader?.nextCycleAt ?? null}
+              onToggleFocus={() => setFeedFocusOverride(false)}
+              focusMode
+              actions={
+                <>
+                  {runNowAction}
+                  {reviewAction}
+                </>
+              }
+            />
+          </div>
+        </div>
+      ) : (
+      <>
+      {/*
+        ══════════════════════════════════════════════════════════════════════
+         **常规视图**（默认）—— 主栏与表格区的高度分配
+        ══════════════════════════════════════════════════════════════════════
+
+        ## 主栏为什么必须是 `flex-1 min-h-0`，而不是 `flex-none`
+        （2026-10-13 用户报"右边无限膨胀"后实测定位）
+
+        ```
+          MAIN#main-scroll          h= 844  (flex: 1 1 0%)
+            └ shell                 h= 764  (h-full，正确)
+                └ 主栏 div          h=**1328**  (flex: 0 **0** auto)  ← 元凶
+                     └ PageShell    h= 1328  (h-full → 跟父一样)
+                          └ 右栏     h= 1328  (max-h-full → 一样)   ← 用户看到的"无限膨胀"
+        ```
+        右栏跟着主栏一起被拉到 1328px，且 `scrollHeight === clientHeight`
+        → **没有内部滚动**，因为整块已经比视口高了。
+
+        `flex-none` = `flex: 0 0 auto` → **既不放大也不收缩**，
+        于是它的高度 = **内容高度**。而"主栏按内容要高度"成立的前提是
+        "主栏内容高度是确定的（图表是 `clamp()` 算出的像素值）" ——
+        **那个前提在合并后的结构里不成立**：主栏里还有 `AgentAuditPanel` 等
+        可长可短的内容，`#5` 上主栏内容实测 1328px。
+
+        ## 表格区的分配
+
+        主栏是**盯盘要看的东西**（指标、账户、图表），表格是**参考材料**
+        （11 列的成交明细）。主栏 `flex-1` 参与 flex 分配、超出部分由
+        `xl:overflow-y-auto`（`page-main` 上已有）自己滚；`min-h-0` 不能省 ——
+        flex 子项默认 `min-height: auto` 会按内容撑高。
+
+        ⚠️ 这同时满足用户最早那句「尽量不出现滚动条翻页」的**正确读法**：
+        滚动条出现在**主栏内部**（而不是整页），所以右栏始终钉在视口里。
+
+        ## 表格区最终是 `flex-none`（不是 `flex-1`）—— 见下面表格区那段
+
+        协作者原方案是表格区 `flex-1` 吃剩下的，但那会和 `max-h-[30vh]`
+        撞在一起、留下"底部一大截空白"（见表格区上的事故记录）。
+        现在主栏 `flex-1` 吸收空间、表格区按内容高。
+      */}
       <div className="min-h-0 flex-1">
       <PageShell
+        /*
+         * 主栏区块间距收到 10px（默认 16px）：这一页在主栏里有五个区块，
+         * 五个 16px 就是 80px —— 相当于一整张指标卡。见 `mainClassName` 的说明。
+         */
+        /*
+         * `space-y-2`（8px）+ `flex flex-col`：这一页主栏有五个区块，
+         * 默认的 16px 间距合计 80px —— 在 722 高的窗口下那就是"要不要滚动"
+         * 的全部差距。8px 仍然分得开（区块本身都有边框或底色），
+         * 但省下 40px。
+         *
+         * ⚠️ `flex flex-col` 与 `space-y-2` 并用是有意的：`space-y` 负责
+         * 间距，`flex` 让下面的图表面板能用 `flex-1` 吃掉剩余高度
+         * （`space-y-*` 本身不影响 flex 布局）。
+         */
+        mainClassName="flex flex-col space-y-2"
         aside={
           <DecisionFeed
             traderId={traderId}
             running={running}
+            /*
+             * ⚠️ **把模式传下去** —— 团队模式的看板与另两种根本不同
+             *（用户 2026-10-12 要求"3 种模式进去以后看板 UI 显示内容也应该是要分开的"）。
+             *
+             * 默认值是 `'strategy'`，所以这里即使不传也不改变既有行为；
+             * 传下去是为了让团队模式显示**编制表**而不是线性步骤列表。
+             */
+            mode={trader?.mode ?? 'strategy'}
             /* 下一轮决策的预定时刻 —— 由服务端给出，界面只显示倒计时（见 CycleCountdown）。 */
             nextCycleAt={trader?.nextCycleAt ?? null}
+            /*
+             * ⚠️ **必须传它**（2026-10-13 实测踩到）：`DecisionFeed` 只在
+             * `onToggleFocus !== undefined` 时渲染「全屏」按钮 ——
+             * 我第一版只在聚焦分支传了它，于是**常规视图里根本没有那个按钮**，
+             * 用户**无法进入全屏**（而"进不去全屏"正是他抱怨的那件事）。
+             */
+            onToggleFocus={() => setFeedFocusOverride(true)}
             actions={
               <>
                 {runNowAction}
@@ -1274,7 +1654,22 @@ export function TraderPage() {
         }
       >
         {/* A. 页头：我是谁 + 什么状态 + 能做什么，常驻一行 --------------- */}
-        <header className="flex flex-wrap items-center gap-x-3 gap-y-2">
+        {/*
+          ⚠️ 宽屏 `xl:flex-nowrap`：这一行有七个元素（返回链接、标题、#id、
+          状态、账户、两个按钮），在 674px 的主栏里总宽约 707px —— 差 37px
+          就放不下，于是 `flex-wrap` 把「启动 / 配置」推到第二行，
+          页头从 28px 变成 62px。那 34px 在 722 高的窗口下正是"图表还剩多少"
+          的分界（实测图表被压到 61px，基本不可读）。
+
+          该被压缩的是**标题**（它本来就 `truncate`），不是把动作挪到另一行：
+          把 `max-w-[24rem]` 换成 `min-w-0 flex-1` 之后标题自己让位，
+          其余元素各就各位，页头稳定一行。窄屏仍保留换行。
+
+          `gap-x-2`（原来 3）：这一行有七个元素、六个间隙，收 4px 就是 24px
+          —— 正好是"[DEMO] 决策审计示例"被截成"[DEMO] 决策审..."的那点差距
+          （标题需要 191px，收窄前只剩 174px）。8px 的间距在徽章之间仍然清楚。
+        */}
+        <header className="flex flex-wrap items-center gap-x-2 gap-y-2 xl:flex-nowrap">
           <Link
             to="/traders"
             className="inline-flex items-center gap-1 text-base text-ink-lo transition hover:text-accent"
@@ -1285,7 +1680,20 @@ export function TraderPage() {
 
           <span className="h-4 w-px bg-base-700" aria-hidden />
 
-          <h1 className="min-w-0 max-w-[24rem] truncate text-xl font-semibold tracking-wide text-ink-hi">
+          <h1
+            /*
+             * `text-lg`（原来 `text-xl`）：主栏宽 674px，这一行七个元素合计
+             * 683px —— 差 9px，标题被截成「[DEMO] 决策审计...」。
+             * 20px → 18px 省下约 19px，正好让标题完整显示。
+             *
+             * 这一页的标题是**数据驱动的机器人名**（可能是任意长度），
+             * 而它旁边的徽章（#id、状态、账户）都是定长的 —— 该让的是标题，
+             * 但也没必要让到"看不清自己打开的是哪个机器人"。
+             */
+            className="min-w-0 flex-1 truncate text-lg font-semibold tracking-wide text-ink-hi"
+            /* 极窄窗口下标题仍可能被截，完整名字必须能从悬停读到。 */
+            title={trader.name}
+          >
             {trader.name}
           </h1>
           <Badge tone="muted">#{trader.id}</Badge>
@@ -1506,10 +1914,23 @@ export function TraderPage() {
         <Panel
           padded={false}
           bodyClassName="p-0"
+          /*
+           * 图表高度由 `EQUITY_CHART_HEIGHT` 的 `clamp(110px, 16vh, 260px)`
+           * 决定，**不再用 `flex-1` 吃剩余高度**。
+           *
+           * 试过 `flex-1` + `fill`（让 recharts 撑满父级）：主栏的高度是
+           * flex 算出来的，而 `height:100%` 需要父级有一个**已解析的**像素
+           * 高度 —— 实测图表在 1405x722 下只拿到 6px（`.recharts-responsive-
+           * container` 的实际高度），曲线整块消失。`clamp()` 给出的是一个
+           * 确定的像素值，recharts 能照用，四种窗口尺寸下都画得出来。
+           */
+          className="shrink-0"
           title={
             <span className="flex items-center gap-1">
               <ChartTabButton active={chartTab === 'equity'} onClick={() => setChartTab('equity')}>
-                归属权益曲线
+                {/* ⚠️ 「账户权益」而不是「归属权益」—— 曲线画的是共享钱包的真实权益
+                    （与上方「账户余额」指标卡同一个数），标签必须说对。 */}
+                账户权益曲线
               </ChartTabButton>
               <ChartTabButton active={chartTab === 'candles'} onClick={() => setChartTab('candles')}>
                 行情图表
@@ -1562,7 +1983,13 @@ export function TraderPage() {
                 所以没有任何数据是拿不到的。
               */
               <EquityMiniStrip
-                values={windowed.map((snapshot) => snapshot.equity)}
+                /*
+                 * ⚠️ **账户口径**（与展开态的曲线、与「账户余额」指标卡三者一致）。
+                 * 见 `windowFirst` 那段说明。
+                 */
+                values={windowed.map((snapshot) =>
+                  snapshot.accountEquity > 0 ? snapshot.accountEquity : snapshot.equity,
+                )}
                 delta={windowDelta}
                 percent={windowPercent}
                 asset={settleAsset}
@@ -1578,7 +2005,7 @@ export function TraderPage() {
             ) : (
               <div className="px-3.5 pb-2.5 pt-2">
                 <EquityWindowLine
-                  equity={equity}
+                  equity={windowLast}
                   delta={windowDelta}
                   percent={windowPercent}
                   asset={settleAsset}
@@ -1587,7 +2014,12 @@ export function TraderPage() {
                   snapshots={snapshots}
                   range={range}
                   baseline={trader.initialEquity}
-                  height={EQUITY_CHART_HEIGHT}
+                  height={equityChartHeight}
+                  /*
+                   * ⚠️ **账户口径**（2026-10-13 用户要求）——
+                   * 曲线必须能和上方「账户余额」指标卡对上。见 `windowFirst` 那段。
+                   */
+                  metric="account"
                 />
               </div>
             )
@@ -1595,6 +2027,33 @@ export function TraderPage() {
             <CandlesPanel symbol={chartSymbol} />
           )}
         </Panel>
+
+        {/*
+          **智能体审计**（用户 2026-10-12 要求的「汇报工作的」那一环）。
+
+          它把三张此前**前端完全不可见**的表呈现出来
+          （`agent_runs` / `agent_experiments` / `agent_memory`）。
+
+          ── ⚠️ 2026-10-13 用户报的问题（**我越界了**）──────────────────────
+          > 「还有你做的这个，为什么会出现在智能托管模式机器人里面（赚大钱）？
+          >  你这次更新不都是只针对团队模式吗？」
+
+          用户说得对。这条硬约束写在需求里：
+          > 「你现在的更新迭代**不要影响我现在实盘跑的机器人**：赚大钱」
+
+          `#10 赚大钱` 是 `ai_managed`，而我**主动**让它显示了新面板 ——
+          代码注释里我甚至写着「不按模式隐藏」，理由是"那三张表 ai_managed 也有"。
+
+          **那个理由混淆了两件事**：
+          ```
+            数据存在      ≠ 用户要在这个模式里看到新界面
+          ```
+          实测那三张表在 `#10` 上确实有数据（runs 280 / experiments 24 /
+          memory 90），**但那是既有 AI 托管的行为**，不是"应该给它加个新面板"的理由。
+
+          所以现在**只对 `ai_team` 显示** —— 与本次大更新的边界一致。
+        */}
+        {trader.mode === 'ai_team' && <AgentAuditPanel traderId={traderId} />}
 
       </PageShell>
       </div>
@@ -1621,8 +2080,57 @@ export function TraderPage() {
         表格内部本来就有 `max-h-[34vh] overflow-y-auto`（见 `TraderTables`），
         所以这里只需给外层一个上限，让整块（标签栏 + 表体 + 净额桥）
         不超视口的四成半 —— **上面那两块（指标卡与图表）才是盯盘要看的东西。**
+
+        `flex-1` + `min-h-0`：表格区**吃剩下的高度**而不是先占一块
+        （见上面主栏那段的说明）。窗口矮的时候它可以被压得很扁 —— 内部有
+        滚动条，压扁的代价只是"一次少看几行"，而不是"整块消失"。
+
+        `max-h-[30vh]`（原来是 46vh）：主栏优先之后，表格在 722 高的窗口下
+        只剩一百来像素，这个上限只在**高窗口**（≥ 900px）下才起作用 ——
+        那时表格最多占 30vh，多出来的高度留给主栏的图表。
       */}
-      <div className="max-h-[46vh] space-y-4 overflow-y-auto">
+      {/*
+        ⚠️⚠️ **`flex-none`，不是 `flex-1`**（2026-10-13 用户报"页面底部空了一大截"后修）。
+        
+        ## 事故现象（量化）
+        
+        ```
+          视口 723 · shell 603
+            主栏        h=374（flex-1）
+            表格区容器  h=**217**（flex-1 + max-h-[30vh]）
+              其中表格  h= 94
+              盈亏行    h= 39  → 内容合计 149
+              **容器内空 68px**  ← 用户看到的那一截空白
+        ```
+        加上页面自身的 32px 内边距，底部共空约 **100px**。
+        
+        ## 根因：容器「既被要求长高、又被卡住上限」
+        
+        `flex-1`（`flex: 1 1 0%`）让容器**吃掉剩余空间**，
+        而 `max-h-[30vh]` 又把它**卡在 217px**。于是容器是 217、
+        内容只有 149 —— 那 68px 既没被内容占满、也没让给别的区块，
+        就变成了死空白。
+        
+        ⚠️ 这一处是本文件里**唯一**与协作者原取向相反的地方：他写的是
+        "主栏 flex-none（按内容）/ 表格区 flex-1"。
+
+        ## 修法：让**主栏**吸收空间，表格区按内容高度
+        
+        ```
+          主栏     flex-1    → 吸收全部剩余（图表跟着变大，那是"盯盘要看的"）
+          表格区   flex-none + max-h-[30vh] → 按内容高；行数多了才滚动
+        ```
+        这样"盈亏行"就贴到页面底部了（只剩页面自身的内边距）。
+        
+        ⚠️ `max-h-[30vh]` **必须保留**：成交记录可能有几十行，
+        没有上限时它会无限长高、把主栏挤成一条缝。
+        `flex-none` + `max-h` 的组合正好表达"按内容、但有上限"。
+        
+        他的目标是"主栏不被压缩"，而主栏 `flex-1` 同样能达到（甚至更大：
+        它现在会吸收表格省下的空间）。两者真正的差别是**死空白归谁** ——
+        而用户的判定是"底部不该有空白"，所以取 `flex-none`。
+      */}
+      <div className="min-h-0 max-h-[30vh] flex-none space-y-4 overflow-y-auto">
         <TraderTables
           traderId={traderId}
           tab={tableTab}
@@ -1694,6 +2202,8 @@ export function TraderPage() {
           </div>
         )}
       </div>
+      </>
+      )}
 
       <StartTraderModal
         trader={trader}
@@ -1825,9 +2335,13 @@ function MetricCard({ children }: { children: ReactNode }) {
   /*
    * `h-full` 是**必须**的，不是装饰：grid 子项默认 `stretch` 只让外层 div 等高，
    * 里面的 `Metric` 想用 `mt-auto` 把 footer 推到底，就得让高度真的传下去。
+   *
+   * `py-2`（原来 `py-3`）：这一页在 722 高的窗口下主栏只有三百来像素，
+   * 五张卡各 90px 里每张有 24px 是上下内边距。收到 16px 之后每张 82px，
+   * 五张省下 40px —— 正好是"要不要滚动"的那点差距。
    */
   return (
-    <div className="h-full min-w-0 rounded-lg border border-base-750 bg-base-900 px-3.5 py-3">{children}</div>
+    <div className="h-full min-w-0 rounded-lg border border-base-750 bg-base-900 px-3.5 py-2">{children}</div>
   );
 }
 
@@ -1920,7 +2434,7 @@ function EquityMiniStrip({
 /**
  * 展开态下图表上方的一行口径说明。
  *
- * 只讲**这一段窗口里涨跌了多少**：当前归属权益本身已经常驻在上面那张指标卡里，
+ * 只讲**这一段窗口里涨跌了多少**：当前权益本身已经常驻在上面那张指标卡里，
  * 在这里再放一个 `text-3xl` 会让同一个数字在一屏里出现两次，而且都比别的东西显眼
  * （DESIGN.md §4 "不要把所有东西做成一样大"）。
  *
@@ -1928,6 +2442,24 @@ function EquityMiniStrip({
  * 正常运行时它既不是状态、也没有后果 —— 曲线上有多少个点，看曲线本身就知道。
  * 真正需要解释"为什么这条曲线这么稀"的时候（快照太少、或一条平线被收成一行），
  * 说明就在 `EquityMiniStrip` 的 `note` 里，那里是**带结论**的一句话。
+ *
+ * ## ⚠️ 2026-10-13：这里曾经有过第二行「同期账户」，已删除
+ *
+ * 起因是用户报「图表显示和实际账号对不上」。我第一版的修法是
+ * **把两个口径并排显示 + 解释差额来源**：
+ * ```
+ *   本段变化  +$8.58 USDT (+8.57%)  本机器人归属
+ *   同期账户  −$2.10 USDT (−2.09%)  同一钱包含其他机器人（…多 +$10.67）
+ * ```
+ * 用户的第二次反馈（原话）：
+ * > 「图标完全乱套了，上面叫归属权益、同期账户、本段变化，一大堆莫名其妙的，
+ * >  搞这么多没用的画蛇添足，无端增加BUG？图标不就是最真实准确简单的，
+ * >  **账号余额、总盈亏能对上的吗**？」
+ *
+ * **他是对的** —— 那个修法把"数字对不上"换成了"要读两行解释才懂"，
+ * 而问题本身有更简单的解：**让曲线画账户口径**（见 `DashboardEquityChart`
+ * 的 `metric` prop 与下面 `windowFirst` / `windowLast` 的说明）。
+ * 于是这一行回到一行，标签也改回中性的"本段变化"。
  */
 function EquityWindowLine({
   equity,
@@ -1942,7 +2474,10 @@ function EquityWindowLine({
 }) {
   return (
     <div className="mb-2 flex flex-wrap items-baseline gap-x-3 gap-y-1 text-xs">
-      <span className="text-ink-lo" title="相对可见区间第一个快照的变化。">
+      <span
+        className="text-ink-lo"
+        title="相对可见区间第一个快照的变化。与上方「账户余额」同一口径（共享钱包的真实权益）。"
+      >
         本段变化
       </span>
       <span className={cn('num text-base font-semibold', pnlColor(delta))}>
@@ -1951,7 +2486,7 @@ function EquityWindowLine({
       <span className={cn('num', pnlColor(delta))}>({fmtPercent(percent)})</span>
       {/* `equity` 只用来兜底没有快照时的比较基准，与图表内部口径一致；
           它是给屏幕阅读器的，不占视觉位置。 */}
-      <span className="sr-only">当前归属权益 {fmtNum(equity, 2)}</span>
+      <span className="sr-only">当前账户权益 {fmtNum(equity, 2)}</span>
     </div>
   );
 }

@@ -1,4 +1,5 @@
 import { normalizeSymbol, type StrategyConfig } from '@aq/shared';
+import { runFunnel, type FunnelStageReport } from '../market/funnel.js';
 import type { MarketDataService } from '../market/service.js';
 import { createLogger } from '../logger.js';
 import { candidateBudget, estimateCandidateChars, PROMPT_TOKEN_BUDGET } from './prompt.js';
@@ -93,6 +94,13 @@ export async function selectCandidates(
      */
     preferred?: Iterable<string>;
     /**
+     * **漏斗每层的淘汰报告**（团队模式用）。
+     *
+     * 为什么要回调而不是直接写日志：`coins.ts` 不该知道日志系统，
+     * 而"每层淘汰了多少"正是操作员要看的（"我的币为什么没被看到"）。
+     */
+    onFunnelReport?: (stages: readonly FunnelStageReport[], survivors: number) => void;
+    /**
      * 提示词 token 预算。省略 = 保守默认（6 万）。
      *
      * 调用方应当传 `promptTokenBudget(model.inputTokenLimit)` —— 候选池的大小
@@ -137,6 +145,40 @@ export async function selectCandidates(
           minOpenInterestUsd: coinSource.minOpenInterestUsd,
         });
         for (const symbol of symbols) add(symbol, 'coinpool');
+        break;
+      }
+
+      /*
+       * ── **团队模式：走【分层漏斗】**（2026-10-12 接线）────────────────────
+       *
+       * 用户的要求：
+       * > 「交易所有 500 个可以交易的币……**层层筛选**」
+       *
+       * ⚠️ **为什么另起一个 sourceType 而不是改 `coinpool`**：
+       * `coinpool` 是**另两种模式在用**的路径，用户明确要求
+       * 「现阶段得也得保留……用户可以自行切换用现有模式」——
+       * 所以**另两种模式的选池行为必须逐字节不变**。
+       * 新的 `funnel` 只给团队模式用。
+       *
+       * 与 `coinpool` 的实质差别：
+       * | | coinpool | funnel |
+       * |---|---|---|
+       * | 层数 | **一层**（按成交额取前 N）| **多层**（流动性 → 波动区间 → …）|
+       * | 淘汰可解释 | ❌ | ✅ 每层带 `dropped` + `note` |
+       * | 谁决定"选谁" | 单一排序 | 每层可以有自己的排序依据 |
+       *
+       * 用户要"层层筛选"，而 `coinpool` 的**单层**做不到"层"这个概念 ——
+       * 它只是一次排序取前 N。所以这是**真的新增**，不是换名字。
+       */
+      case 'funnel': {
+        const rows = await market.screenUniverseRows();
+        const { survivors, stages } = runFunnel(rows);
+        for (const s of survivors) add(s.symbol, 'funnel');
+        /*
+         * **把每层淘汰写进日志** —— 这是"每层可解释"的落地：
+         * 操作员要能回答"我的币为什么没被看到"。
+         */
+        options.onFunnelReport?.(stages, survivors.length);
         break;
       }
 

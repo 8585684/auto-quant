@@ -16,11 +16,13 @@
  *      (counted once per account), 交易 is what each bot itself is doing (adds up).
  *      The per-bot 归属权益 never appears as a total — that sum counted one
  *      wallet once per bot and read ~3× high (see `lib/fleetTotals.ts`);
- *   3. 主区 — the equity curve, which is the primary visual **only when the
- *      series has shape** (≥3 points with real variation, `equityShape`). A flat
- *      or thin series collapses to a 36px strip (§4: never spend a third of the
- *      viewport drawing a straight line). It plots the **account-basis** curve;
- *      each bot's attributed curve lives on its own dashboard;
+ *   3. 主区 — the equity curve, **always drawn at full height**. It used to
+ *      collapse to a 36px strip when the series was flat or thin (§4: never
+ *      spend a third of the viewport drawing a straight line), but that made
+ *      the page change height as data arrived — the user asked for a stable
+ *      layout ("不管有没有数据都要保持展开状态一致"). It plots the
+ *      **account-basis** curve; each bot's attributed curve lives on its own
+ *      dashboard;
  *   4. 机器人明细 — the dense per-bot table;
  *   5. 运行环境 — a footer, at the smallest size on the page, holding status
  *      only. Internal diagnostics (clock offset, API weight) appear **only when
@@ -33,7 +35,7 @@
 import { Suspense, lazy, useEffect, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { Bot, CircleAlert, RefreshCw } from 'lucide-react';
-import type { EquitySnapshot, TraderStatus } from '@aq/shared';
+import type { EquitySnapshot, TraderMode, TraderStatus } from '@aq/shared';
 import { api, type TraderRow } from '../lib/api';
 import { useApp, useEvents } from '../lib/store';
 import { useSummaries } from '../lib/summaries';
@@ -41,14 +43,13 @@ import { accountEquityContributor, fleetTotals } from '../lib/fleetTotals';
 import { useDocumentTitle, usePolled } from '../lib/hooks';
 import { Button, Empty, ErrorNote, Panel, Spinner3 } from '../components/ui';
 import { Metric, MetricGroup, PageShell, SectionLabel } from '../components/shell';
+import { PageActions } from '../templates/lib/PageActions';
 import { NewTraderModal, StartTraderModal } from '../components/TraderModals';
 import { EQUITY_RANGES, mergeEquityCurves, rangeSpanMs, type EquityRange } from '../components/equityCurve';
 import {
   EquitySkeleton,
-  EquityStrip,
   SystemFact,
   TradersSnapshotTable,
-  equityShape,
   useRecentTrades,
 } from './overviewParts';
 import {
@@ -71,8 +72,9 @@ import {
  * whole library in front of the first paint of the headline numbers. The shell
  * and the rail render immediately; the curve lands a moment later.
  *
- * It is reached only when `equityShape` says there is something to draw, so a
- * flat or brand-new account never downloads it at all.
+ * ⚠️ 这条 `lazy` 现在**每次都会加载**：曲线不再按数据形状收起，所以一个全新的
+ * 账户也会去下载它。这是刻意的取舍 —— 分块仍在（它不阻塞首屏标题数字的绘制，
+ * 外壳与左栏先渲染、曲线稍后落位），但"数据薄时省掉这次下载"换不来稳定版面。
  */
 const EquityCurveChart = lazy(() =>
   import('../components/EquityCurveChart').then((module) => ({ default: module.EquityCurveChart })),
@@ -285,10 +287,6 @@ export function OverviewPage() {
 
   const listFailed = tradersQuery.error !== null && tradersQuery.data === null;
 
-  /* --- 曲线形态：决定主区是画图表、还是收成一条紧凑的缩略线（§4） ------- */
-  const shape = equityShape(curve);
-  const rangeLabel = range === 'ALL' ? '全部区间' : `近 ${range}`;
-
   const pnlTone = (value: number): 'default' | 'up' | 'down' =>
     value > 0 ? 'up' : value < 0 ? 'down' : 'default';
 
@@ -425,21 +423,67 @@ export function OverviewPage() {
             {statsPending && ` · 正在读取 ${fmtInt(traders.length - withStats)} 个机器人的统计…`}
           </p>
         </div>
+        {/*
+          动作走**统一接口**：控制台模板把它们收进工具栏，经典模板就地渲染
+          （下面这一屏就是原版的样子）。见 `templates/lib/PageActions.tsx`。
+
+          ⚠️ 这一层容器的类名**原样保留**，它是"经典模板下和改版前逐字一致"
+          的关键：`PageActions` 就地渲染时**不加包裹层**，直接把自己那两个
+          子项交给这个 `flex` 容器排版（`ml-auto` 把整组推到右边、`gap-1.5`
+          给按钮之间留缝）。控制台模板下这个容器是空的 —— 两个子项被 portal
+          进工具栏了，而 `flex` 容器没有子项时宽度为 0，不影响标题行。
+        */}
         <div className="ml-auto flex flex-wrap items-center gap-1.5">
-          <Button small variant="ghost" busy={refreshing} onClick={refreshAll} title="重新读取机器人列表、统计与系统状态">
-            <RefreshCw aria-hidden className="h-3.5 w-3.5" />
-            刷新
-          </Button>
-          <Link to="/traders" className="btn btn-ghost btn-xs">
-            管理机器人
-          </Link>
-          <Button small variant="primary" onClick={() => setNewOpen(true)}>
-            新建机器人
-          </Button>
+          <PageActions
+            start={
+              <>
+                <Button small variant="ghost" busy={refreshing} onClick={refreshAll} title="重新读取机器人列表、统计与系统状态">
+                  <RefreshCw aria-hidden className="h-3.5 w-3.5" />
+                  刷新
+                </Button>
+                <Link to="/traders" className="btn btn-ghost btn-xs">
+                  管理机器人
+                </Link>
+              </>
+            }
+            end={
+              <Button small variant="primary" onClick={() => setNewOpen(true)}>
+                新建机器人
+              </Button>
+            }
+          />
         </div>
       </header>
 
       <PageShell aside={rail}>
+        {/*
+          **运行模式分布**（用户 2026-10-12 要求三种模式在 UI 上分开）。
+
+          用户的原话：
+          > 「既然现在有 3 种模式了（普通、智能、团队），那么 **UI 上面也要加上相应得显示**，
+          >  并且 3 种模式进去以后看板 UI 显示内容什么的**也应该是要分开的**」
+
+          ## 为什么总览页需要这一块
+
+          总览页此前把所有机器人**混在一起**统计（"共 N 个机器人"）——
+          而三种模式的运行方式、成本、风险完全不同：
+
+          | 模式 | 谁在决策 | 一轮要多久 |
+          |---|---|---|
+          | 普通 | 固定策略，**不用 AI** | 秒级 |
+          | 智能托管 | **一个**模型 | 1–10 分钟 |
+          | AI 团队 | **一队**模型（开会） | 数分钟 |
+
+          混在一起时，"有 3 个在跑"看不出**有多少个在烧模型额度**。
+
+          ## 为什么不做成"分模式各显示一套指标"
+
+          那会让总览页在只有一种模式时**显得残缺**（大块空白区域），
+          而用户要的是**增量**：现有模式的表现**一点都不能变**。
+          所以这里只是**加一块**分布视图，不动任何既有指标。
+        */}
+        <ModeBreakdown traders={traders} onOpen={(id) => navigate(`/traders/${id}`)} />
+
         {/* ---------------------------------------------------------------- */}
         {/*  1. 资金曲线 —— 有形状才展开成图表（§4）                          */}
         {/* ---------------------------------------------------------------- */}
@@ -470,7 +514,23 @@ export function OverviewPage() {
             <ErrorNote>{equityQuery.error}</ErrorNote>
           ) : equityQuery.loading && equityQuery.data === null ? (
             <EquitySkeleton />
-          ) : shape.hasShape ? (
+          ) : (
+            /*
+             * ⚠️ **永远画完整曲线，不再按数据形状决定展开还是收成一条缩略线。**
+             *
+             * 原来的规则是"有形状（≥3 点且有波动）才展开，否则塌成 36px 的
+             * `EquityStrip`"。理由本身没错（§4：不要拿三分之一屏去画一条直线），
+             * 但它带来一个更糟的问题：**同一块版面会随数据变高变矮** ——
+             * 机器人还没跑够两个周期时是一行缩略线，跑够了突然长成 240px 图表，
+             * 整页其它区块跟着上下跳。用户的原话是「这个图标默认就要展开显示，
+             * 不管有没有数据都要保持展开状态一致」。
+             *
+             * 高度稳定比"省那 200px"重要：这一页是首屏，它会跳就意味着每次
+             * 刷新都要重新找一遍"我的机器人在哪"。
+             *
+             * 数据不足时的提示没有丢：曲线没有点可画时 `EquityCurveChart`
+             * 自己会给空态说明。
+             */
             <Panel padded={false} bodyClassName="p-3">
               <Suspense fallback={<EquitySkeleton />}>
                 <EquityCurveChart
@@ -482,14 +542,6 @@ export function OverviewPage() {
                 />
               </Suspense>
             </Panel>
-          ) : (
-            <EquityStrip
-              points={curve}
-              change={equityChange}
-              changePercent={equityChangePercent}
-              rangeLabel={rangeLabel}
-              flat={shape.flat}
-            />
           )}
         </section>
 
@@ -651,5 +703,92 @@ export function OverviewPage() {
         }}
       />
     </div>
+  );
+}
+
+
+/**
+ * **运行模式分布** —— 三种模式在总览页分开显示（用户 2026-10-12 要求）。
+ *
+ * ## 为什么需要它
+ *
+ * 总览页此前把所有机器人**混在一起**统计（"共 N 个机器人"）——
+ * 而三种模式的运行方式与成本完全不同：
+ *
+ * | 模式 | 谁在决策 | 一轮要多久 |
+ * |---|---|---|
+ * | 普通 | 固定策略，**不用 AI** | 秒级 |
+ * | 智能托管 | **一个**模型 | 1–10 分钟 |
+ * | AI 团队 | **一队**模型（开会） | 数分钟 |
+ *
+ * 混在一起时，"有 3 个在跑"看不出**有多少个在烧模型额度**。
+ *
+ * ## 为什么三种模式【都列】，即使数量为 0
+ *
+ * 只列有机器人的模式，会让"这个系统支持三种模式"这件事**看不出来** ——
+ * 而用户的原话正是「**UI 上面也要加上相应得显示**」。
+ * 数量为 0 时显示成灰的，而不是隐藏。
+ *
+ * ## 为什么不做成"分模式各一套指标"
+ *
+ * 那会让总览页在只有一种模式时**显得残缺**（大块空白），
+ * 而用户要的是**增量**：现有模式的表现**一点都不能变**。
+ * 所以这里只**加一块**分布视图，不动任何既有指标。
+ */
+function ModeBreakdown({
+  traders,
+  onOpen,
+}: {
+  traders: TraderRow[];
+  onOpen: (id: number) => void;
+}): React.ReactElement {
+  const groups: Array<{ mode: TraderMode; label: string; hint: string }> = [
+    { mode: 'strategy', label: '普通', hint: '固定策略，不用 AI' },
+    { mode: 'ai_managed', label: '智能托管', hint: '一个模型决策' },
+    { mode: 'ai_team', label: 'AI 团队', hint: '一队模型开会' },
+  ];
+
+  return (
+    <section aria-labelledby="overview-modes">
+      <SectionLabel title="运行模式" />
+      <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+        {groups.map((g) => {
+          const mine = traders.filter((t) => t.mode === g.mode);
+          const running = mine.filter((t) => t.status === 'running');
+          return (
+            <Panel key={g.mode} className="p-3">
+              <div className="flex items-baseline gap-2">
+                <span className="text-base font-medium text-ink-hi">{g.label}</span>
+                <span className="num text-sm text-ink-soft">{mine.length}</span>
+                {running.length > 0 && <span className="text-xs text-up">运行中 {running.length}</span>}
+              </div>
+              <p className="mt-0.5 text-xs text-ink-faint">{g.hint}</p>
+              {mine.length === 0 ? (
+                <p className="mt-1.5 text-xs text-ink-faint">（暂无）</p>
+              ) : (
+                <ul className="mt-1.5 space-y-0.5">
+                  {mine.map((t) => (
+                    <li key={t.id}>
+                      <button
+                        type="button"
+                        onClick={() => onOpen(t.id)}
+                        className="flex w-full items-center gap-1.5 text-left text-xs hover:text-ink-hi"
+                      >
+                        <span
+                          className={`h-1.5 w-1.5 shrink-0 rounded-full ${
+                            t.status === 'running' ? 'bg-up' : 'bg-ink-faint/50'
+                          }`}
+                        />
+                        <span className="min-w-0 flex-1 truncate text-ink-lo">{t.name}</span>
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </Panel>
+          );
+        })}
+      </div>
+    </section>
   );
 }

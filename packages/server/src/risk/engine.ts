@@ -954,8 +954,50 @@ export class RiskEngine {
     }
 
     /* --- 8. Notional ----------------------------------------------------- */
+    /*
+     * ══════════════════════════════════════════════════════════════════════
+     *  ⭐ **以"自身保证金"为上限**（2026-10-13 用户要求）
+     * ══════════════════════════════════════════════════════════════════════
+     *
+     * ## 用户的原话
+     *
+     * > 「**不要限制单笔上限**（由于系统【逐仓】运行，所以一笔交易最多亏损保证金，
+     * >  所以用户会自己控制，不需要系统限制最大止损金额），
+     * >  改成**以自身保证金为限制**」
+     *
+     * ## 为什么原来的上限是一个真瓶颈（实测数据）
+     *
+     * 原口径：`maxNotionalByRatio = 权益 × ratio`，实测 `#11` 的
+     * `altcoinMaxPositionValueRatio = 1` → **上限只有 20.75 USDT**。
+     * 而交易所对多数标的的最小名义是 5–50 —— 于是**根本没有可做的空间**。
+     *
+     * 逐仓下这个上限是**多余的**：一笔的最大亏损 = 它自己的保证金
+     *（强平不会动别的仓位），所以"能亏多少"由**划了多少保证金**决定，
+     * 而不是由"权益的多少倍"决定。
+     *
+     * ## 新口径：可用保证金 × 杠杆
+     *
+     * ```
+     *   maxNotionalByMargin = 可用余额（或权益） × 该标的的杠杆上限
+     * ```
+     * 实测：20.75 × 12 = **249 USDT** —— 比原来的 20.75 宽 12 倍。
+     *
+     * ⚠️ **这不是"没有上限"**：上限仍然是**你账上的钱**（物理边界），
+     * 而且 `maxMarginUsage`（保证金占用上限）与最小名义两个约束照旧。
+     * 变的只是"上限怎么算" —— 从一个人为的比例换成你自己的资金。
+     *
+     * ⚠️ **默认关闭**（`marginBasedLimit: false`）——
+     * 既有机器人（尤其实盘 `#10`）的行为**逐字节不变**。
+     */
+    const useMarginLimit = risk.marginBasedLimit === true;
     const maxRatio = isMajorSymbol(symbol) ? risk.btcEthMaxPositionValueRatio : risk.altcoinMaxPositionValueRatio;
-    const maxNotionalByRatio = account.equity * maxRatio;
+    /*
+     * 杠杆上限：与下面算保证金时用的是同一个值（逐仓 + 该标的的上限）。
+     * ⚠️ 必须在 `maxNotionalByRatio` **之前**取到 —— 否则新口径用不了它。
+     */
+    const leverageCap = isMajorSymbol(symbol) ? risk.btcEthMaxLeverage : risk.altcoinMaxLeverage;
+    const maxNotionalByMargin = Math.max(0, account.availableBalance || account.equity) * leverageCap;
+    const maxNotionalByRatio = useMarginLimit ? maxNotionalByMargin : account.equity * maxRatio;
 
     let notional = num(decision.positionSizeUsd, 0);
 
@@ -998,12 +1040,30 @@ export class RiskEngine {
     }
 
     /* --- 10. Minimums ---------------------------------------------------- */
+    /*
+     * ⚠️ **`marginBasedLimit` 下不再用 `minPositionSize`**
+     *（2026-10-13 用户要求：「可以取消最小开仓的要求（要保证交易所有效性）」）。
+     *
+     * ## 为什么这两者要分开
+     *
+     * ```
+     *   minPositionSize  —— 一个人为的偏好（"我不想做太小的仓"）
+     *   exchangeMin      —— 交易所的物理下限（低于它**根本发不出去**）
+     * ```
+     * 用户要取消的是**前者**，而后者**必须保留** ——
+     * 否则会发出必然被交易所拒绝的单（那是纯粹的浪费，且会让日志充满假失败）。
+     *
+     * ⚠️ 默认（`marginBasedLimit: false`）仍然是 `max(两者)` —— 行为不变。
+     */
     const exchangeMin = env.minNotionalOf(symbol);
-    const effectiveMin = Math.max(risk.minPositionSize, exchangeMin);
+    const effectiveMin = useMarginLimit ? exchangeMin : Math.max(risk.minPositionSize, exchangeMin);
     if (notional < effectiveMin) {
       return {
         ok: false,
-        reason: `仓位名义价值 $${notional.toFixed(2)} 低于最低要求 $${effectiveMin.toFixed(2)}。`,
+        reason:
+          useMarginLimit
+            ? `仓位名义价值 $${notional.toFixed(2)} 低于交易所下限 $${effectiveMin.toFixed(2)}（低于它发不出去）。`
+            : `仓位名义价值 $${notional.toFixed(2)} 低于最低要求 $${effectiveMin.toFixed(2)}。`,
       };
     }
     if (marginHeadroom <= 0) {

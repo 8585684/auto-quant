@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
-import type { TraderMode, TraderStatus } from '@aq/shared';
+import { isAiDriven, type TraderMode, type TraderStatus } from '@aq/shared';
 import {
   api,
   type AiModelRow,
@@ -13,6 +13,7 @@ import {
 import { useApp } from '../lib/store';
 import { Badge, Button, ErrorNote, Field, Modal, NumberInput, Select, Spinner3, TextInput } from './ui';
 import { CheckList } from './Badges';
+import { SectionLabel } from './shell';
 import { EquitySourceField, equityPayload, useExchangeEquity } from './EquitySourceField';
 import { fmtUsd } from '../lib/format';
 import type { Catalog } from '../lib/api';
@@ -42,7 +43,23 @@ import type { Catalog } from '../lib/api';
  * 策略 id（`#9`），提交时照样会被带上。**界面上"选不了"不等于请求里"没有"。**
  */
 export function strategyIdFor(mode: TraderMode, selected: number): number | null {
-  return mode === 'ai_managed' ? null : selected;
+  /*
+   * ⚠️ **用共享的 `isAiDriven`，不要写死 `'ai_managed'`**（2026-10-12 复核发现的 P0）。
+   *
+   * 原来写死单模式名，于是加了 `ai_team` 之后：
+   *
+   *   strategy   -> 返回选中的策略 id
+   *   ai_managed -> null
+   *   ai_team    -> **返回选中的策略 id** ← 前端把真实策略 id 提交上去
+   *
+   * 而服务端对所有 AI 驱动模式都会拒绝非 null 的 `strategyId`
+   *（「AI 托管模式不引用任何策略」）→ **`ai_team` 机器人在界面上根本创建不出来**，
+   * 报错信息还指向"策略"，与用户实际做的事（选了个 AI 团队）完全对不上。
+   *
+   * 这与 2026-10-03 报过的「创建不了机器人」是**同一个 bug**，
+   * 只是换到了新模式的路径上 —— 因为两处规则各自写了一遍模式名。
+   */
+  return isAiDriven(mode) ? null : selected;
 }
 
 export function NewTraderModal({
@@ -361,7 +378,36 @@ export function NewTraderModal({
       )}
 
       {ready && missing.length === 0 && (
-        <div className="space-y-3">
+        /*
+         * ⚠️ **分组是这个弹窗最重要的可读性修复。**
+         *
+         * 之前八个字段一路 `space-y-3` 平铺：名称、凭证、厂商、模型、运行模式、
+         * 策略、周期、起始权益 —— 全靠 12px 的间距区分。用户的原话是
+         * 「该有的分割线得有」：他滚到「运行模式」时已经看不出前面那四行
+         * 属于"选哪个账户和模型"、后面两行属于"怎么跑"。
+         *
+         * 三组的边界是**用户要做的三个决定**，不是字段类型：
+         *
+         *   1. 叫什么、用哪个钱包与模型 —— 身份；
+         *   2. 怎么跑（按策略参数 / AI 托管）—— 唯一会改变机器人行为的选择；
+         *   3. 跑多快、从多少本金起算 —— 参数。
+         *
+         * 用 `SectionLabel`（页面里同一个区块标题组件）：标题 + 延伸线，
+         * 两套模板下都成立，不是这里临时画的样式。
+         *
+         * ⚠️ 光有标题还不够。用户第二次看的时候说的是「该有的分割线得有」：
+         * 三组之间只有 16px 空白，滚到中间时上一组的最后一个字段和下一组的
+         * 标题在视觉上仍然是一个段落 —— 延伸线只画在标题右侧，管不到组的
+         * 边界。所以第 2、3 组各加一条 `border-t`，让组的起止一眼可辨。
+         *
+         * 颜色必须是 `base-750` 而不是 `base-800`：弹窗底色就是 `base-900`，
+         * 控制台主题下 800 (#1e242c) 和 900 (#1d232b) 只差 1 个色阶，
+         * 实测那条线在屏幕上根本看不见（采样出来就是底色）。750 (#2a323b)
+         * 在主题里的语义正是「弱分隔线」，两套模板下都够看。
+         */
+        <div className="space-y-4">
+          <section className="space-y-3">
+            <SectionLabel title="身份与账户" className="mb-0" />
           <Field label="名称" hint="在控制台与审计记录中显示。">
             <TextInput
               value={name}
@@ -396,6 +442,7 @@ export function NewTraderModal({
               第二种**必须来自接口**而不是内置静态列表：聚合网关的内置列表是空的，
               照静态列表做出来的下拉在那些厂商上会一个模型都不显示。
             */}
+            {mode !== 'ai_team' && (
             <Field label="模型厂商">
               <Select
                 value={providerId}
@@ -414,7 +461,26 @@ export function NewTraderModal({
                 ))}
               </Select>
             </Field>
+            )}
 
+            {/*
+              ⚠️ **团队模式不显示模型选择**（用户 2026-10-12 明确要求）。
+
+              用户原话：
+              > 「团队多智能体模式，在创建/修改的时候就**不应该采用 AI 模型列表里面的**，
+              >  而是**直接采用系统的 magpie**，（系统 AI 列表里面添加的那些
+              >  **不应该给这个模式使用**），因为这个模式很多东西会和其他的冲突」
+
+              理由（实测确认过）：团队模式的模型出口来自**独立的 magpie 网关配置**
+              （见 `teamGateway.ts`），而「AI 模型」列表是给普通机器人用的。
+              两者共用会造成"改一条记录去调 A 机器人，连带改掉所有团队机器人" ——
+              用户实测发现了这个现象。
+
+              所以这里**不渲染**选择器，而不是渲染了再禁用 ——
+              禁用会让用户以为"这里有个选项只是现在不能改"，
+              而真相是**这个字段与团队模式无关**。
+            */}
+            {mode !== 'ai_team' && (
             <Field
               label="模型"
               hint={
@@ -481,7 +547,9 @@ export function NewTraderModal({
                 </p>
               )}
             </Field>
+            )}
           </div>
+          </section>
 
           {/*
             运行模式。
@@ -489,6 +557,8 @@ export function NewTraderModal({
             AI 托管**不是一个策略** —— 策略是"一组固定参数"，而 AI 模式的意思是
             "没有固定参数"。所以它是机器人自己的一个属性，在创建时选。
           */}
+          <section className="space-y-3 border-t border-base-750 pt-4">
+            <SectionLabel title="运行方式" className="mb-0" />
           <Field
             label="运行模式"
             hint="AI 托管下参数由 AI 自己设定并持续调整，交易提示词也是它的一部分 —— 一份固定不变的提示词称不上智能。"
@@ -525,21 +595,62 @@ export function NewTraderModal({
                   </span>
                 </span>
               </label>
+              {/*
+                ⚠️ **AI 团队是「智能托管」之外的另一套东西（用户 2026-10-12 明确要求）。**
+                原话：「这次更新应该是一个全新的项目，和现在智能托管是 2 个东西……
+                等这个更新做完以后**新建机器人就应该有除了智能托管外这次更新的模式**」。
+
+                所以它作为**独立选项**出现在这里，而不是替换或改造智能托管 ——
+                已有机器人（含正在实盘跑的那台）的模式与服务端行为一个字都不变。
+              */}
+              <label className="flex cursor-pointer items-start gap-2 text-base">
+                <input
+                  type="radio"
+                  name="trader-mode"
+                  className="mt-0.5"
+                  checked={mode === 'ai_team'}
+                  onChange={() => setMode('ai_team')}
+                />
+                <span>
+                  <span className="font-medium">AI 团队（多智能体 · 7×24）</span>
+                  <span className="block text-xs text-ink-faint">
+                    一支分工协作的智能体团队：调度官统筹，分析师并行调研（行情、新闻、社区情绪），
+                    多空研究员对抗辩论，风控官把关，交易员执行。持续工作、事件驱动，
+                    每次决策都有完整审计轨迹。
+                  </span>
+                </span>
+              </label>
             </div>
           </Field>
+
+          {/*
+            团队模式的说明 —— 告诉用户"模型从哪来"。
+            用户 2026-10-12 要求团队模式"直接采用系统的 magpie"，
+            所以这里要说清它**不**用上面那个列表。
+          */}
+          {mode === 'ai_team' && (
+            <div className="rounded-md border border-base-700 bg-base-850 px-3 py-2 text-base text-ink-soft">
+              <span className="font-medium">模型由系统 magpie 网关统一调度</span>
+              <span className="block text-xs text-ink-faint">
+                团队模式不使用「AI 模型」列表里的任何记录 —— 它的模型出口是独立的 magpie 网关
+                （在服务器 <code>​.env</code> 里配置，或自动从 magpie 发现）。
+                每个智能体按工作内容分到不同档位的模型，某个模型额度用尽会自动向下平替。
+              </span>
+            </div>
+          )}
 
           <Field
             label="策略"
             hint={
-              mode === 'ai_managed'
-                ? 'AI 托管模式下这项被忽略 —— 参数来自 AI 自己（每个机器人独立一份）。仍需选一个是为了保留数据库约束，它不会影响 AI 的决策。'
+              mode === 'ai_managed' || mode === 'ai_team'
+                ? 'AI 模式下这项被忽略 —— 参数来自 AI 自己（每个机器人独立一份）。'
                 : undefined
             }
           >
             <Select
               value={strategyId}
               onChange={(e) => setStrategyId(Number(e.target.value))}
-              disabled={mode === 'ai_managed'}
+              disabled={isAiDriven(mode)}
             >
               {strategyList?.map((strategy) => (
                 <option key={strategy.id} value={strategy.id}>
@@ -548,7 +659,10 @@ export function NewTraderModal({
               ))}
             </Select>
           </Field>
+          </section>
 
+          <section className="space-y-3 border-t border-base-750 pt-4">
+            <SectionLabel title="节奏与本金" className="mb-0" />
           <Field label="周期间隔（分钟）" hint="多久向模型请求一次决策。">
             <NumberInput value={cycleIntervalMinutes} onValueChange={setCycleIntervalMinutes} step={1} />
           </Field>
@@ -561,6 +675,7 @@ export function NewTraderModal({
               <span className="font-semibold">权益基准为 0。</span> {baselineWarning}
             </div>
           )}
+          </section>
 
           {error && <ErrorNote>{error}</ErrorNote>}
 

@@ -12,6 +12,7 @@ import {
   StrategyConfigSchema,
   defaultStrategyConfig,
   providerDefaults,
+  defaultAiTeamConfig,
   unboundedAiManagedConfig,
   type PositionView,
   type ServerEvent,
@@ -47,8 +48,14 @@ import {
   trades as tradeStore,
   users,
 } from '../store/repositories.js';
+/*
+ * 智能体审计三张表（运行轨迹 / 参数实验 / 教训记忆）。
+ * 它们此前**没有任何 API 暴露** —— 见 `/api/traders/:id/agent-audit` 的说明。
+ */
+import { agentExperiments as agentStoreExperiments, agentMemory as agentStoreMemory, agentRuns as agentStoreRuns } from '../store/agentStore.js';
 import type { TraderManager } from '../trader/manager.js';
-import { readLlmHealth } from '../trader/manager.js';
+import { readLlmHealth, recordLlmHealth } from '../trader/manager.js';
+import { runSelfCheck } from '../trader/selfcheckRunner.js';
 import {
   requireAuth,
   signToken,
@@ -61,7 +68,7 @@ import {
   type TokenPayload,
 } from './auth.js';
 import { FailureThrottle, IP_THROTTLE_OPTIONS, USERNAME_THROTTLE_OPTIONS } from './loginThrottle.js';
-import { checkOutboundUrl } from '../llm/urlGuard.js';
+import { checkOutboundUrl, parseHostAllowlist } from '../llm/urlGuard.js';
 import type { BalanceService } from '../services/balance.js';
 
 const log = createLogger('api');
@@ -102,7 +109,16 @@ const BaseUrlSchema = z
   .default('')
   .superRefine((value, ctx) => {
     if (!value) return;
-    const verdict = checkOutboundUrl(value);
+    /*
+     * ⚠️ **这里必须也传操作员的内网白名单（2026-10-11）。**
+     *
+     * 这是**保存模型时的校验**，也就是用户看到「baseUrl 不被允许：私有地址 172.16.0.0/12」
+     * 的那一处。只改 `client.ts`/`discovery.ts` 的话，保存这一步照样拒绝 ——
+     * 于是"允许内网端点"这个开关**在用户真正会碰到的那道门上不起作用**。
+     *
+     * 教训：一个开关接了几处、漏了一处，等于没接 —— 因为用户只会撞上漏的那一处。
+     */
+    const verdict = checkOutboundUrl(value, parseHostAllowlist(env.allowPrivateLlmHosts));
     if (!verdict.allowed) {
       ctx.addIssue({ code: z.ZodIssueCode.custom, message: `baseUrl 不被允许：${verdict.reason}` });
     }
@@ -243,12 +259,18 @@ const TraderInputSchema = z.object({
   /**
    * 运行模式。
    *
-   * `'ai_managed'` 表示由 AI 智能体托管：参数由它自己设定并持续调整，
+   * `'ai_managed'` 表示由 **AI 智能体托管**：参数由它自己设定并持续调整，
    * 存在 `agent_config_json`（按机器人隔离），**策略参数被忽略**。
+   *
+   * `'ai_team'` 表示由 **AI 团队托管**（2026-10-12 新增的多智能体模式）：
+   * 7×24 事件驱动、多个角色分工协作、辩论与裁决。**与 `ai_managed` 是两套独立的
+   * 代码路径** —— 用户明确要求「不要影响我现在实盘跑的机器人」。
+   *
+   * 两种 AI 模式都**不引用策略**（参数由 AI 自己管），所以下面的校验对它们同等生效。
    *
    * 默认 `'strategy'`，所以既有调用点（前端与脚本）行为完全不变。
    */
-  mode: z.enum(['strategy', 'ai_managed']).default('strategy'),
+  mode: z.enum(['strategy', 'ai_managed', 'ai_team']).default('strategy'),
 });
 
 /* -------------------------------------------------------------------------- */
@@ -438,6 +460,36 @@ export function evaluateTraderHealth(
 
   const stale = traders.filter((t) => t.stale);
   return { ok: stale.length === 0, stale, traders };
+}
+
+/**
+ * 给团队模式取一个**真实存在**的 `aiModelId` 当占位。
+ *
+ * ## 为什么需要它（本地实测踩到的坑）
+ *
+ * `traders.ai_model_id` 是 `NOT NULL` + 外键，而团队模式**不使用**这个字段
+ *（它的模型出口是独立的 magpie 网关配置，见 `teamGateway.ts`）。
+ * 所以需要写一个"满足外键、但没人读"的值。
+ *
+ * 第一版硬编码成 `1`，假设"建表时必然有 id=1 的模型"。**那个假设不成立**：
+ * 本地库里模型 id 是 `4/5/8/9`（没有 1），于是建团队机器人直接
+ * `FOREIGN KEY constraint failed` —— 而那个错误完全指不到真正的原因
+ *（看起来像"外键配置错了"，实际是"占位值选错了"）。
+ *
+ * ## 行为
+ *
+ * · 有模型 → 返回**第一条的 id**（团队模式不读它，取哪条都一样）；
+ * · 一条都没有 → 抛**说人话**的错误，而不是让外键去报。
+ */
+function requireAnyModelIdForTeam(): number {
+  const first = aiModels.list()[0];
+  if (!first) {
+    throw new Error(
+      'AI 团队模式需要数据库里至少存在一条「AI 模型」记录（团队模式本身不使用它，' +
+        '但机器人表的这一列是必填的）。请先到「AI 模型」页添加任意一条。',
+    );
+  }
+  return first.id;
 }
 
 export async function buildServer(deps: ApiDependencies): Promise<FastifyInstance> {
@@ -1399,12 +1451,18 @@ export async function buildServer(deps: ApiDependencies): Promise<FastifyInstanc
     return { ok: true };
   }));
 
-  /** Probe the model endpoint without starting a trader. */
+  /**
+   * Probe the model endpoint without starting a trader.
+   *
+   * 结果写进 `llm_health:<id>`(同一份记录机器人运行时的调用结果)。否则点完「测试」
+   * 刷新页面,「最近测试」就回到"从未测试" —— 结果只活在前端内存里。
+   */
   app.post('/api/ai-models/:id/test', authed, async (request, reply) => {
     const id = Number((request.params as { id: string }).id);
     const row = aiModels.getWithSecret(id);
     if (!row) return reply.code(404).send({ error: '找不到该模型' });
 
+    const at = () => new Date().toISOString();
     try {
       const { LlmClient } = await import('../llm/client.js');
       const client = new LlmClient({
@@ -1416,9 +1474,14 @@ export async function buildServer(deps: ApiDependencies): Promise<FastifyInstanc
         maxRetries: 0,
       });
       const probe = await client.testConnection();
+      recordLlmHealth(id, probe.ok
+        ? { ok: true, at: at(), latencyMs: probe.latencyMs }
+        : { ok: false, at: at(), latencyMs: probe.latencyMs, error: probe.message.slice(0, 300) });
       return probe;
     } catch (error) {
-      return reply.code(400).send({ ok: false, message: (error as Error).message, latencyMs: 0 });
+      const message = (error as Error).message;
+      recordLlmHealth(id, { ok: false, at: at(), error: message.slice(0, 300) });
+      return reply.code(400).send({ ok: false, message, latencyMs: 0 });
     }
   });
 
@@ -1582,7 +1645,27 @@ export async function buildServer(deps: ApiDependencies): Promise<FastifyInstanc
     if (!parsed.success) throw new Error(parsed.error.issues[0]?.message ?? 'Invalid trader');
     const account = exchanges.get(parsed.data.exchangeAccountId);
     if (!account) throw new Error('未知的交易所账户');
-    if (!aiModels.get(parsed.data.aiModelId)) throw new Error('未知的 AI 模型');
+    /*
+     * ⚠️ **团队模式不校验 `ai_model_id`** —— 它**不使用**这个字段（用户 2026-10-12 要求）。
+     *
+     * 用户原话：
+     * > 「团队多智能体模式，在创建/修改的时候就不应该采用 AI 模型列表里面的，
+     * >  而是直接采用系统的 magpie，（系统 AI 列表里面添加的那些不应该给这个模式使用）」
+     *
+     * 团队模式的模型出口来自**独立的 magpie 网关配置**（见 `teamGateway.ts`），
+     * 所以「AI 模型」列表里有什么、那条记录是不是 magpie、有没有被改过，
+     * **都与团队模式无关**。
+     *
+     * ## 为什么数据库那一列仍然保留
+     *
+     * `traders.ai_model_id` 是 `NOT NULL`（建表时就定了），改成可空要一次迁移，
+     * 而迁移的风险（重建表、影响正在跑的实盘机器人）**远大于收益**。
+     *
+     * 所以：**列保留、写入一个占位值、团队模式不读它**。
+     * 这比"为了语义干净去做一次有风险的迁移"更符合本项目"不碰实盘"的纪律。
+     */
+    const isTeamMode = parsed.data.mode === 'ai_team';
+    if (!isTeamMode && !aiModels.get(parsed.data.aiModelId)) throw new Error('未知的 AI 模型');
 
     /*
      * ── 策略：**两种模式的要求正好相反** ────────────────────────────────
@@ -1597,11 +1680,21 @@ export async function buildServer(deps: ApiDependencies): Promise<FastifyInstanc
      * 两个方向都要拦：只拦一边的话，要么建出"没有配置的固定策略机器人"，
      * 要么又把 AI 托管绑回一个它用不上的策略（这正是要修的那个问题）。
      */
-    const isAiManaged = parsed.data.mode === 'ai_managed';
+    /*
+     * ⚠️ 用 `isAiDriven` 而不是 `=== 'ai_managed'` —— **加新模式时这里必须自动生效**。
+     *
+     * 写死单个模式名的话，新建 `ai_team` 机器人时会被下面那个 `else` 分支
+     * 要求"必须选一个策略"，而 AI 团队模式的参数**整份由团队自己管**，
+     * 根本没有可选策略 —— 于是新模式一建就报错。
+     *
+     * 这正是共享包把 `AI_DRIVEN_MODES` 导出来的理由：**让"哪些模式由 AI 驱动"
+     * 只有一个定义处**，而不是散在各层的字符串比较里。
+     */
+    const isAiDrivenMode = parsed.data.mode === 'ai_managed' || parsed.data.mode === 'ai_team';
     const requestedStrategyId = parsed.data.strategyId ?? null;
-    if (isAiManaged) {
+    if (isAiDrivenMode) {
       if (requestedStrategyId !== null) {
-        throw new Error('智能托管模式不引用任何策略 —— 请不要为它选择策略。');
+        throw new Error('AI 托管模式不引用任何策略 —— 请不要为它选择策略。');
       }
     } else {
       if (requestedStrategyId === null) throw new Error('固定策略模式必须选择一个策略。');
@@ -1624,7 +1717,27 @@ export async function buildServer(deps: ApiDependencies): Promise<FastifyInstanc
     const trader = traders.create({
       name: parsed.data.name,
       exchangeAccountId: parsed.data.exchangeAccountId,
-      aiModelId: parsed.data.aiModelId,
+      /*
+       * ⚠️ **团队模式写入一个占位 `aiModelId`** —— 因为 `traders.ai_model_id` 是
+       * `NOT NULL` + 外键（建表时就定了），而团队模式**不使用**这个字段
+       *（它的模型出口来自独立的 magpie 网关配置，见 `teamGateway.ts`）。
+       *
+       * 为什么不做迁移把它改成可空：那要重建表，而这张表上挂着**正在跑的实盘机器人**
+       * —— 迁移风险远大于"语义干净"带来的收益。本项目的纪律是"不碰实盘"。
+       *
+       * ## ⚠️ 占位值**不能硬编码成 `1`**（本地实测踩到）
+       *
+       * 第一版写的是 `? 1 : ...`，理由是"建表时必然有 id=1 的模型"。
+       * **那个假设不成立**：本地实测库里模型 id 是 `4/5/8/9`（没有 1），
+       * 于是建团队机器人直接 `FOREIGN KEY constraint failed` ——
+       * 而错误信息完全指不到"占位值选错了"这个原因。
+       *
+       * 正确做法：**取一个真实存在的模型 id**。团队模式从不读它，
+       * 所以取哪一条都行，只要满足外键。
+       *
+       * 一条模型都没有时（全新库）→ 抛一个说人话的错误，而不是外键报错。
+       */
+      aiModelId: parsed.data.mode === 'ai_team' ? requireAnyModelIdForTeam() : parsed.data.aiModelId,
       strategyId: requestedStrategyId,
       cycleIntervalMinutes: parsed.data.cycleIntervalMinutes,
       initialEquity,
@@ -1658,9 +1771,30 @@ export async function buildServer(deps: ApiDependencies): Promise<FastifyInstanc
      * 上限顶格、门槛归零，唯一的例外是 `requireStopLoss`（那是结构要求，
      * 不是策略偏好）。**已有机器人不会被追溯修改** —— 它们的参数已经在自己的
      * `agent_config_json` 里，怎么调由模型与操作员决定。
+     *
+     * ---
+     *
+     * ⚠️ **`ai_team` 用【自己那份】配置，不借用智能托管的。**
+     *
+     * `unboundedAiManagedConfig` 是**单智能体**的参数集；团队模式有**风控官**在
+     * 裁决之后把关，语义不同（见设计 §二/§三）。
+     *
+     * 但上一轮我**漏了给团队模式播种**（只写了注释说"留给 S3"），于是实测踩到：
+     *
+     *     机器人 #11 的配置里没有任何候选标的（静态列表为空、也没开动态候选池）
+     *     —— 它不会交易任何东西。
+     *
+     * 也就是说：团队模式**跑得起来、界面显示"运行中"，但永远不会开任何仓**。
+     * 而用户要的正是「然后做相应的动作（**开仓、平仓、调仓**等等）」。
+     *
+     * 所以现在两种模式**各自播种自己那份**：
+     *   · `ai_managed` → `unboundedAiManagedConfig()`（单智能体口径）
+     *   · `ai_team`    → `defaultAiTeamConfig()`（含**动态标的池**）
      */
-    if (isAiManaged) {
+    if (parsed.data.mode === 'ai_managed') {
       traders.setAgentConfig(trader.id, JSON.stringify(unboundedAiManagedConfig()));
+    } else if (parsed.data.mode === 'ai_team') {
+      traders.setAgentConfig(trader.id, JSON.stringify(defaultAiTeamConfig()));
     }
 
     return { ...trader, equitySource };
@@ -1673,6 +1807,47 @@ export async function buildServer(deps: ApiDependencies): Promise<FastifyInstanc
     }
     const parsed = TraderInputSchema.partial().safeParse(body);
     if (!parsed.success) throw new Error(parsed.error.issues[0]?.message ?? 'Invalid trader');
+    /*
+     * ⚠️ **改了仓储不支持的字段时必须明说，不能静默成功（2026-10-11 审查发现）。**
+     *
+     * `TraderInputSchema` 含 `exchangeAccountId`（创建时必需），而 `traders.update()`
+     * 的入参里**没有这个字段** —— 于是编辑弹窗改了交易所账户、接口回 200、
+     * `return traders.get(id)` 看起来一切正常，**而账户根本没变**。
+     *
+     * 这是最坏的一类失败：**它告诉你成功了。**
+     *
+     * ## ⚠️ 判据必须是"值变了没有"，不是"键在不在"（2026-10-11 当天返工）
+     *
+     * 第一版写的是 `key in parsed.data` —— **它把用户改任何东西都挡住了**，
+     * 用户报的原话是「我修改机器人模型报错了」。我为了防"静默失败"，
+     * 造出了一个"什么都改不了"。
+     *
+     * ### 真正的原因（已实测证实，不是推测）
+     *
+     * 我起初以为是 zod 的 `.partial()` 会保留声明过的键 —— **实测否定了它**：
+     *
+     *     z.object({ a: z.number().optional(), b: z.string() }).partial()
+     *       .safeParse({ b: 'x' }).data   →  { b: 'x' }
+     *       'a' in data                   →  false
+     *
+     * 所以 `key in parsed.data` 对**未传**的键本来就是 false。
+     * 真正的原因是**前端把 `exchangeAccountId` 一起提交了** ——
+     * 配置弹窗会带上当前选中的交易所账户，哪怕用户改的是别的东西。
+     *
+     * 结论不变、但理由不同：**要判断的是"这一次有没有改它"，只能拿值和库里的比。**
+     * 一个请求体里出现某个字段，既不代表用户改了它、也不代表没改 ——
+     * **只有和当前值比较才能回答那个问题。**
+     */
+    const current = traders.get(id);
+    if (!current) return reply.code(404).send({ error: `找不到机器人 ${id}` });
+    const requestedAccountId = (parsed.data as { exchangeAccountId?: number }).exchangeAccountId;
+    if (requestedAccountId !== undefined && requestedAccountId !== current.exchangeAccountId) {
+      return reply.code(400).send({
+        error:
+          '暂不支持通过编辑修改交易所账户。要换账户，请新建一个机器人' +
+          '（当前这个可以停掉保留历史）。',
+      });
+    }
     traders.update(id, parsed.data);
     return traders.get(id);
   }));
@@ -1695,13 +1870,15 @@ export async function buildServer(deps: ApiDependencies): Promise<FastifyInstanc
     const body = (request.body ?? {}) as { dryRun?: boolean };
     // Paper mode is the default: a real-money start must be asked for explicitly.
     const dryRun = body.dryRun ?? true;
-    const result = await deps.manager.startTrader(id, dryRun);
+    /* ⚠️ 同步返回，不等启动跑完 —— 建连接/拉持仓/对账都要等，界面会像"点了没反应"（2026-10-10）。 */
+    const result = deps.manager.startTraderAsync(id, dryRun);
     if (!result.ok) return reply.code(400).send(result);
     return result;
   });
 
   app.post('/api/traders/:id/stop', authed, async (request) => {
-    await deps.manager.stopTrader(Number((request.params as { id: string }).id));
+    /* ⚠️ 不 await：stopTrader 已先把状态翻成 stopped 并掐断在途 AI 请求（2026-10-10）。 */
+    void deps.manager.stopTrader(Number((request.params as { id: string }).id));
     return { ok: true };
   });
 
@@ -2145,6 +2322,91 @@ export async function buildServer(deps: ApiDependencies): Promise<FastifyInstanc
    * `before` 时退回按 id 分页 —— 老调用方（以及任何只发一个游标的脚本）
    * 行为与以前完全一致。
    */
+  /**
+   * ── **智能体审计**（`agent_runs` / `agent_experiments` / `agent_memory`）──
+   *
+   * ## 为什么要有这个端点（用户 2026-10-12 的要求）
+   *
+   * 用户理想中的团队要有「**汇报工作的**」角色，而团队模式的看板要能显示
+   * 「有哪些智能体、都是什么分工、都在做什么」。
+   *
+   * 但这三张表**此前在前端完全不可见** —— 仓储层写得很完整
+   *（`agentStore.recent()` 三个方法都有），**却没有任何 API 暴露它们**，
+   * 于是 `web/src` 里对这三张表的引用是 **0 处**（考古报告 §5.2 记的就是这件事）。
+   *
+   * 结果是：AI 改了什么参数、反思出了什么教训、每个角色跑得怎么样 ——
+   * **全都在库里，但操作员一条都看不到**。那等于没有审计。
+   *
+   * ## 一次返回三张表
+   *
+   * 合成一个响应而不是三个端点：界面上一块面板就要同时显示它们
+   *（"这一轮做了什么 + 学到了什么 + 之前试过什么"），
+   * 分三个请求会让面板出现三次加载闪烁。
+   */
+  app.get('/api/traders/:id/agent-audit', authed, (request) => {
+    const traderId = traderIdOf(request);
+    const query = request.query as { limit?: string };
+    const parsed = Number(query.limit ?? 20);
+    /* 钳制而不报错 —— 与 `clampDecisionLimit` 同一个原则（界面传错不该 500）。 */
+    const limit = Number.isFinite(parsed) ? Math.min(Math.max(1, Math.trunc(parsed)), 100) : 20;
+
+    return {
+      /** 每次角色运行（谁跑了、用了多少 token、多久）。 */
+      runs: agentStoreRuns.recent(traderId, limit),
+      /** 参数实验（改了什么 + 真实结果）。**这是"自我迭代"的审计线索。** */
+      experiments: agentStoreExperiments.recent(traderId, limit),
+      /** 教训记忆（按标的）。 */
+      memory: agentStoreMemory.recent(traderId, limit),
+      /** 待结算的实验数 —— 界面可以据此说"还有 N 个在等结果"。 */
+      pendingExperiments: agentStoreExperiments.pending(traderId).length,
+      /** 累计运行次数 —— 判断"这个机器人到底跑过多少次"。 */
+      runCount: agentStoreRuns.countSince(traderId, '1970-01-01T00:00:00Z'),
+    };
+  });
+
+  /**
+   * **跑一次自检**（用户需求 #6）。
+   *
+   * ## 用户的原话（这是本端点存在的理由）
+   *
+   * > 「你迭代更新系统得搞智能体团队**持续观察、测试**，然后反馈给你做相应得处理，
+   * >  **不要有任何 BUG，也不要老让我来测试和发现问题，你要自己发现问题自己解决**」
+   *
+   * > 「本地开发 + 服务器运行都要有 **AI 自检、问题留痕**」
+   *
+   * ## 为什么是 POST 而不是 GET
+   *
+   * 它会**写库**（发现落进 `runtime_logs` 的 `selfcheck` scope）——
+   * GET 不该有副作用。而且它是一次真实的检查动作，不是读既有结果。
+   *
+   * ## 为什么既返回结果又写日志
+   *
+   * 两处都要：
+   *   · **返回结果** → 调用方（界面按钮、我的脚本）能立刻看到；
+   *   · **写日志** → 留痕。用户要"下次唤醒时能快速定位"，
+   *     而日志是唯一**跨会话持久**的地方（进程重启也在）。
+   *
+   * ## 目前只跑确定性层
+   *
+   * 不依赖模型 —— 因为**模型挂掉的时候恰恰最需要自检**。
+   * AI 层建在这一层之上，见 `selfcheckRunner.runSelfCheck` 的 `ask` 参数。
+   */
+  app.post('/api/traders/:id/selfcheck', authed, async (request) => {
+    const traderId = traderIdOf(request);
+    const query = request.query as { windowHours?: string };
+    const parsed = Number(query.windowHours ?? 6);
+    /* 钳制而不报错 —— 与其它端点同一原则。 */
+    const windowHours = Number.isFinite(parsed) ? Math.min(Math.max(1, Math.trunc(parsed)), 168) : 6;
+
+    const result = await runSelfCheck(traderId, { windowHours });
+    return {
+      windowHours: result.evidence.windowHours,
+      deterministic: result.deterministic,
+      ai: result.ai,
+      evidence: result.evidence,
+    };
+  });
+
   app.get('/api/traders/:id/trades', authed, async (request) => {
     const query = request.query as { limit?: string; before?: string; beforeClosedAt?: string };
     const limit = Number(query.limit ?? TRADE_PAGE_DEFAULT);

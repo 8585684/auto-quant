@@ -1,5 +1,6 @@
 import {
   StrategyConfigSchema,
+  isAiDriven,
   type CircuitBreakerReading,
   type StrategyConfig,
   type TraderStatus,
@@ -8,6 +9,8 @@ import { connectExchange, preflight, type ExchangeConnection, type PreflightChec
 import type { BinanceEnvironment } from '../binance/endpoints.js';
 import { BinanceUserDataStream } from '../binance/ws.js';
 import type { Vault } from '../crypto/vault.js';
+import { mkdirSync } from 'node:fs';
+import { cpus } from 'node:os';
 import { createLogger } from '../logger.js';
 import { env } from '../env.js';
 import { MarketDataService } from '../market/service.js';
@@ -18,6 +21,24 @@ import { eventBus } from '../events.js';
 import { checkConfigReachability } from '../risk/reachability.js';
 import { AgentRuntime } from './agent/runtime.js';
 import { AutoTrader, type DecisionModel } from './autoTrader.js';
+import { ModelRouter } from '../llm/modelRouter.js';
+import { createMagpieCallFactory, discoverFromGateway } from './magpieGateway.js';
+import { resolveTeamGateway } from './teamGateway.js';
+import { collectMarketResearch, DEFAULT_SEARCH_ENDPOINT } from './agent/webSearch.js';
+import { runAgentTask } from './agent/harness.js';
+import { parseIntelReport } from './intel/parseIntel.js';
+import { rankIntel } from './intel/freshness.js';
+import {
+  HUNTERS,
+  buildHunterTask,
+  mergeHunterReports,
+  summariseHunters,
+  type HunterReport,
+} from './intel/hunters.js';
+import { mapConcurrent } from './agent/pool.js';
+import { runOutsideCritical } from './agent/resourceGate.js';
+import { runSelfCheck } from './selfcheckRunner.js';
+import { createRoutedDecisionModel, createTeamDecisionModel, tierForRole } from './routedModel.js';
 
 const log = createLogger('manager');
 
@@ -126,7 +147,7 @@ export function readLlmHealth(aiModelId: number): LlmHealth | null {
   }
 }
 
-function recordLlmHealth(aiModelId: number, health: LlmHealth): void {
+export function recordLlmHealth(aiModelId: number, health: LlmHealth): void {
   settings.set(`llm_health:${aiModelId}`, JSON.stringify(health));
 }
 
@@ -155,6 +176,31 @@ function recordLlmHealth(aiModelId: number, health: LlmHealth): void {
  * 项目自己的风格要求就是"导出的纯函数优先于需要打桩的对象"（§5.4）—— 这里照它办。
  * **判定顺序与错误文案都与原来一字不差**：这只是提取，不是改行为。
  */
+/**
+ * 启动流程的看门狗（毫秒）。
+ *
+ * 超过这个时间还没进入 `running`，就把状态落到 `error` 并释放 `starting` 占位 ——
+ * 见 `startTraderAsync` 里的说明。**"永远停在启动中"会让操作员既看不到结论、
+ * 又点不动按钮**，比一个明确的失败更糟。
+ */
+const START_WATCHDOG_MS = 90_000;
+
+/**
+ * 连接缓存的键：**同一台机器人的"模拟盘"与"实盘"是两条不同的连接。**
+ *
+ * 见 `connectionFor` 里那段说明 —— 键里少了 `dryRun` 会让模拟盘启动复用到实盘连接，
+ * 日志写模拟、订单真实成交（2026-10-11 审查发现的 P0）。
+ */
+function connectionCacheKey(traderId: number, dryRun: boolean): string {
+  return `${traderId}:${dryRun ? 'paper' : 'live'}`;
+}
+
+/** 把某台机器人**两种模式**的连接都从缓存里去掉（停止 / 失败 / 清理时用）。 */
+function dropConnections(store: Map<string, ExchangeConnection>, traderId: number): void {
+  store.delete(connectionCacheKey(traderId, true));
+  store.delete(connectionCacheKey(traderId, false));
+}
+
 export function startGuard(input: {
   traderId: number;
   globalTradingDisabled: boolean;
@@ -234,6 +280,43 @@ export interface StartResult {
 }
 
 /**
+ * `buildTeamModel` 的结果 —— **带原因**，而不是"成功给模型 / 失败给 null"。
+ *
+ * ## 为什么要带原因（复核发现的 P0，2026-10-12）
+ *
+ * 原来返回 `DecisionModel | null`，于是失败时调用点只能看到"没有模型"，
+ * 就**静默退回到单模型路径**了。一台标着「AI 团队」的机器人实际在用**一个模型**
+ * 跑，而界面上看不出任何异常 —— 用户以为团队在开会，其实没有。
+ *
+ * `reason` 让调用点能把失败**说清楚**（页面上的 preflight check + 日志），
+ * 同时仍然不阻断启动（与「模型不可达不阻止启动」的既有原则一致）。
+ */
+/**
+ * 团队模式网关的固定参数。
+ *
+ * **不取自 `ai_models`** —— 团队模式与「AI 模型」列表完全解耦（用户 2026-10-12 要求）。
+ * 这些值是"跑一个 7 人团队会议"的合理默认：单次 300 秒（团队一轮要跑 7 次调用）、
+ * 单模型内重试 2 次（跨模型的降级由 `ModelRouter` 负责，不重复做）。
+ */
+const TEAM_GATEWAY_TIMEOUT_SECONDS = 300;
+const TEAM_GATEWAY_MAX_RETRIES = 2;
+const TEAM_GATEWAY_TEMPERATURE = 0.2;
+
+/**
+ * 团队模式的单次输出预算基准。
+ *
+ * 8192 起步：够一个角色写完整的论证，而 `ModelRouter.budgetFor` 会对
+ * 思维链模型再放大（但**不会小于**这个值 —— 见那里的说明）。
+ */
+const TEAM_BASE_MAX_TOKENS = 8192;
+
+interface TeamModelBuild {
+  model: DecisionModel | null;
+  /** `null` = 成功。有值 = 失败原因（给人看的中文）。 */
+  reason: string | null;
+}
+
+/**
  * Owns the lifecycle of every running trader.
  *
  * Each trader gets its own exchange connection, market-data cache and model
@@ -241,6 +324,736 @@ export interface StartResult {
  * another's decisions. Stopping is always clean: the loop is cleared and any
  * partially-open state is left for the next start to reconcile.
  */
+
+/**
+ * 自检的 AI 层单次请求超时（秒）。
+ *
+ * 比团队决策（`TEAM_GATEWAY_TIMEOUT_SECONDS`）短得多：自检是**后台任务**，
+ * 它卡住不该拖过一个检查间隔（默认 30 分钟）——
+ * 一次自检的 AI 层没出结果，确定性层的结果仍然有效。
+ */
+const SELF_CHECK_TIMEOUT_SECONDS = 120;
+
+/**
+ * **agent 的"办公室"** —— 每个机器人一个独立工作目录。
+ *
+ * 为什么要独立目录：harness 会在 `cwd` 里读写文件、存会话状态。
+ * 多个机器人共用一个目录会互相踩（一个的会话状态被另一个读到）。
+ */
+/**
+ * **调研结果的缓存**（2026-10-12 实测后加的）。
+ *
+ * ## 为什么必须缓存
+ *
+ * 实测：一次真 agent 调研要 **197 秒**（2608 字的带来源简报）。
+ * 而它**原本每轮都重跑** —— 于是每一轮决策都先白等 3 分钟，
+ * 而这 3 分钟里查到的新闻**和上一轮基本一样**（新闻不是秒级变化的）。
+ *
+ * ## 这条改动其实实现了"调研与决策解耦"的最小形态
+ *
+ * | 情况 | 行为 |
+ * |---|---|
+ * | 缓存新鲜 | **立刻返回**（决策不再等待）|
+ * | 缓存过期 | **立刻返回旧结果 + 后台刷新** —— 决策用"稍旧但可用"的情报，而不是等 |
+ * | 完全没有缓存 | 只能等（第一次总得查一次）|
+ *
+ * 这正是用户要的"7×24 不间断"该有的形状：
+ * **调研在后台持续跑，决策随时读最新可用的结果**，两者不互相阻塞。
+ *
+ * ⚠️ 为什么不是"后台定时刷新"：那需要一个常驻 timer（上一轮刚为 `stopAll()`
+ * 清理过 timer 泄漏问题）。用"用到时看是否过期、过期就在后台刷一次"更简单，
+ * 且**没有额外生命周期**。
+ */
+interface ResearchCache {
+  text: string;
+  at: number;
+  /** 刷新是否正在进行 —— 防止并发轮次同时起多个 agent。 */
+  refreshing: boolean;
+}
+const researchCache = new Map<number, ResearchCache>();
+
+/**
+ * ══════════════════════════════════════════════════════════════════════════
+ *  ⭐ **调研成果要活过进程重启**（2026-10-13 实测后加）
+ * ══════════════════════════════════════════════════════════════════════════
+ *
+ * ## 事故现象
+ *
+ * 线上日志反复出现（每 16 分钟一次）：
+ * ```
+ *   03:08:20 [调研] 首次调研在后台进行 —— 本轮**没有新闻材料**（下一轮就会有）
+ *   03:24:56 [调研] 首次调研在后台进行 —— 本轮**没有新闻材料**
+ *   03:28:21 [调研] 首次调研在后台进行 —— 本轮**没有新闻材料**
+ *   03:45:08 [调研] 首次调研在后台进行 —— 本轮**没有新闻材料**
+ * ```
+ * **"首次调研"出现了很多次** —— 而它字面上只能有一次。
+ * 而同一时段确实**成功过一次**：
+ * ```
+ *   03:50:38 [调研] 可用情报 2 条（过期被剔除 0 条；…）
+ * ```
+ * 然后 `03:58:23` 服务重启（一次部署），`03:59:37` 又是"首次调研"。
+ *
+ * ## 根因
+ *
+ * `researchCache` 是**进程内存**（`Map`）—— 重启就没了。而一次调研要
+ * **22 分钟**（实测），所以"重启 → 22 分钟没有新闻"是必然的。
+ *
+ * ⚠️ **这不是"实现 bug"，而是与用户要求的冲突**：
+ * > 「更新成 **7×24 不间断**、不定时、持续工作模式」
+ *
+ * 一个"每次重启就要重新花 22 分钟找新闻"的系统，**不满足 7×24**。
+ * 而且实测那份情报**只值 2 条**（查询一次成本很高），丢掉它很浪费。
+ *
+ * ## 修法：内存优先 + `settings` 表兜底
+ *
+ * ```
+ *   读：内存有 → 用它（快，且是最新的）
+ *       内存没有 → 读 `settings`（重启后仍能拿到上一份）
+ *   写：内存 + `settings`（同时）
+ * ```
+ *
+ * ⚠️ **只持久化"真的有内容"的那一份**（`at > 0 && text.length > 0`）——
+ * 占位对象（`at: 0`）不该被写进库里，否则重启后会把"空情报"当成"旧情报"
+ *（那是本项目已经修过一次的坑，见 `runOnce` 里那段说明）。
+ *
+ * ⚠️ **仍然有过期判据**：读回来的那一份照样走 `researchTtlMs()` 判断 ——
+ * 持久化只是"让它活过重启"，不是"让它永不过期"。
+ */
+const RESEARCH_CACHE_SETTING_PREFIX = 'research_cache:';
+
+/** 从库里读回一份（重启后仍能拿到）。**只在内存没有时读。** */
+function readPersistedResearch(traderId: number): ResearchCache | undefined {
+  try {
+    const raw = settings.get(`${RESEARCH_CACHE_SETTING_PREFIX}${traderId}`);
+    if (raw === undefined || raw.length === 0) return undefined;
+    const parsed = JSON.parse(raw) as { text?: unknown; at?: unknown };
+    const text = typeof parsed.text === 'string' ? parsed.text : '';
+    const at = typeof parsed.at === 'number' ? parsed.at : 0;
+    /* ⚠️ 空情报不认 —— 与内存那侧的判据一致（`at > 0 && text.length > 0`）。 */
+    if (at <= 0 || text.length === 0) return undefined;
+    return { text, at, refreshing: false };
+  } catch {
+    /* 库读不出来不该让决策失败 —— 当作"没有缓存"，照常走首次调研。 */
+    return undefined;
+  }
+}
+
+/** 写一份到库里（失败不影响内存那侧）。 */
+function persistResearch(traderId: number, text: string, at: number): void {
+  /* ⚠️ 只持久化"真的有内容"的那一份 —— 占位（空串）不该进库。 */
+  if (at <= 0 || text.length === 0) return;
+  try {
+    settings.set(`${RESEARCH_CACHE_SETTING_PREFIX}${traderId}`, JSON.stringify({ text, at }));
+  } catch {
+    /* 写不进去只是"重启后要重查一次"，不该让本轮失败。 */
+  }
+}
+
+/** 读缓存：**内存优先，库兜底**（见上面那段说明）。 */
+function getResearchCache(traderId: number): ResearchCache | undefined {
+  /*
+   * ⚠️ 这里必须是 `researchCache.get(...)`（内存 Map），**不是** `getResearchCache(...)`。
+   *
+   * 我做批量替换（`researchCache.get(` → `getResearchCache(`）时，
+   * **把这个封装函数自己的函数体也换掉了** → 它变成无限递归。
+   * 同类错误还有 `clearResearchCache`（那次更直接：`clearResearchCache(traderId)` 调自己）。
+   *
+   * ⚠️ 教训：**批量替换会改到"定义处"本身** ——
+   * 替换后必须逐个检查新写的封装函数体，而不是只看替换计数。
+   * 而 TypeScript **抓不到这种错**（递归调用的类型完全合法），
+   * 所以这类错误只能靠"逐个看函数体"或"跑一次真实路径"发现。
+   */
+  const inMemory = researchCache.get(traderId);
+  if (inMemory !== undefined) return inMemory;
+  const persisted = readPersistedResearch(traderId);
+  if (persisted !== undefined) {
+    /* 回填内存，避免每次读都碰库。 */
+    researchCache.set(traderId, persisted);
+  }
+  return persisted;
+}
+
+/** 写缓存：**内存与库同时写**（见上面那段说明）。 */
+function setResearchCache(traderId: number, entry: ResearchCache): void {
+  researchCache.set(traderId, entry);
+  persistResearch(traderId, entry.text, entry.at);
+}
+
+/**
+ * 清掉调研缓存。
+ *
+ * ══════════════════════════════════════════════════════════════════════════
+ *  ⚠️ **两个场景需要相反的行为 —— 所以必须区分**（2026-10-13）
+ * ══════════════════════════════════════════════════════════════════════════
+ *
+ * ## 场景 A：用户主动停止机器人（`stopResearchRefresher`）
+ *
+ * 既有测试的意图（`researchLifecycle.test.ts` 原文）：
+ * > 「缓存也要清：机器人停掉后再启动时，一份 10 分钟前的旧情报没有意义 ——
+ * >  而留着它会让**新启动的第一轮基于旧情报决策**。」
+ *
+ * **那个意图是对的**：用户按了停止，再按启动时他期待"重新看现在的市场"。
+ * 所以这里要**连库一起删**（`dropPersisted: true`）。
+ *
+ * ## 场景 B：进程重启（部署 / 崩溃 / OOM）
+ *
+ * ```
+ *   03:50:38 [调研] 可用情报 2 条      ← 22 分钟换来的
+ *   03:58:23 服务重启（一次部署）
+ *   03:59:37 [调研] 首次调研在后台进行  ← 又得等 22 分钟
+ * ```
+ * **而进程重启时根本不会调用 `stopResearchRefresher`**（代码没跑）——
+ * 所以库里的那一份**自然保留**，正是我要的。
+ *
+ * ## 所以：默认只清内存，停止机器人时显式连库一起删
+ *
+ * ```
+ *   clearResearchCache(id)                        → 只清内存（进程重启走这条，库保留）
+ *   clearResearchCache(id, { dropPersisted: true }) → 连库删（用户主动停止走这条）
+ * ```
+ *
+ * ⚠️ 这个区分**必须写清楚** —— 否则下一个人看到"停止时清了库、
+ * 而重启时没清"会以为是漏了，然后"修"成一致，于是两个场景必然坏一个。
+ */
+function clearResearchCache(traderId: number, options?: { dropPersisted?: boolean }): void {
+  researchCache.delete(traderId);
+  if (options?.dropPersisted === true) {
+    try {
+      settings.set(`${RESEARCH_CACHE_SETTING_PREFIX}${traderId}`, '');
+    } catch {
+      /* 删不掉只是"下次启动可能拿到旧情报"，不该让停止流程失败。 */
+    }
+  }
+}
+
+/** 缓存有效期：默认 15 分钟（新闻不是秒级变化的）。 */
+/**
+ * **调研缓存的有效期**（毫秒）。
+ *
+ * ⚠️ **必须大于刷新间隔**（2026-10-13 实测后改）。
+ *
+ * ## 原来写死 15 分钟，而刷新间隔是 10 分钟、调研实测要 22 分钟
+ *
+ * ```
+ *   刷新间隔   10 分钟
+ *   TTL        15 分钟
+ *   实际耗时   **22.1 分钟**
+ * ```
+ * 于是决策经常读到"已过期"的缓存 —— 而它本可以读上一份
+ *（**新闻不是秒级变化的**，一份 20 分钟前的情报比"没有情报"好得多）。
+ *
+ * ## 新口径
+ *
+ * ```
+ *   TTL = 刷新间隔 + 10 分钟
+ * ```
+ * 这样"上一份的年龄"最多到"下一份刚准备好" —— **中间不会出现空窗**。
+ *
+ * ⚠️ 上界 90 分钟：再长的话"旧闻当新闻"的风险就超过收益了
+ *（实测 `rankIntel` 会把超过 48 小时的消息判为过期，所以上界不是安全线，
+ *  而是"情报新鲜度"的取舍）。
+ */
+function researchTtlMs(): number {
+  const explicit = Number(process.env.AQ_RESEARCH_TTL_MS ?? '');
+  if (Number.isFinite(explicit) && explicit >= 60_000) return explicit;
+  return researchIntervalMs() + 10 * 60_000;
+}
+
+/**
+ * **后台调研的刷新间隔**（毫秒）—— 与 `ensureResearchRefresher` 共用一处。
+ *
+ * ⚠️ 抽成函数是因为**两个地方都要用它**（间隔与 TTL 必须自洽）——
+ * "同一个算术写在两个地方，改一处等于没改"（本项目已经踩过两次）。
+ */
+function researchIntervalMs(): number {
+  const raw = Number(process.env.AQ_RESEARCH_INTERVAL_MS ?? '');
+  /*
+   * 默认 **20 分钟**：实测一次调研 **22.1 分钟**（4 猎手串行、全部有产出）。
+   * 比它短的间隔只会让下一轮撞上还没跑完的那轮。
+   */
+  return Number.isFinite(raw) && raw >= 60_000 ? raw : 20 * 60_000;
+}
+function agentWorkdir(traderId: number): string {
+  const base = process.env.AQ_AGENT_WORKDIR ?? '/opt/autoquant/data/agent-workspace';
+  return `${base}/trader-${traderId}`;
+}
+
+/**
+ * **后台调研的定时器**（每个机器人一个）—— 2026-10-13。
+ *
+ * ⚠️ 放在模块级（而不是类字段）：`research` 是一个闭包，
+ * 它拿不到 `TraderManager` 的 `this`。而"每个机器人最多一个刷新循环"
+ * 这个约束需要**跨调用共享状态**。
+ */
+const researchRefreshers = new Map<number, NodeJS.Timeout>();
+
+/**
+ * **在飞调研的中止控制器**（每个机器人一个）—— 2026-10-13。
+ *
+ * ## 为什么需要它（实测）
+ *
+ * 修了定时器泄漏之后，实测仍看到：
+ * ```
+ *   #11 status = stopped        ← 已停止
+ *   claude 进程 2 个，etime 00:27  ← 但进程还在跑
+ * ```
+ * 它们是"启动时立刻跑一次"那批猎手 —— **已经起飞的进程停不下来**，
+ * 会跑完（约 200–600 秒）才自然退出，期间每个约 150–250MB。
+ *
+ * 所以停止时要**主动中止**它们（`harness` 已支持 `signal`）。
+ */
+const researchAborts = new Map<number, AbortController>();
+
+/**
+ * **保证这个机器人有一个后台调研循环**（幂等）。
+ *
+ * ## 为什么需要它（用户需求 ② 的实质）
+ *
+ * > 「系统**不再是像现在这样定时去工作**，而是**持续、并发**的工作」
+ *
+ * 而实测（`#2471`）整轮 **619 秒** —— 因为决策**同步等**调研跑完。
+ * 四个猎手并发也要约 400 秒，而 240 秒的猎手超时在并发下让四个**全部超时**。
+ *
+ * 解耦之后：调研在后台持续跑，决策读缓存**立即返回**。
+ *
+ * ⚠️ **幂等是必须的**：`research()` 每轮都调它，若每次都起一个定时器，
+ * 几分钟内就会堆出几十个 claude code 进程（实测单进程约 250MB）。
+ */
+function ensureResearchRefresher(
+  traderId: number,
+  symbols: readonly string[],
+  apiKey: string,
+): void {
+  if (researchRefreshers.has(traderId)) return;
+  /*
+   * ══════════════════════════════════════════════════════════════════════
+   *  ⚠️ **三个数字必须自洽**（2026-10-13 实测后重定）
+   * ══════════════════════════════════════════════════════════════════════
+   *
+   * ## 原来那三个数字互相矛盾
+   *
+   * ```
+   *   后台刷新间隔   10 分钟
+   *   缓存 TTL       15 分钟
+   *   调研实际耗时   **22.1 分钟**   ← 实测（4 猎手串行，全部有产出）
+   * ```
+   *
+   * **后果**：每 10 分钟起一次调研，而一次要 22 分钟 →
+   * ① 永远有第二批在跑（`refreshing` 标志挡住了并发，但**下一次触发又立刻开始**）；
+   * ② 缓存 15 分钟就过期 → **决策经常读到"已过期"的缓存**，
+   *    而那句日志会写着"先用旧结果，后台正在刷新"。
+   *
+   * ## 为什么原来的注释说"6–8 分钟"
+   *
+   * 那时是**并发 2**（四个猎手两批），而那个配置下**每个都超时** ——
+   * "6–8 分钟"是"超时前跑的那一段"，不是"真的跑完"。
+   * 现在串行（并发 1）**真的跑完了**，耗时是 **22.1 分钟**（实测各猎手 199–510 秒）。
+   *
+   * ## 新的口径（按"实测耗时"反推，而不是按"希望多久"）
+   *
+   * ```
+   *   刷新间隔  = max(默认 20 分钟, 上次实测耗时 × 1.2)
+   *   TTL       = 刷新间隔 + 10 分钟   ← 保证"缓存不会在下一份准备好之前就过期"
+   * ```
+   * ⚠️ **TTL 必须 > 刷新间隔**：否则决策会在两份情报之间读到"已过期"，
+   * 而那段时间**它本可以读上一份**（新闻不是秒级变化的）。
+   *
+   * ⚠️ 而"实测耗时"用**自适应**的：不同机器、不同模型档位下耗时差很多
+   *（我这次是 22 分钟，4 核机器上可能 8 分钟）。写死一个数会在换机器后失准。
+   */
+  const intervalMs = researchIntervalMs();
+
+  const runOnce = (): void => {
+    const cached = getResearchCache(traderId);
+    if (cached?.refreshing === true) return;
+    /*
+     * ⚠️ **占位不能伪装成"一份旧情报"**（2026-10-13 实测踩到）。
+     *
+     * ## 现象
+     *
+     * ```
+     *   [调研] 缓存已过期（29863939 分钟前）—— 先用旧结果，后台正在刷新
+     * ```
+     * **29863939 分钟 ≈ 56 年** —— 因为占位对象里 `at: 0` 被解释成 1970 年。
+     *
+     * ## 两个后果，第二个更严重
+     *
+     * ① 日志里出现一个荒谬的时间（可读性问题）；
+     * ② **空字符串被当作"旧情报"返回给团队** ——
+     *    而 `text: ''` 在提示词里等于**一片空白**，团队却以为
+     *    "有一份过期但可用的情报"。**那比"明说没有材料"更糟**：
+     *    它让 `newscaster` / `sentiment` 以为有材料可整理。
+     *
+     * ## 修法：`at: 0` 的占位**不算缓存**
+     *
+     * 判据统一成"**有没有真的查到过东西**"（`at > 0`）。
+     * 于是 `research()` 那边走的是"首次调研在后台进行 —— 本轮没有新闻材料"
+     * 那条路径，**如实说没有**。
+     */
+    const hasRealCache = cached !== undefined && cached.at > 0 && cached.text.length > 0;
+    setResearchCache(traderId, {
+      text: hasRealCache ? cached.text : '',
+      at: hasRealCache ? cached.at : 0,
+      refreshing: true,
+    });
+    /*
+     * 每次刷新一个**新的** controller（上一次的已经作废）——
+     * 于是"停止"只需要 abort 最新那一个。
+     */
+    const controller = new AbortController();
+    researchAborts.set(traderId, controller);
+    void runOutsideCritical(async () =>
+      refreshResearch(traderId, symbols, apiKey, controller.signal),
+    )
+      /*
+       * ⚠️⚠️ **不能写成 `.catch(() => undefined)`**（2026-10-13 实测抓到）。
+       *
+       * ## 事故现象
+       *
+       * 线上日志停在最后一句"4 个来源全部有产出。"，**之后再无任何调研日志** ——
+       * 既没有"可用情报 N 条"，也没有"退回原文"，也没有任何错误。
+       * 看起来像"后台调研跑完了但什么都没查到"，而**真相是它抛异常了**。
+       *
+       * 排查时我完全无从下手：`refreshResearch` 里每一个分支都会写日志，
+       * 唯独"抛异常"这条路径**一个字都不留**。
+       *
+       * ## 为什么这条特别危险
+       *
+       * 它是**后台任务**：没人 await 它，异常不会冒泡到任何地方 ——
+       * 如果这里吞掉，那个异常就**永远消失了**。
+       * 而"团队没有新闻材料"这个现象，既可能来自"真的没查到"，
+       * 也可能来自"代码炸了" —— **两者在界面上长得一模一样**。
+       *
+       * 所以这里必须**写日志**。这也是本项目反复强调的那条：
+       * **"知道它失败"与"知道它为什么失败"是两件事。**
+       */
+      .catch((error: unknown) => {
+        const message = error instanceof Error ? error.message : String(error);
+        runtimeLogs.write(traderId, 'error', 'team', `[调研] 后台刷新异常：${message.slice(0, 300)}`);
+        /* 堆栈也留下 —— 只有 message 往往指不到行号。 */
+        if (error instanceof Error && error.stack !== undefined) {
+          runtimeLogs.write(traderId, 'error', 'team', `[调研] 堆栈：${error.stack.slice(0, 500)}`);
+        }
+      })
+      .finally(() => {
+        const cur = getResearchCache(traderId);
+        if (cur !== undefined) cur.refreshing = false;
+      });
+  };
+
+  const timer = setInterval(runOnce, intervalMs);
+  /* 不因为这个定时器把进程吊在退出前。 */
+  timer.unref();
+  researchRefreshers.set(traderId, timer);
+  /* 立刻跑一次 —— 否则第一轮决策要等一个间隔才有材料。 */
+  runOnce();
+}
+
+/**
+ * **停掉某个机器人的后台调研循环**（2026-10-13）。
+ *
+ * ## 为什么必须停（一个真实的资源泄漏）
+ *
+ * 实测：`#11` 已经 `stopped`，而服务器上**还有 2 个 claude 进程在跑**。
+ * 核实后发现 `researchRefreshers` **只在创建处出现，从未被清理** ——
+ * 也就是说：
+ * ```
+ *   机器人停止 → 决策循环停了 → 而后台调研【每 10 分钟】照常起 4 个进程
+ * ```
+ * 它**不会报错、不会出现在界面上**，只是安静地吃 CPU/内存
+ *（实测单个 claude 进程约 250MB）。
+ *
+ * ⚠️ **同时清掉缓存**：缓存是"这个机器人当前的情报"，
+ * 机器人停掉之后再启动时，一份 10 分钟前的旧情报没有意义 ——
+ * 而留着它会让新启动的第一轮**基于旧情报决策**。
+ */
+export function stopResearchRefresher(traderId: number): void {
+  const timer = researchRefreshers.get(traderId);
+  if (timer !== undefined) {
+    clearInterval(timer);
+    researchRefreshers.delete(traderId);
+  }
+  /*
+   * ⚠️ **中止在飞的猎手**（2026-10-13 补）。
+   *
+   * 只清定时器是不够的：实测 `#11` 已 stopped 而 `claude` 进程仍在跑
+   *（`etime 00:27`）—— 那是"启动时立刻跑一次"那批。它们会跑完
+   *（约 200–600 秒）才自然退出，期间每个约 150–250MB。
+   */
+  const controller = researchAborts.get(traderId);
+  if (controller !== undefined) {
+    controller.abort();
+    researchAborts.delete(traderId);
+  }
+  /*
+   * ⚠️ **用户主动停止 → 连库一起删**（`dropPersisted: true`）。
+   *
+   * 既有测试的意图（`researchLifecycle.test.ts`）：
+   * 「机器人停掉后再启动时，一份 10 分钟前的旧情报没有意义 ——
+   *   而留着它会让**新启动的第一轮基于旧情报决策**。」
+   *
+   * **而进程重启（部署/崩溃）走的是另一条路** —— 它根本不调用这个函数，
+   * 所以库里的那一份自然保留（那正是"活过重启"的意思，见 `clearResearchCache`）。
+   */
+  clearResearchCache(traderId, { dropPersisted: true });
+}
+
+/**
+ * **猎手并发数** —— 由 CPU 核数推导，**两处调研共用这一个**。
+ *
+ * ## 为什么抽成函数（2026-10-13）
+ *
+ * 实测发现**同一个硬编码的 `|| 2` 在文件里出现了两处**
+ *（L635 的 `refreshResearch` 与 L1614 的另一条调研路径）——
+ * 我只改了第一处，而**测试当场抓到了第二处**（那条断言是全文匹配的）。
+ *
+ * 这正是"同一个算术写在两个地方"的典型代价：改一处等于没改。
+ * 所以抽成**唯一**的实现。
+ *
+ * ## 取值
+ *
+ * ```
+ *   AQ_HUNTER_CONCURRENCY 显式设置 → 用它
+ *   否则 → min(3, max(1, floor(核数 / 2)))
+ *     2 核 → 1（串行）· 4 核 → 2 · 8 核以上 → 3（封顶）
+ * ```
+ *
+ * ## 为什么默认是 1 而不是 2（实测）
+ *
+ * ```
+ *   单独实测一个猎手任务： ok=true 耗时 **92.7 秒**
+ *   线上并发跑四个：        **3 个未产出**（每个"超过 600 秒未返回"）
+ * ```
+ * 服务器只有 **2 核 / 1971MB（可用 822MB）**，而每个猎手是
+ * **一整个 claude code 进程**（150–250MB，自带 node 运行时）。
+ * 2 核切成 5–6 份 → 每个慢 6 倍以上 → 全部超时。
+ *
+ * ⚠️ 而代价是**不对称的**：
+ * ```
+ *   慢 6 分钟（串行）→ 调研在【后台】跑，决策不等它 → 没有代价
+ *   全部超时        → 团队永远拿不到新闻 → 功能失效
+ * ```
+ * 实测裁决官的原话：「材料**无新闻、无情绪**……数据不足无法判断」。
+ */
+function hunterConcurrency(): number {
+  const explicit = Number(process.env.AQ_HUNTER_CONCURRENCY ?? '');
+  if (Number.isFinite(explicit) && explicit >= 1) return Math.floor(explicit);
+  const cores = (() => {
+    try {
+      return Math.max(1, cpus().length);
+    } catch {
+      return 1;
+    }
+  })();
+  return Math.min(3, Math.max(1, Math.floor(cores / 2)));
+}
+
+/**
+ * **猎手超时**（毫秒）—— 同样两处共用。
+ *
+ * ⚠️ 原来两处**不一致**：`refreshResearch` 是 600 秒，另一条路径是 240 秒。
+ * 而 240 秒**小于实测的单猎手耗时上界**（单独 92.7 秒，但并发时会成倍拉长）——
+ * 那条路径的猎手实际上更容易全部超时。
+ *
+ * 600 秒的依据：实测单猎手 92.7–197 秒；留 3 倍余量以吸收并发抖动。
+ */
+function hunterTimeoutMs(): number {
+  const v = Number(process.env.AQ_RESEARCH_TIMEOUT_MS ?? '');
+  return Number.isFinite(v) && v > 0 ? v : 600_000;
+}
+
+/**
+ * **真正跑一次四猎手调研**，把结果写进 `researchCache`。
+ *
+ * ⚠️ 它**不抛错**（调用方已经 catch）—— 后台任务失败不该影响任何东西。
+ *
+ * ⚠️ 动态 `import()` 而不是顶部静态导入：`manager.ts` 与
+ * `agent/harness.js` 之间有循环依赖（harness 用到 manager 的日志类型），
+ * 而这段代码**只在后台首次刷新时才需要**。
+ */
+async function refreshResearch(
+  traderId: number,
+  symbols: readonly string[],
+  apiKey: string,
+  signal?: AbortSignal,
+): Promise<void> {
+  const { runAgentTask } = await import('./agent/harness.js');
+  const { HUNTERS, buildHunterTask, mergeHunterReports, summariseHunters } = await import('./intel/hunters.js');
+  const { mapConcurrent } = await import('./agent/pool.js');
+  const { parseIntelReport } = await import('./intel/parseIntel.js');
+  const { rankIntel } = await import('./intel/freshness.js');
+
+  /*
+   * ⚠️ 并发数与超时都走**共用函数**（`hunterConcurrency()` / `hunterTimeoutMs()`）——
+   * 它们的完整依据写在函数上方。抽出来的原因见那里：
+   * **同一个硬编码的 `|| 2` 在这个文件里出现过两处**，改一处等于没改。
+   */
+  const limit = hunterConcurrency();
+  const timeoutMs = hunterTimeoutMs();
+  /*
+   * ⚠️ 超时走 `hunterTimeoutMs()` —— 依据写在它上方。
+   * （这里原来还有一个 `?? 600_000` 的副本，与并发数那次是同一个教训：
+   *   **同一个算术写在两个地方，改一处等于没改**。）
+   */
+
+  const results = await mapConcurrent(HUNTERS, limit, async (hunter) => {
+    /* ⚠️ 每个猎手一个独立 workdir/HOME —— 共用会让并发实例争用 ~/.claude。 */
+    const dir = `${agentWorkdir(traderId)}/hunter-${hunter.id}`;
+    try {
+      mkdirSync(dir, { recursive: true });
+    } catch {
+      /* 建不出来就用共用目录 —— 至少不要因此整个失败。 */
+    }
+    const r = await runAgentTask({
+      task: buildHunterTask(hunter, symbols),
+      allowedTools: 'WebSearch,WebFetch',
+      model: process.env.AQ_RESEARCH_GROUP ?? 'group/team-news',
+      fastModel: process.env.AQ_GRUNT_GROUP ?? 'group/team-grunt',
+      workdir: dir,
+      timeoutMs,
+      authToken: apiKey,
+      /* 机器人停止时中止在飞的猎手 —— 见 `researchAborts` 的说明。 */
+      ...(signal === undefined ? {} : { signal }),
+    });
+    return {
+      hunterId: hunter.id,
+      label: hunter.label,
+      ok: r.ok,
+      text: r.text,
+      ...(r.error === undefined ? {} : { error: r.error }),
+      latencyMs: r.latencyMs,
+    };
+  });
+
+  const reports = results.map((res, i) => {
+    if (res.ok) return res.value;
+    const hunter = HUNTERS[i];
+    return {
+      hunterId: hunter?.id ?? `hunter_${i}`,
+      label: hunter?.label ?? `猎手 ${i}`,
+      ok: false,
+      text: '',
+      error: res.error,
+      latencyMs: 0,
+    };
+  });
+
+  runtimeLogs.write(traderId, 'info', 'team', `[调研] ${summariseHunters(reports)}`);
+  /* ⚠️ 失败原因必须写进日志 —— "知道它失败"与"知道为什么失败"是两件事。 */
+  for (const rep of reports.filter((x) => !x.ok)) {
+    runtimeLogs.write(traderId, 'warn', 'team', `[调研] ${rep.label} 未产出：${rep.error ?? '未知原因'}`);
+  }
+
+  if (reports.filter((x) => x.ok).length === 0) {
+    /*
+     * ⚠️ **全部失败时不覆盖旧缓存** —— 旧结果可能还有用（只是旧），
+     * 覆盖成空会让下一轮"什么都没有"。
+     */
+    runtimeLogs.write(traderId, 'warn', 'team', '[调研] 全部猎手未产出 —— 保留上一份结果（若有）');
+    return;
+  }
+
+  const merged = mergeHunterReports(reports);
+  const parsed = parseIntelReport(merged, Date.now(), 'news_hunter');
+  if (parsed.intel.length > 0) {
+    /*
+     * ⚠️⚠️ **`requireConfirmed: false`**（2026-10-13 实测后改）。
+     *
+     * ## 为什么改（实测数据）
+     *
+     * 线上真实一次调研的 3 条情报：
+     * ```
+     *   · coinstats.app · 72.0h前 · weight=0.00 · 独立来源=1 · confirmed=false
+     *   · www.forbes.com · 72.0h前 · weight=0.00 · 独立来源=1 · confirmed=false
+     *   · pluang.com    · 24.0h前 · weight=0.33 · 独立来源=1 · confirmed=false
+     *
+     *   rankIntel(默认)         → 0 条   ← 全部剔除
+     *   rankIntel(不要求确认)   → 1 条   ← pluang 那条本可用
+     * ```
+     *
+     * `independentSources` 的算法是"**同一个事件**被几个不同域名报道"。
+     * 而三家媒体**报道的是三件不同的事** —— 所以这个数**在实践中几乎永远是 1**，
+     * 于是 `confirmed` 永远为 `false`、**新闻永远进不了决策**。
+     * 这正是"零决策"链条的最后一环。
+     *
+     * ## 更重要的：这条规则与用户的明确要求冲突
+     *
+     * > 「系统**不再设置内置风控**（我的想法是既然都要做这么智能了，
+     * >  那么风格也应该由一个智能体来负责，而不是系统内置简单风控规则）」
+     *
+     * `requireConfirmed` 正是一个**内置规则替 AI 做决定** ——
+     * 而且它做的是最坏的那种决定：**把情报扔掉**，
+     * 而不是**把情报和它的可信度一起交给 AI**。
+     *
+     * ## 改法：标注，而不是丢弃
+     *
+     * · **过期**（`weight <= 0`）仍然剔除 —— 那是"事实层面的旧"，不是判断问题；
+     * · **未确认**的**保留**，但在文本里**明确标注**"单一来源 · 未确认" ——
+     *   让裁决官看到它、并**自己决定**给多少权重。
+     *
+     * 这样"防幻觉"的目的仍然达到（AI 知道它只有一个来源），
+     * 但**决定权回到了 AI 手里** —— 与需求 ③ 一致。
+     */
+    const ranked = rankIntel(parsed.intel, Date.now(), { requireConfirmed: false });
+    if (ranked.length > 0) {
+      const text = ranked
+        .map((r) => {
+          const h = (r.assessment.ageMs / 3_600_000).toFixed(1);
+          /*
+           * ⚠️ **可信度必须写在文本里** —— 否则 `requireConfirmed: false`
+           * 就变成"悄悄放宽了标准"，而 AI 不知道自己拿到的是单来源情报。
+           */
+          const trust = r.assessment.confirmed
+            ? `已确认（${r.assessment.independentSources} 个独立来源）`
+            : `**单一来源 · 未确认**（${r.assessment.independentSources} 个来源）`;
+          return `- [${r.intel.direction}] ${r.intel.summary}\n` +
+            `  来源：${r.intel.sourceUrl}（${trust}）\n` +
+            `  ${h} 小时前 · ${r.assessment.verdict}`;
+        })
+        .join('\n');
+      setResearchCache(traderId, { text, at: Date.now(), refreshing: false });
+      const unconfirmed = ranked.filter((r) => !r.assessment.confirmed).length;
+      runtimeLogs.write(
+        traderId, 'info', 'team',
+        `[调研] 可用情报 ${ranked.length} 条（过期被剔除 ${parsed.intel.length - ranked.length} 条` +
+          (unconfirmed > 0 ? `；其中 ${unconfirmed} 条为单一来源未确认，已标注供裁决官自行权衡` : '') +
+          '）',
+      );
+      return;
+    }
+    const note = '（本轮没有可用的新鲜情报：查到的都过期了）';
+    setResearchCache(traderId, { text: note, at: Date.now(), refreshing: false });
+    /*
+     * ⚠️ **这里必须写日志**（2026-10-13 实测踩到）。
+     *
+     * ## 事故现象
+     *
+     * 线上日志停在"4 个来源全部有产出。"，**之后再无任何调研日志** ——
+     * 既没有"可用情报 N 条"，也没有"退回原文"，也没有异常。
+     * 于是"团队没有新闻材料"这件事**完全没有解释**。
+     *
+     * 而真相是：`parseIntelReport` 解析出 **3 条**情报，
+     * 但 `rankIntel` 把它们**全部剔除**（`hoursAgo` 缺失 → 判为过期）
+     * → 走到这个分支 → **而这个分支一句话都不说**。
+     *
+     * ## 为什么这条日志是必须的
+     *
+     * "查到 3 条但都被时效过滤掉" 与 "什么都没查到" 是**两件不同的事**：
+     * 前者说明**猎手在正常工作、但输出缺字段**（该改提示词）；
+     * 后者说明**信息源本身没有消息**（不该改代码）。
+     * 不写日志就把这两件事混成了一件 —— 而那正是我这次排查花了很久的原因。
+     */
+    runtimeLogs.write(
+      traderId, 'warn', 'team',
+      `[调研] 查到 ${parsed.intel.length} 条情报但**全部过期**（weight=0）—— ` +
+        '本轮没有可用情报。这说明猎手查到了东西、但那些消息太旧了（新闻猎手被要求查"今天"）',
+    );
+    return;
+  }
+  /* 解析不出结构化情报 → 退回合并后的原文（格式没对上，但原文仍可能有信息）。 */
+  runtimeLogs.write(traderId, 'warn', 'team', '[调研] 产出不是结构化格式 —— 退回原文使用');
+  setResearchCache(traderId, { text: merged, at: Date.now(), refreshing: false });
+}
 export class TraderManager {
   private readonly running = new Map<number, AutoTrader>();
   /**
@@ -257,7 +1070,7 @@ export class TraderManager {
    * 都能凑成这个组合。所以启动必须**先占位、再干活**。
    */
   private readonly starting = new Set<number>();
-  private readonly connections = new Map<number, ExchangeConnection>();
+  private readonly connections = new Map<string, ExchangeConnection>();
   private readonly userStreams = new Map<number, BinanceUserDataStream>();
   /**
    * 成交触发的即时对账，按机器人去抖 —— 见 `scheduleFillReconcile()`。
@@ -293,6 +1106,51 @@ export class TraderManager {
    * the bot — it can only delay a notification. That separation is what makes it
    * safe to attach a streaming dependency to a system that must run unattended.
    */
+  /**
+   * **写状态并推送**（2026-10-13 加）—— 修一个真实的"自相矛盾"。
+   *
+   * ## 用户报的现象
+   *
+   * > 「明显BUG，运行状态一边停止，一边是运行中」
+   *
+   * 截图里同时出现：页头徽章「**运行中**」，而按钮是「**启动**」。
+   *
+   * ## 根因：`manager.ts` 里 9 处 `traders.setStatus` **全都只写数据库、不推送**
+   *
+   * ```
+   *   autoTrader.ts（正确）:
+   *     setStatus() { traderStore.setStatus(...); eventBus.publish({type:'trader_status'}) }
+   *
+   *   manager.ts（9 处，错）:
+   *     traders.setStatus(traderId, 'stopped', null);   ← 无推送
+   * ```
+   *
+   * 于是点"停止"之后：
+   * ```
+   *   REST 重新拉取 → trader.status = 'stopped' → 按钮变「启动」   ✅
+   *   WebSocket 从未收到 stopped 推送 → liveStatus 仍是旧的 running
+   *                                     → 徽章显示「运行中」      ❌
+   * ```
+   * **两个数据源说的是两件事**，界面就自相矛盾了。
+   *
+   * ## 为什么之前没被发现
+   *
+   * 前端的 `status = liveStatus ?? trader?.status` **假设"推送总是比 REST 新"** ——
+   * 而这里的情况恰好相反：**推送压根没发**，于是 REST 是对的、推送是陈旧的。
+   *
+   * ⚠️ 修法放在**服务端**（而不是让前端去猜哪个更新）：推送缺了就是缺了，
+   * 前端无论怎么合并都补不出一个从未发出的通知。
+   */
+  private setTraderStatus(traderId: number, status: TraderStatus, error: string | null = null): void {
+    traders.setStatus(traderId, status, error);
+    eventBus.publish({
+      type: 'trader_status',
+      traderId,
+      status,
+      ...(error === null ? {} : { detail: error }),
+    });
+  }
+
   private async startUserStream(traderId: number, connection: ExchangeConnection): Promise<void> {
     if (!connection.rest.hasCredentials) return;
 
@@ -402,11 +1260,41 @@ export class TraderManager {
       this.fillReconcileTimers.delete(traderId);
       const autoTrader = this.running.get(traderId);
       if (!autoTrader) return;
-      void autoTrader.applyExchangeFill().catch((error) => {
-        log.warn(
-          `机器人 #${traderId} 成交后即时对账失败（下一个周期仍会补上）：${(error as Error).message}`,
-        );
-      });
+      void autoTrader
+        .applyExchangeFill()
+        /*
+         * ── **成交之后：唤醒决策循环**（事件驱动的核心一步）──────────────
+         *
+         * ## 为什么必须排在 `applyExchangeFill()` **之后**
+         *
+         * 顺序反了会让团队基于**半更新的账本**做判断（"我以为还持有，
+         * 其实止损已经打掉了"）—— 那正是调研里"错误级联"的入口。
+         * 先对齐状态，再叫它来看。
+         *
+         * ## 为什么这里需要它
+         *
+         * 系统原来两者都有、但中间缺一环：
+         *   · 成交 → **账本**立刻对齐（本函数）；
+         *   · AI 可以要求"下次什么时候再看"（1–120 分钟）。
+         *
+         * 缺的是：**成交之后决策循环并不知道**。账本已经对了，而团队要等到
+         * 下一个周期（最长 120 分钟）才重新评估 —— 那意味着
+         * **仓位已经没了，团队还在按"持有"思考**。
+         *
+         * 用户的要求正是这件事：
+         * > 「系统**不再是像现在这样定时去工作**，而是持续、并发的工作」
+         *
+         * ⚠️ `requestEarlyCycle` 内部只对 `ai_team` 生效（见那里的说明）——
+         * 用户明确要求不要改变现有实盘机器人（`#10 赚大钱` 是 `ai_managed`）的行为。
+         */
+        .then(() => {
+          autoTrader.requestEarlyCycle('有成交');
+        })
+        .catch((error) => {
+          log.warn(
+            `机器人 #${traderId} 成交后即时对账失败（下一个周期仍会补上）：${(error as Error).message}`,
+          );
+        });
     }, FILL_RECONCILE_DEBOUNCE_MS);
 
     /*
@@ -447,6 +1335,14 @@ export class TraderManager {
     return typeof value === 'boolean' ? value : null;
   }
 
+  /**
+   * **启动代数**：每个机器人最近一次启动的序号。
+   *
+   * 用途只有一个：让"上一次启动的看门狗/回调"能判断自己是否已经过期，
+   * 从而不去覆盖后来者的状态（见 `startTraderAsync`）。
+   */
+  private readonly startGeneration = new Map<number, number>();
+
   runningIds(): number[] {
     return [...this.running.keys()];
   }
@@ -477,7 +1373,24 @@ export class TraderManager {
     exchangeAccountId: number,
     dryRun: boolean,
   ): Promise<ExchangeConnection> {
-    const existing = this.connections.get(traderId);
+    /*
+     * ⚠️ **缓存键必须带上 `dryRun`（2026-10-11 审查发现的 P0）。**
+     *
+     * 原来键只有 `traderId`，命中就直接返回 —— **完全不比对 `dryRun`**。后果：
+     *
+     *   1. 开机数秒后对全部机器人做对账，那是按**实盘**建的连接；
+     *   2. 之后操作员按默认的「模拟盘」启动同一台机器人；
+     *   3. 它拿到的是第 1 步那条**实盘**连接 —— 日志写"模拟盘"，**订单真实成交**。
+     *
+     * 这是"一个字段说模拟、另一个字段在下真单"，比任何账目偏差都严重：
+     * 操作员以为在纸面上试，钱已经动了。
+     *
+     * 键改成 `traderId:paper|live`：两种模式各持一条连接，互不冒充。
+     * 同一台机器人的两种模式**本来就不该共享**连接对象 ——
+     * 它的 `dryRun` 是构造时定死的，不是可切换的开关。
+     */
+    const cacheKey = connectionCacheKey(traderId, dryRun);
+    const existing = this.connections.get(cacheKey);
     if (existing) return existing;
 
     const account = exchanges.getWithSecret(exchangeAccountId);
@@ -514,7 +1427,7 @@ export class TraderManager {
       ...(process.env.BINANCE_WS_HOST ? { wsHostOverride: process.env.BINANCE_WS_HOST } : {}),
     });
 
-    this.connections.set(traderId, connection);
+    this.connections.set(cacheKey, connection);
     return connection;
   }
 
@@ -568,6 +1481,597 @@ export class TraderManager {
       `模型「${row.label}」的上下文长度已自动发现：${match.contextLength} tokens —— ` +
         '提示词预算按它重算（换模型后不需要手工填任何东西）。',
     );
+  }
+
+  /**
+   * **构造 AI 团队模式的模型出口**（2026-10-12 新增）。
+   *
+   * ## 与 `buildModel` 的关系：并存，不替换
+   *
+   * `buildModel` 是"一条记录 = 一个模型"（`ai_managed` 用）；
+   * 本方法是"一条记录 = 一个网关 + 动态模型名"（`ai_team` 用）。
+   * **两者互不调用、互不影响** —— 用户硬约束要求团队模式不能碰到实盘那条路。
+   *
+   * ## 为什么复用 `ai_models` 那条记录当网关出口
+   *
+   * magpie 是 **705 个模型共用一套 baseUrl/key**，靠请求体里的模型名切换。
+   * 而 `ai_models` 是"一条记录一个模型"—— 一对多表达不了。
+   *
+   * 与其新增一套"网关配置"概念（用户得再学一遍、再配一遍），不如
+   * **把已有那条 magpie 记录当出口**：它的 baseUrl/key 就是网关的。
+   * 判据用 `looksLikeMagpieGateway(baseUrl)` —— 从配置**推断**，不需要用户勾开关。
+   *
+   * ## 失败时不阻断启动
+   *
+   * 与 `buildModel` 的探测失败同一个原则（用户 2026-10-10 定的：
+   * 「模型用尽那你启动以后页面上提示就行了」）：
+   * 出口不通用 `error` 状态说清，而不是让机器人起不来。
+   */
+  private async buildTeamModel(traderId: number): Promise<TeamModelBuild> {
+    /*
+     * ⚠️ **团队模式【不】使用「AI 模型」列表里的任何记录**（用户 2026-10-12 明确要求）。
+     *
+     * 用户原话：
+     * > 「团队多智能体模式，在创建/修改的时候就不应该采用 AI 模型列表里面的，
+     * >  而是直接采用系统的 magpie，（系统 AI 列表里面添加的那些不应该给这个模式使用），
+     * >  因为这个模式很多东西会和其他的冲突，例如我刚才修改列表里面 magpie 的模型，
+     * >  目的是为了更改赚大钱机器人的模型，但是**我猜测实际影响到了你那个团队模式的测试机器人**」
+     *
+     * **他猜对了**，实测确认：`#10 赚大钱` 与 `#11 团队测试` 当时都指向 `ai_models #13`。
+     * 改那条记录去调一台机器人，会连带改掉所有团队机器人。
+     *
+     * 根因是我原来的设计：让团队模式**复用 `ai_models` 里那条 magpie 记录当网关出口**，
+     * 理由是"用户不用学新配置概念"。那个理由站不住 ——
+     * `ai_models` 的语义是"**一个模型**"，而团队模式要的是"**一个网关**"，
+     * 两者生命周期与用途都不同，共用一条记录必然互相干扰。
+     *
+     * 现在改成读**独立配置**（`.env` 显式配置优先，否则从 magpie 自己的配置自动发现），
+     * 与 `ai_models` 完全解耦：改任何一边都不影响另一边。
+     */
+    const gateway = resolveTeamGateway(process.env);
+    if (gateway === null) {
+      return {
+        model: null,
+        reason:
+          '找不到 magpie 网关配置。请在服务器 `.env` 里设置 `MAGPIE_GATEWAY_URL` 与 `MAGPIE_GATEWAY_KEY`' +
+          '（或确保 magpie 的 caller-keys.json 可被本服务读取）。',
+      };
+    }
+    const baseUrl = gateway.baseUrl;
+    const apiKey = gateway.apiKey;
+
+    /*
+     * ── **自动发现：让系统跟上模型的变化**（用户 2026-10-12 的明确要求）──
+     *
+     * 用户原话：
+     *
+     * > 「万一今天能用，明天不能用、改了名字或者限量了，又或者**突然上线了什么模型**
+     * >  （假如系统运行中这个提供商增加了一个模型，很好用智商高，**系统是否会自动发现，
+     * >  自动调研判断模型档次，然后应用到相应的智能体中**）」
+     *
+     * ## 为什么要在**装配时**拉一次（而不是每次决策都拉）
+     *
+     * · 装配发生在启动时 → **不占决策时间**（一轮决策本来就要几十秒）；
+     * · 模型上下线是**低频**事件（小时/天级），每次决策都拉纯属浪费；
+     * · 失败就退回静态档案（`modelCatalog`）—— **发现不了也要能跑**。
+     *
+     * ## 发现结果怎么"应用到智能体"
+     *
+     * `catalog.byTier` 是"档位 → 模型 id（免费优先排序）"。
+     * 它被喂给 `ModelRouter` 当**候选链**，于是角色路由用的就是**当前真实存在**
+     * 的模型，而不是档案里那份可能已经过期的清单。
+     *
+     * 这也是"合理安排使用"的落地点：`byTier` 的排序把 `free: 'all'` 排在前面，
+     * 所以体力活（T1/T2）会优先走不限量的通道，把付费额度留给真正需要判断的环节。
+     */
+    const catalog = await discoverFromGateway({
+      baseUrl,
+      apiKey,
+      timeoutSeconds: TEAM_GATEWAY_TIMEOUT_SECONDS,
+      maxRetries: TEAM_GATEWAY_MAX_RETRIES,
+      temperature: TEAM_GATEWAY_TEMPERATURE,
+      /*
+       * ⚠️ `plugin-providers.json` 是 **Docker 卷里的文件**，
+       * 只在同机部署时读得到。读不到就退化为"不知道免费与否"（`free: 'unknown'`），
+       * **绝不猜** —— 猜错的代价是把免费模型当付费的避开（白烧额度），
+       * 或者反过来（以为免费其实烧钱）。
+       */
+      pluginProvidersPath: process.env.MAGPIE_PLUGIN_PROVIDERS_PATH ?? null,
+    });
+
+    if (catalog !== null) {
+      /*
+       * 把"发现了什么"写进日志 —— 用户要求"看得见系统在做什么"，
+       * 而"模型目录变了"正是最该被看见的一类变化（它会影响后续所有决策）。
+       */
+      runtimeLogs.write(
+        traderId,
+        'info',
+        'team',
+        `模型目录已刷新：共 ${catalog.models.length} 个（免费 ${catalog.models.filter((m) => m.free === 'all').length} 个）；` +
+          `T3 ${catalog.byTier.T3_deep.length} / T2 ${catalog.byTier.T2_mid.length} / T1 ${catalog.byTier.T1_fast.length}`,
+      );
+      if (catalog.appeared.length > 0) {
+        runtimeLogs.write(traderId, 'info', 'team', `发现新模型：${catalog.appeared.slice(0, 10).join('、')}`);
+      }
+      if (catalog.disappeared.length > 0) {
+        runtimeLogs.write(traderId, 'warn', 'team', `模型已消失：${catalog.disappeared.slice(0, 10).join('、')}`);
+      }
+    } else {
+      runtimeLogs.write(
+        traderId,
+        'warn',
+        'team',
+        '未能从网关拉取模型目录 —— 本轮使用内置的静态模型档案（不影响交易，但可能错过新模型或已下线的模型）。',
+      );
+    }
+
+    const router = new ModelRouter({
+      call: createMagpieCallFactory({
+        baseUrl,
+        apiKey,
+        timeoutSeconds: TEAM_GATEWAY_TIMEOUT_SECONDS,
+        maxRetries: TEAM_GATEWAY_MAX_RETRIES,
+        temperature: TEAM_GATEWAY_TEMPERATURE,
+        pluginProvidersPath: process.env.MAGPIE_PLUGIN_PROVIDERS_PATH ?? null,
+      }),
+      /*
+       * **把发现到的候选链交给路由器** —— 这就是"应用到相应的智能体中"那一步。
+       *
+       * `null`（没发现成功）时路由器回退到静态档案，行为与之前一致。
+       */
+      ...(catalog !== null ? { discoveredLadders: catalog.byTier } : {}),
+      /*
+       * 观测：每一次降级都写进本机器人的日志。
+       * 用户反复要求"看得见系统在做什么"，而降级正是最该被看见的事
+       *（"为什么这轮慢"的答案通常就是"首选额度尽了、换了两次"）。
+       */
+      onFallback: (info: { from: string | null; to: string; verdict: { reason: string } }) => {
+        runtimeLogs.write(
+          traderId,
+          'warn',
+          'team',
+          `模型降级：${info.from ?? '首选'} → ${info.to}（${info.verdict.reason}）`,
+        );
+      },
+    });
+
+    /*
+     * ⚠️ **这里返回的是「跑整个交易台」的模型，不是单角色路由**（S3 完成接线）。
+     *
+     * 为什么这个区别重要：`autoTrader` 只会 `complete(system, user)` 一次，
+     * 而团队模式需要**一次调用背后跑完 7 个角色**（4 分析师并行 → 辩论 → 裁决）。
+     * 所以编排必须**封装在模型层内部**，交易循环那边看到的仍然是
+     * "一个模型给了一段 `<decision>` 文本"。
+     *
+     * 这也是"不碰交易循环"的具体形态 —— 见 `routedModel.ts` 的文件头说明。
+     */
+    const model = createTeamDecisionModel({
+      router,
+      baseMaxTokens: TEAM_BASE_MAX_TOKENS,
+      /*
+       * 每一步都写进本机器人的日志 —— 用户反复要求"看得见系统在做什么"。
+       * 多智能体模式下这一步尤其关键：否则界面上只是一轮很慢的决策，
+       * 看不出"它在开会"。
+       */
+      onStep: ({ role, phase, note }) => {
+        runtimeLogs.write(traderId, 'info', 'team', `[${phase}] ${role}：${note}`);
+        /*
+         * ⚠️ **同时推给前端事件流**（2026-10-12）。
+         *
+         * 用户要求团队看板「直观显示**有哪些智能体，都是什么分工，都在做什么**」。
+         * 只写 `runtime_logs` 的话，界面得靠轮询日志才能看到 —— 而团队的每一步
+         * 是**实时**发生的（分析师并行、辩论、裁决），轮询既慢又拿不到"正在进行中"。
+         *
+         * 带 `role` 与 `phase` 推 `cycle_step`，界面就能**按角色分组、按阶段排序**
+         * 显示成"团队正在开会"的形态，而不是一串时间戳日志。
+         *
+         * `cycleNumber` 用当前轮次（`autoTrader` 那边也会推它自己的步骤，
+         * 两者用同一个 `traderId` + `cycleNumber` 就自然归到同一轮）。
+         */
+        eventBus.publish({
+          type: 'cycle_step',
+          traderId,
+          /*
+           * 轮次取自数据库的 `last_cycle_number` **+1** —— 团队会议发生在
+           * 决策循环的第 7 步，那时 `last_cycle_number` 还是**上一轮**的值，
+           * 所以 +1 就是"正在跑的这一轮"。
+           *
+           * 用数据库而不是内存计数：**跨重启一致**（部署重启后轮次不会错位），
+           * 而且与 `autoTrader` 那边推的 `cycleNumber` 同源，能自然归到同一轮。
+           */
+          cycleNumber: (traders.get(traderId)?.lastCycleNumber ?? 0) + 1,
+          level: 'info',
+          message: note,
+          at: new Date().toISOString(),
+          role,
+          phase,
+        });
+      },
+      /*
+       * ── **市场调研（联网搜索）**（用户需求 #2 / #4）──────────────────────
+       *
+       * 用户原话：
+       * > 「总管**委派子代理去做市场调研**（查新闻、各大交易所社区、社交媒体、
+       * >  新闻源等等。。）根据资料反馈给相应的智能体做处理」
+       * > 「以后系统自身需要用到网络搜索，**可以直接用 magpie 内置的搜索 MCP**
+       * >  `http://127.0.0.1:3425/mcp/magpie/web-search`（我已经配置好了密钥）」
+       *
+       * ## 为什么直接用 magpie 的搜索 MCP（不重复造轮子）
+       *
+       * magpie 已经把"搜索 API（tavily/brave/exa/…）或会搜索的模型"统一成一个
+       * `web_search` 工具，而用户**已经配好了密钥**。自己再接一套搜索 API 是重复劳动，
+       * 而且会多一个要维护的密钥与限流面。
+       *
+       * ## 端点与 key 从哪来
+       *
+       * **复用团队网关的 key**（同一个 magpie 实例）—— 不再新增一套配置。
+       * 端点可用 `MAGPIE_SEARCH_URL` 覆盖（默认 magpie 的标准位置）。
+       */
+      research: async (symbols) => {
+        /*
+         * ── ① 先看缓存（见 `researchCache` 的说明）──────────────────────
+         *
+         * 实测一次 agent 调研要 **197 秒**，而新闻不是秒级变化的 ——
+         * 让每轮决策都白等 3 分钟是纯浪费，且会把整轮拖到十几分钟。
+         */
+        const cached = getResearchCache(traderId);
+        const age = cached === undefined ? Infinity : Date.now() - cached.at;
+
+        if (cached !== undefined && age < researchTtlMs()) {
+          runtimeLogs.write(
+            traderId, 'info', 'team',
+            `[调研] 用缓存结果（${Math.round(age / 1000)}s 前查到，有效期 ${Math.round(researchTtlMs() / 60_000)} 分钟）`,
+          );
+          return cached.text;
+        }
+
+        /*
+         * ── ①b **后台刷新，决策不等它**（2026-10-13 解耦）──────────────────
+         *
+         * ## 为什么必须解耦（实测数据）
+         *
+         * 用户的要求：
+         * > 「系统**不再是像现在这样定时去工作**，而是**持续、并发**的工作」
+         *
+         * 而实测（`#2471`）整轮 **619 秒** —— 因为决策**同步等**调研跑完。
+         * 四个猎手即便并发也要约 400 秒（两个一批，每批约 200 秒），
+         * 而 `240 秒` 的猎手超时在并发下让**四个全部超时**：
+         * ```
+         *   [调研] 新闻猎手 未产出：agent 超过 240 秒未返回
+         *   （四个都是同一个原因）
+         * ```
+         *
+         * ## 正确形状：调研在后台持续跑，决策读最新结果
+         *
+         * ```
+         *   后台：每 N 分钟跑一次四猎手 → 写进 `researchCache`
+         *   决策：读缓存（几乎总是新鲜的）→ **立即返回**
+         * ```
+         * 于是"持续工作"与"决策不被拖慢"**同时成立**。
+         *
+         * ⚠️ 缓存**空**时（首次启动）也不阻塞等待 —— 立刻返回一句说明，
+         * 让团队知道"这一轮没有新闻材料"。**不能让整轮卡在调研上。**
+         */
+        ensureResearchRefresher(traderId, symbols, apiKey);
+        /*
+         * ⚠️ **判据是"有没有真的查到过东西"，不是"Map 里有没有这一项"**
+         *（2026-10-13 实测踩到）。
+         *
+         * 后台刷新会先写一个 `refreshing: true` 的**占位**（`at: 0`、`text: ''`）——
+         * 而第一版这里只看 `cached !== undefined`，于是：
+         * ```
+         *   [调研] 缓存已过期（29863939 分钟前）—— 先用旧结果，后台正在刷新
+         * ```
+         * 并**把空字符串当作"旧情报"返回给团队** ——
+         * 那比"明说没有材料"更糟：它让 `newscaster` 以为有材料可整理。
+         */
+        const hasRealCache = cached !== undefined && cached.at > 0 && cached.text.length > 0;
+        if (hasRealCache) {
+          /* 有**过期**缓存 → 先用它（总比"什么都没有"好），后台已在刷新。 */
+          runtimeLogs.write(
+            traderId, 'info', 'team',
+            `[调研] 缓存已过期（${Math.round(age / 60_000)} 分钟前）—— 先用旧结果，后台正在刷新`,
+          );
+          return cached.text;
+        }
+        runtimeLogs.write(
+          traderId, 'info', 'team',
+          '[调研] 首次调研在后台进行 —— 本轮**没有新闻材料**（下一轮就会有）',
+        );
+        return '（本轮没有新闻材料：首次调研正在后台进行，下一轮就会有）';
+
+        /* eslint-disable no-unreachable */
+        /*
+         * ══════════════════════════════════════════════════════════════════════
+         *  ⚠️ DEAD-CODE-SYNC-RESEARCH（待删，但**无害**）
+         * ══════════════════════════════════════════════════════════════════════
+         *
+         * 从这一行到本闭包结束的 `});`，是**原来的"同步调研"实现**。
+         *
+         * ## 它为什么不执行
+         *
+         * 上面那句 `return` 已经返回 —— 这一整段是**不可达代码**。
+         * 所以它**无害**（不会重复调研、不会多花额度），
+         * 但它**误导性很强**：读代码的人会以为"四猎手是在这里跑的"，
+         * 而实际上四猎手跑在**模块级的 `refreshResearch()`**（文件上方）。
+         *
+         * ## 为什么暂时留着
+         *
+         * 我为了删它已经**三次写坏这个文件**（两次 PowerShell 大段替换、
+         * 一次 edit 边界算错）。而它无害 —— **风险大于收益**。
+         *
+         * ## 正确的删法（留给下一次）
+         *
+         * **不要用 PowerShell 数组操作。** 用编辑器从这一行整段选中到
+         * 本闭包结束的 `});`，一次删除，然后立刻 `npm run typecheck`。
+         * 判据：删完之后 `manager.ts` 里不该再有 `collectMarketResearch` 的调用
+         *（模块级已经不需要它了）。
+         *
+         * ══════════════════════════════════════════════════════════════════════
+         *
+         * 下面是原注释（保留，因为其中"为什么用 agent 而不是直接调搜索"
+         * 那段论证仍然适用于**模块级的 `refreshResearch`**）：
+         */
+
+        /*
+         * ⚠️ **第一优先：让真 agent 自己去查**（2026-10-12 实测后改的）。
+         *
+         * ## 为什么换掉"直接调 MCP 搜索"
+         *
+         * 实测对照（同一个新闻调研任务）：
+         *
+         * | | 直接调搜索 / 单次模型调用 | harness agent |
+         * |---|---|---|
+         * | 情报产出 | 零（「我无法联网，没有工具」）| **3 条具体新闻 + 资金流 + 来源链接** |
+         *
+         * 差别在于 agent 会**自己决定查什么、查几轮、把结果综合成结论** ——
+         * 而"调一次搜索接口"只是把原始结果丢出来。
+         *
+         * 用户的原话：
+         * > 「智能体就像一个真人一样，公司干活的员工……能**自己上班干活**，
+         * >  而不是像机器人一样**问一次答一次**」
+         *
+         * ## 为什么仍然保留 MCP 搜索作为兜底
+         *
+         * harness 没装、超时、模型不认识 —— 任何一种都可能发生。
+         * **兜底不是"退化成没用"，而是"至少还有原始搜索数据"**。
+         */
+        /*
+         * ── **四个猎手并行调研**（2026-10-13 接线）─────────────────────────────
+         *
+         * ## 为什么从"一次调研"改成"四个猎手"
+         *
+         * 用户的要求：
+         * > 「总管委派子代理去做市场调研（查**新闻、各大交易所社区、
+         * >  **社交媒体、新闻源**等等）」
+         * > 「有**调查新闻的**、有**监控社区的**、有**查市场情绪的**」
+         *
+         * 而之前是**一段提示词 + 一次 agent 调用** ——
+         * **一个 agent 覆盖不了多个信息源**：它一次只能沿一个方向查，
+         * 结果必然是"查了新闻就没查社区"。
+         *
+         * ## 并行（墙钟不叠加）
+         *
+         * 实测一个 harness 调研约 **197 秒**，串行四个就是 13 分钟；
+         * 并行仍是约 200 秒。用户明确说过"不限制并发"（指 magpie 侧），
+         * 而**服务器侧的并发由闸门控**（`AQ_HUNTER_CONCURRENCY`，默认 2）。
+         *
+         * ## ⚠️ 失败者必须进结果（不能静默丢掉）
+         *
+         * 见 `hunters.ts`：把失败的猎手丢掉会让下游以为
+         * "**那个来源上什么都没有**" —— 而那是两件完全不同的事
+         *（"社区没有讨论" vs "社区猎手挂了"）。
+         */
+        const hunterLimit = hunterConcurrency();
+        const hunterTimeout = hunterTimeoutMs();
+        /*
+         * ⚠️ **每个猎手一个独立的工作目录**（2026-10-13 实测后加）。
+         *
+         * ## 为什么（一次真实的全部失败）
+         *
+         * 第一版四个猎手共用 `agentWorkdir(traderId)`，实测结果：
+         * ```
+         *   [调研] 4 个来源中 **4 个未产出**：新闻猎手、资金猎手、社区猎手、宏观猎手
+         * ```
+         * **而同一个 workdir 下单猎手是能跑成的**（实测约 197 秒、查到 3 条新闻）。
+         * 差别只有"并发 + 共用目录"。
+         *
+         * ## 根因在 `harness.ts` 的这两行
+         * ```
+         *   cwd:  input.workdir
+         *   HOME: process.env.AQ_HARNESS_HOME ?? `${input.workdir}/.home`
+         * ```
+         * 于是四个并发实例**共用一个 `HOME`** —— 而 claude code 会把
+         * 配置、会话与历史写进 `~/.claude`。多个进程同时写同一份状态，
+         * 正是"单跑能成、并发全败"的典型形状。
+         *
+         * 所以给每个猎手一个子目录（`mkdirSync` 是必须的：
+         * `cwd` 不存在时 `spawn` 直接 ENOENT）。
+         */
+        const hunterWorkdir = (hunterId: string): string => {
+          const dir = `${agentWorkdir(traderId)}/hunter-${hunterId}`;
+          try {
+            mkdirSync(dir, { recursive: true });
+          } catch {
+            /* 建不出来就退回共用目录 —— 至少不要因为它整个失败。 */
+            return agentWorkdir(traderId);
+          }
+          return dir;
+        };
+        const hunterResults = await mapConcurrent(
+          HUNTERS,
+          hunterLimit,
+          async (hunter): Promise<HunterReport> => {
+            const r = await runAgentTask({
+              task: buildHunterTask(hunter, symbols),
+              allowedTools: 'WebSearch,WebFetch',
+              model: process.env.AQ_RESEARCH_GROUP ?? 'group/team-news',
+              fastModel: process.env.AQ_GRUNT_GROUP ?? 'group/team-grunt',
+              workdir: hunterWorkdir(hunter.id),
+              timeoutMs: hunterTimeout,
+              authToken: apiKey,
+            });
+            return {
+              hunterId: hunter.id,
+              label: hunter.label,
+              ok: r.ok,
+              text: r.text,
+              ...(r.error === undefined ? {} : { error: r.error }),
+              latencyMs: r.latencyMs,
+            };
+          },
+        );
+        /*
+         * ⚠️ **`mapConcurrent` 从不抛错** —— 里面抛出的异常会变成
+         * `{ ok: false, error, index }`。这一层映射把那个形状**还原成猎手**，
+         * 于是"猎手函数自己炸了"与"agent 跑失败"走同一条可见路径
+         *（都进 `hunterReports`、都在合并结果里写明原因）。
+         *
+         * 若这里漏掉失败分支，那种情况会**静默少一个猎手** ——
+         * 而下游会以为"那个来源上没有消息"。
+         */
+        const hunterReports: HunterReport[] = hunterResults.map((res, i) => {
+          if (res.ok) return res.value;
+          const hunter = HUNTERS[i];
+          return {
+            hunterId: hunter?.id ?? `hunter_${i}`,
+            label: hunter?.label ?? `猎手 ${i}`,
+            ok: false,
+            text: '',
+            error: res.error,
+            latencyMs: 0,
+          };
+        });
+        const okReports = hunterReports.filter((rep) => rep.ok);
+        const mergedText = mergeHunterReports(hunterReports);
+        runtimeLogs.write(traderId, 'info', 'team', `[调研] ${summariseHunters(hunterReports)}`);
+        /*
+         * ⚠️ **失败原因必须写进日志**（2026-10-13 实测踩到）。
+         *
+         * 第一版只写了"4 个来源中 4 个未产出"——**没写为什么**。
+         * 于是排查时我无法回答"是超时、是 harness 没装、还是并发冲突"，
+         * 只能靠猜。**而"知道它失败了"和"知道它为什么失败"是两件事** ——
+         * 前者只是让人焦虑，后者才能修。
+         *
+         * ⚠️ 写在 `if (agentResult.ok)` **之前** —— 全部失败时也要留下来。
+         */
+        for (const rep of hunterReports.filter((x) => !x.ok)) {
+          runtimeLogs.write(traderId, 'warn', 'team', `[调研] ${rep.label} 未产出：${rep.error ?? '未知原因'}`);
+        }
+        /*
+         * ⚠️ 下面沿用原来的 `agentResult` 形状 —— 于是它后面的
+         * **时效过滤 / 交叉验证 / 退回原文**那三段一行都不用改。
+         *
+         * `text` 用**合并后的文本**（每个猎手一块，失败的写明原因）——
+         * 那样 `parseIntelReport` 能从成功的猎手块里解析出结构化情报，
+         * 而失败信息也不会丢。
+         */
+        const agentResult = {
+          ok: okReports.length > 0,
+          text: mergedText,
+          error: okReports.length > 0 ? undefined : '全部猎手都未产出',
+        };
+
+        if (agentResult.ok) {
+          /*
+           * ── **解析成结构化情报，并做时效/交叉验证过滤**（2026-10-12 接线）──
+           *
+           * ## 为什么要过滤（而不是把原文直接给下游）
+           *
+           * `intel/freshness.ts` 的规则是：
+           * · **过期**（> 48h）→ 权重 0，**不进决策**
+           * · **未确认**（只有一个独立来源）→ 默认**不进决策**
+           *
+           * 若不过滤，这两条规则就只是"写在代码里"而**从未生效** ——
+           * 而用户明确要求过：「消息面的东西常常有时效性，
+           * **如果消息面的策略失效后，应当会及时修正、调整、改变**」。
+           *
+           * ## ⚠️ 但解析失败时**不能丢原文**
+           *
+           * 模型可能没按 JSON 格式输出（尤其换模型之后）。
+           * 那时若我们只返回"解析失败"，团队就**一点情报都没有**了 ——
+           * 而原文里其实有可用信息（只是格式不对）。
+           *
+           * 所以：**解析成功 → 用过滤后的结构化文本；解析失败 → 退回原文**
+           * （并在日志里说明"格式没对上"）。
+           */
+          const parsed = parseIntelReport(agentResult.text, Date.now(), 'news_hunter');
+          if (parsed.intel.length > 0) {
+            const ranked = rankIntel(parsed.intel, Date.now());
+            const droppedByRule = parsed.intel.length - ranked.length;
+            runtimeLogs.write(
+              traderId, 'info', 'team',
+              `[调研] agent 查到 ${parsed.intel.length} 条情报 · ` +
+              `可用 ${ranked.length} 条（过期/未确认被剔除 ${droppedByRule} 条）` +
+              `${parsed.dropped.length > 0 ? ` · 格式不合规 ${parsed.dropped.length} 条` : ''}`,
+            );
+            if (ranked.length > 0) {
+              const text = ranked
+                .map((r) => {
+                  const h = (r.assessment.ageMs / 3_600_000).toFixed(1);
+                  return `- [${r.intel.direction}] ${r.intel.summary}\n` +
+                    `  来源：${r.intel.sourceUrl}（${r.assessment.independentSources} 个独立来源）\n` +
+                    `  ${h} 小时前 · ${r.assessment.verdict}`;
+                })
+                .join('\n');
+              setResearchCache(traderId, { text, at: Date.now(), refreshing: false });
+              return text;
+            }
+            /*
+             * 全部被规则剔除（都过期或都未确认）—— 这也是**有效结论**：
+             * "本轮没有可用的新鲜情报"。明说，而不是给一段旧消息。
+             */
+            const note = '（本轮没有可用的新鲜情报：查到的都过期了）';
+            setResearchCache(traderId, { text: note, at: Date.now(), refreshing: false });
+            return note;
+          }
+
+          /* 解析不出结构化情报 → **退回原文**（格式没对上，但原文仍可能有信息）。 */
+          runtimeLogs.write(
+            traderId, 'warn', 'team',
+            `[调研] agent 的产出不是结构化格式（${parsed.dropped[0]?.reason ?? '未知'}）—— 退回原文使用`,
+          );
+          setResearchCache(traderId, { text: agentResult.text, at: Date.now(), refreshing: false });
+          return agentResult.text;
+        }
+
+        runtimeLogs.write(
+          traderId,
+          'warn',
+          'team',
+          `[调研] agent 未能完成（${agentResult.error ?? '未知'}）—— 退回直接搜索`,
+        );
+
+        const result = await collectMarketResearch(
+          {
+            endpoint: process.env.MAGPIE_SEARCH_URL ?? DEFAULT_SEARCH_ENDPOINT,
+            apiKey,
+          },
+          symbols,
+        );
+        /*
+         * 把"搜到了几条 / 为什么没搜到"写进日志 —— 用户要求看得见，
+         * 而"新闻数据没拿到"正是最该被看见的一件事
+         *（否则团队会一直基于行情做决策，而操作员以为它在查新闻）。
+         */
+        runtimeLogs.write(
+          traderId,
+          result.ok ? 'info' : 'warn',
+          'team',
+          result.ok
+            ? `市场调研完成：${symbols.length > 0 ? `针对 ${symbols.join('/')}` : '整体市场'}`
+            : `市场调研失败：${result.errors.join('；')}`,
+        );
+        /* 兜底结果也缓存 —— 它至少比"没有情报"好，且能省掉下一轮的搜索。 */
+        if (result.ok) {
+          setResearchCache(traderId, { text: result.text, at: Date.now(), refreshing: false });
+        }
+        return result.text;
+      },
+    });
+
+    return { model, reason: null };
   }
 
   private async buildModel(aiModelId: number): Promise<{ client: LlmClient; config: ReturnType<typeof aiModels.get> }> {
@@ -664,11 +2168,34 @@ export class TraderManager {
 
     const probe = await client.testConnection();
     if (!probe.ok) {
-      throw new Error(`AI 模型「${row.label}」无法访问：${probe.message}`);
+      /*
+       * ⚠️ **模型不可达不再阻止启动（2026-10-10，用户定的原则）。**
+       *
+       * 用户的原话：「模型用尽也不应该让我卡在启动\停止页面上，**切换不切换是用户来决定**，
+       * 模型用尽那你**启动以后页面上提示就行**了」。
+       *
+       * 原来这里是 `throw` —— 于是一个额度用尽的模型会让「启动」直接失败：
+       * 操作员既起不来、又被卡在那一页上，还得自己琢磨为什么。
+       * 而**换不换模型是操作员的决定**，系统不该替他做，
+       * 更不该用"起不来"这种形式**逼**他做。
+       *
+       * 现在只记事实：`recordLlmHealth` 写进 `llm_health:<id>`，界面上的「最近错误」
+       * 读的就是它。启动照常继续 —— 模型不可用时那一轮决策会失败，
+       * 而**失败显示在页面上**，那才是操作员需要看到的形态。
+       * （之后每次模型调用的成败由下面 `tracked.chat` 持续记录。）
+       */
+      log.warn(`AI 模型「${row.label}」探测失败，但启动继续：${probe.message}`);
+      recordLlmHealth(aiModelId, {
+        ok: false,
+        at: new Date().toISOString(),
+        latencyMs: probe.latencyMs,
+        error: probe.message.slice(0, 300),
+      });
+    } else {
+      log.info(
+        `AI 模型「${row.label}」（${row.provider}/${row.model}）响应正常，耗时 ${probe.latencyMs}ms`,
+      );
     }
-    log.info(
-      `AI 模型「${row.label}」（${row.provider}/${row.model}）响应正常，耗时 ${probe.latencyMs}ms`,
-    );
 
     /*
      * ⚠️ **把每次调用的成败记下来 —— 否则它只活在日志里。**
@@ -833,9 +2360,9 @@ export class TraderManager {
 
       const blocking = connectivity.filter((c) => !c.ok && c.blocking);
       if (blocking.length > 0) {
-        this.connections.delete(traderId);
+        dropConnections(this.connections, traderId);
         const message = blocking.map((c) => `${c.name}: ${c.detail}`).join(' ');
-        traders.setStatus(traderId, 'error', message);
+        this.setTraderStatus(traderId, 'error', message);
         return {
           result: { ok: false, error: message, preflight: checks },
           permanent: isPermanentStartFailure(message),
@@ -860,9 +2387,25 @@ export class TraderManager {
        */
       const strategyRecord =
         trader.strategyId === null ? undefined : strategies.get(trader.strategyId);
-      if (trader.mode !== 'ai_managed' && !strategyRecord) {
+      /*
+       * ⚠️ **判据必须是"这个模式是不是 AI 驱动"，不能写死 `'ai_managed'`**
+       *（2026-10-12 实测踩到）。
+       *
+       * 原来的写法是 `trader.mode !== 'ai_managed'`。加了 `ai_team` 之后，
+       * 一个新模式的机器人**会被当成"按固定策略运行"**，于是启动时抛
+       * 「它引用的策略已不存在」—— 而 AI 团队模式的参数整份由团队自己管，
+       * **本来就不该有策略**。实测症状（#11 启动即 error）：
+       *
+       *     #11 [团队测试] ai_team status=error
+       *     last_error=这个机器人按固定策略运行，但它引用的策略已不存在…
+       *
+       * 而共享包里**早就导出了 `AI_DRIVEN_MODES`** 就是为了这个 ——
+       * 让"哪些模式由 AI 驱动"只有一个定义处，而不是散在各层的字符串比较里。
+       * 我上一轮在 API 层用了它，却**漏了这里** —— 于是同一个 bug 换个地方又出现。
+       */
+      if (!isAiDriven(trader.mode) && !strategyRecord) {
         throw new Error(
-          '这个机器人按固定策略运行，但它引用的策略已不存在 —— 请为它重新选择一个策略，或改成智能托管。',
+          '这个机器人按固定策略运行，但它引用的策略已不存在 —— 请为它重新选择一个策略，或改成 AI 托管模式。',
         );
       }
       const parsed = strategyRecord ? StrategyConfigSchema.safeParse(strategyRecord.config) : null;
@@ -880,6 +2423,70 @@ export class TraderManager {
         detail: '模型已成功响应探测请求。',
         blocking: false,
       });
+
+      /*
+       * ── AI 团队模式的**模型出口**（2026-10-12 新增，与智能托管完全隔离）──
+       *
+       * ## 为什么在这里分叉，而不是改动那个已有的 `model`
+       *
+       * 用户硬约束：「这次更新是一个全新的项目，和现在智能托管是 2 个东西……
+       * **不要影响我现在实盘跑的机器人**」。
+       *
+       * 所以 `ai_team` 走**另一条构造路径**，而 `strategy` / `ai_managed`
+       * 用的那个 `model` 对象**一个字节都不变** —— 后者上面挂着用户的真金白银。
+       *
+       * ## 出口怎么来的
+       *
+       * 团队模式需要"一个网关 + 动态模型名"（magpie 是 705 个模型共用一套
+       * baseUrl/key）。而 `ai_models` 表是"一条记录 = 一个供应商 + 一个模型"。
+       *
+       * 所以复用那条记录当**网关出口**：它的 baseUrl/key 就是网关的，
+       * 模型名由角色路由在运行时决定（见 `magpieGateway.ts` 的文件头说明）。
+       * **这样用户不用学新配置概念** —— 他已经在「AI 模型」里配过 magpie 了。
+       */
+      const teamBuild =
+        trader.mode === 'ai_team'
+          ? await this.buildTeamModel(trader.id)
+          : { model: null, reason: null };
+      const routedTeamModel = teamBuild.model;
+
+      /*
+       * ⚠️ **团队模式没能启用时必须【显式报告】，不能静默走回单模型。**
+       *
+       * ## 复核发现的 P0（2026-10-12）
+       *
+       * 原来的实现是：`buildTeamModel` 失败 → 返回 `null` → 下面那句
+       * `if (routedTeamModel)` 不成立 → **悄悄退回到 `client.complete()`（单模型）**。
+       *
+       * 后果很严重：一台标着「AI 团队」的机器人，实际在用**一个模型**跑，
+       * 而**界面上看不出任何异常** —— 用户以为团队在开会，其实没有。
+       * 这直接违背了本文件里写下的承诺「`ai_team` 走另一条构造路径」。
+       *
+       * 而且触发条件很容易达成：网关端口改了、换了地址、忘了填 Key、模型记录被删
+       *（`looksLikeMagpieGateway` 用 `:3425` 子串判断，换端口即失效）。
+       *
+       * 所以：失败时**必须**同时
+       *   ① push 一条 `severity: 'error'` 的 preflight check（页面可见）
+       *   ② 写一条 error 级 runtime 日志（日志可见）
+       * 并且**如实说明"当前按单模型运行"** —— 而不是只写一句"团队模式未启用"，
+       * 那会让人以为"没跑"，而真相是"跑错了东西"。
+       *
+       * ⚠️ 仍然**不阻断启动** —— 这与「模型不可达不阻止启动」（用户 2026-10-10 定的
+       * 「模型用尽那你启动以后页面上提示就行了」）保持一致：
+       * 说清楚，但让机器人能起来。
+       */
+      if (trader.mode === 'ai_team' && teamBuild.reason !== null) {
+        const detail = `AI 团队模式未启用：${teamBuild.reason} 当前这台机器人会按**单模型**运行（不是团队）。`;
+        checks.push({
+          name: 'AI 团队模式',
+          severity: 'error',
+          ok: false,
+          detail,
+          blocking: false,
+        });
+        runtimeLogs.write(trader.id, 'error', 'manager', detail);
+        log.warn(`机器人 #${trader.id} ${detail}`);
+      }
 
       /* --- Assemble ----------------------------------------------------- */
       const marketData = new MarketDataService(connection.market, connection.registry);
@@ -943,7 +2550,15 @@ export class TraderManager {
        */
       const effectiveConfig = (() => {
         const raw = traders.get(traderId)?.agentConfigJson;
-        if (trader.mode === 'ai_managed' && typeof raw === 'string' && raw.length > 0) {
+        /*
+         * ⚠️ **用 `isAiDriven` 而不是写死 `'ai_managed'`。**
+         *
+         * 这里是"AI 模式下用 `agent_config_json` 当生效配置"的读取点。
+         * 写死单模式名的话，`ai_team` 会读不到自己的配置 —— 而它的参数同样
+         * 存在那一列（AI 自己管）。**症状是"AI 配的参数没生效"，
+         * 而界面上看不出任何异常。**
+         */
+        if (isAiDriven(trader.mode) && typeof raw === 'string' && raw.length > 0) {
           try {
             const parsedAi = StrategyConfigSchema.safeParse(JSON.parse(raw));
             if (parsedAi.success) return parsedAi.data;
@@ -1107,6 +2722,16 @@ export class TraderManager {
 
       const model: DecisionModel = {
         complete: async (systemPrompt, userPrompt, options) => {
+          /*
+           * ⚠️ **团队模式走路由模型；其余模式走原来那一条路（一字未改）。**
+           *
+           * 判据放在 `complete` 里而不是替换整个 `model` 对象，是为了让
+           * **两者的 usage 适配逻辑共用一份** —— 那个"缓存/思考 token 不能在
+           * 最后一跳丢掉"的坑（见下面那段注释）只该有一个修复点。
+           */
+          if (routedTeamModel) {
+            return routedTeamModel.complete(systemPrompt, userPrompt, options);
+          }
           const result = await client.complete(systemPrompt, userPrompt, options);
           return {
             text: result.text,
@@ -1156,7 +2781,15 @@ export class TraderManager {
          * 意思是"没有固定参数" —— 后者不能是前者的一种。挂在策略上还会让它
          * 出现在策略列表里，任何既有机器人都能选中它。
          */
-        isAiStrategy: () => traders.get(traderId)?.mode === 'ai_managed',
+        /*
+         * `isAiStrategy` 的语义是"**这个机器人是不是 AI 自己管参数**"
+         *（所以它不该被当成一个可选策略）。`ai_team` 同样是 AI 管参数 →
+         * 用 `isAiDriven` 而不是写死单模式名。
+         */
+        isAiStrategy: () => {
+          const mode = traders.get(traderId)?.mode;
+          return mode !== undefined && isAiDriven(mode);
+        },
         model,
         equityNow: () => equity.latest(traderId)?.equity ?? null,
         /*
@@ -1225,8 +2858,8 @@ export class TraderManager {
       const message = (error as Error).message;
       log.error(`启动机器人 ${traderId} 失败：${message}`);
       this.running.delete(traderId);
-      this.connections.delete(traderId);
-      traders.setStatus(traderId, 'error', message);
+      dropConnections(this.connections, traderId);
+      this.setTraderStatus(traderId, 'error', message);
       return {
         result: { ok: false, error: message, preflight: checks },
         permanent: isPermanentStartFailure(message),
@@ -1243,24 +2876,155 @@ export class TraderManager {
    * drain finishes, so a concurrent `startTrader` cannot slip a second instance
    * in behind this one while it is still writing.
    */
+  /**
+   * **启动机器人 —— 同步返回，真正的启动在后台继续。**
+   *
+   * ## 为什么需要它（2026-10-10，用户报的卡顿）
+   *
+   * 用户的原话：「机器人启动\停止，用户点击以后应该是瞬间完成（起码 UI 页面上
+   * 用户感觉是瞬间完成，现在运行中的机器人运行\停止会卡住很久）」。
+   *
+   * 原来的 `/start` 直接 `await startTrader(...)`：它要先建交易所连接、拉持仓、
+   * 对账、再 `this.running.set(...)` —— 这几步实测要几秒到几十秒，而期间
+   * `statusOf()` 仍是 `stopped`（那个 id 还没进 `running`）。于是界面表现成
+   * **点了启动、什么都没发生**，直到全部完成才跳一下。
+   *
+   * 现在：**守卫同步判完 → 状态立刻置为 `starting` 并返回**，真正的启动在后台跑；
+   * 失败时由启动路径自己写 `error` 状态（那条路径本来就有），界面靠推送看到结果。
+   *
+   * 守卫**不重复实现**：这里调的就是 `startGuard`，与 `startTrader` 同一个纯函数。
+   */
+  startTraderAsync(traderId: number, dryRun: boolean): StartResult {
+    const trader = traders.get(traderId);
+    const guard = startGuard({
+      traderId,
+      globalTradingDisabled: env.globalTradingDisabled,
+      traderExists: trader !== undefined,
+      running: this.running.has(traderId),
+      starting: this.starting.has(traderId),
+    });
+    if (!guard.ok) return { ok: false, error: guard.error, preflight: [] };
+    if (!trader) return { ok: false, error: `找不到机器人 ${traderId}`, preflight: [] };
+
+    /*
+     * ⚠️ **这里不能先 `starting.add` 再调 `startTrader`** —— `startTrader` 自己的
+     * 守卫会看到"已经在启动了"而拒绝，启动永远起不来。
+     * 所以只写状态（界面立刻变），占位交给 `startTrader` 自己加：
+     * 中间**没有 await**，两次调用在同一个同步块里，不存在并发窗口。
+     */
+    /*
+     * **启动代数** —— 每次启动自增。看门狗与回调据此判断"我还是不是当前那一代"，
+     * 避免一次陈旧的启动（或它的看门狗）去覆盖后来者的状态（2026-10-11 审查发现）。
+     */
+    const generation = (this.startGeneration.get(traderId) ?? 0) + 1;
+    this.startGeneration.set(traderId, generation);
+
+    this.setTraderStatus(traderId, 'starting', null);
+
+    /*
+     * ⚠️ **"卡在启动中"本身是个 bug，必须有兜底（2026-10-10 实测）。**
+     *
+     * 用户点启动后界面停在「正在启动中」，而且**再点也点不动** —— 因为
+     * `startTrader` 的 `starting` 占位一直没释放，守卫就一直回
+     * 「该机器人正在启动中」。根因是启动流程里某一步没有返回
+     *（模型不可用那条路上有长重试），而**状态与占位都跟着它一起悬住**。
+     *
+     * 所以加一道看门狗：无论如何，启动要么进 `running`，要么落到 `error`
+     * 并释放占位。**"永远停在启动中"不是一种可接受的状态** ——
+     * 操作员既看不到结论，也失去了重试的能力。
+     */
+    const startWatchdog = setTimeout(() => {
+      /* 已经有更新的一次启动接管了 → 这个陈旧看门狗什么都不做。 */
+      if (this.startGeneration.get(traderId) !== generation) return;
+      if (this.running.has(traderId)) return;
+      /*
+       * ⚠️ **看门狗【不释放】 `starting` 占位（2026-10-11 审查发现）。**
+       *
+       * 上一版这里删了占位，理由是"否则用户再也点不动"。**那个理由换来了一个更糟的后果**：
+       * 慢启动（>90 秒）时占位被提前释放，用户再点一次就能并发出**第二个交易实例**，
+       * 而第一个还活着 —— 它既停不掉，也会和新的那个一起下单。
+       *
+       * 正确的分工：**占位由 `startTrader` 的 `finally` 释放**（谁持有谁释放），
+       * 看门狗只负责"把状态说清楚" —— 让操作员看到"启动还在进行中、已超过 N 秒"，
+       * 而不是让按钮变成一个可以踩出第二个实例的陷阱。
+       *
+       * 按钮在此期间点不动是**正确行为**：那一轮启动确实还在飞。
+       */
+      const message =
+        `启动仍在进行中，已超过 ${Math.round(START_WATCHDOG_MS / 1000)} 秒未完成` +
+        '（可能是 AI 模型不可用导致的长重试）。请等待它结束；若持续不结束请看服务器日志。';
+      log.error(`机器人 ${traderId} ${message}`);
+      this.setTraderStatus(traderId, 'error', message);
+    }, START_WATCHDOG_MS);
+    /* 别让这个定时器拖住进程退出。 */
+    startWatchdog.unref?.();
+
+    void this.startTrader(traderId, dryRun)
+      .then((result) => {
+        clearTimeout(startWatchdog);
+        if (this.startGeneration.get(traderId) !== generation) return;
+        if (result.ok) return;
+        log.warn(`机器人 ${traderId} 启动失败：${result.error ?? '未知错误'}`);
+        /* 失败必须落到 `error` —— 否则状态会停在 `starting` 上（见看门狗）。 */
+        this.setTraderStatus(traderId, 'error', result.error ?? '启动失败');
+      })
+      .catch((error: unknown) => {
+        clearTimeout(startWatchdog);
+        if (this.startGeneration.get(traderId) !== generation) return;
+        const message = (error as Error).message;
+        log.error(`机器人 ${traderId} 启动时抛错：${message}`);
+        this.setTraderStatus(traderId, 'error', message);
+      });
+    return { ok: true, preflight: [] };
+  }
+
   async stopTrader(traderId: number): Promise<void> {
     // Record the operator's intent before doing any async work, so a boot retry
     // parked in `waitForRetry()` aborts instead of starting the trader seconds
     // after it was told to stop.
     this.cancelledStarts.add(traderId);
     const autoTrader = this.running.get(traderId);
-    if (autoTrader) {
-      await autoTrader.stop();
-      this.running.delete(traderId);
-    }
+
+    /*
+     * ⚠️ **先把"它已停止"定下来，再去做清理（2026-10-10，用户报的卡顿）。**
+     *
+     * 用户的原话：「机器人启动\停止，用户点击以后应该是瞬间完成（起码 UI 页面上
+     * 用户感觉是瞬间完成，现在运行中的机器人运行\停止会卡住很久）」。
+     *
+     * 原来 `this.running.delete()` 在 `await autoTrader.stop()` **之后** ——
+     * 而 `stop()` 要等在途那一轮结束（最多 60 秒，那一轮可能正卡在一次 LLM 调用上）。
+     * 界面读的是 `statusOf()`（= `running.get(id)?.currentStatus ?? 'stopped'`），
+     * 于是**这 60 秒里页面上还写着"运行中"**，看起来就是"点了没反应"。
+     *
+     * 顺序反过来之后：状态立刻变 `stopped`，界面立刻翻；清理照常在后面做完。
+     * 清理期的机器人在 `running` 里已经不存在，所以并发 `start` 不会撞上半停的实例。
+     */
+    this.running.delete(traderId);
     this.startedAt.delete(traderId);
+    if (autoTrader) {
+      /* 掐断在途的 AI 请求 —— 这是"停止"要立即生效的那部分。 */
+      autoTrader.abortInFlightCycle();
+      this.setTraderStatus(traderId, 'stopped', null);
+      await autoTrader.stop();
+    } else {
+      this.setTraderStatus(traderId, 'stopped', null);
+    }
     this.cancelFillReconcile(traderId);
+    /*
+     * ⚠️ **必须停掉后台调研循环**（2026-10-13 实测发现的资源泄漏）。
+     *
+     * 实测：`#11` 已 `stopped`，而服务器上**还有 2 个 claude 进程在跑** ——
+     * 因为 `researchRefreshers` 只在创建处出现，从未被清理。
+     * 后果：机器人停止后后台调研**每 10 分钟照常起 4 个进程**，
+     * 不报错、界面看不见，只是安静地吃 CPU/内存（单个约 250MB）。
+     */
+    stopResearchRefresher(traderId);
     const stream = this.userStreams.get(traderId);
     if (stream) {
       await stream.stop().catch(() => undefined);
       this.userStreams.delete(traderId);
     }
-    this.connections.delete(traderId);
+    dropConnections(this.connections, traderId);
     runtimeLogs.write(traderId, 'info', 'manager', '机器人已停止');
   }
 
@@ -1345,10 +3109,10 @@ export class TraderManager {
      * 覆盖）；固定策略模式仍然返回 `null`（那种情况下确实读不到）。
      */
     const record = trader.strategyId === null ? undefined : strategies.get(trader.strategyId);
-    if (!record && trader.mode !== 'ai_managed') return null;
+    if (!record && !isAiDriven(trader.mode)) return null;
     let config: StrategyConfig = record?.config ?? StrategyConfigSchema.parse({});
     const raw = trader.agentConfigJson;
-    if (trader.mode === 'ai_managed' && typeof raw === 'string' && raw.length > 0) {
+    if (isAiDriven(trader.mode) && typeof raw === 'string' && raw.length > 0) {
       try {
         const parsed = StrategyConfigSchema.safeParse(JSON.parse(raw));
         if (parsed.success) config = parsed.data;
@@ -1630,6 +3394,11 @@ export class TraderManager {
      */
     for (const trader of traders.list()) this.cancelledStarts.add(trader.id);
     this.stopping = true;
+    /* 停掉自检循环 —— 关闭时不该再开新的查询。 */
+    if (this.selfCheckTimer) {
+      clearInterval(this.selfCheckTimer);
+      this.selfCheckTimer = null;
+    }
 
     await Promise.all(
       [...this.userStreams.entries()].map(async ([id, stream]) => {
@@ -1802,7 +3571,7 @@ export class TraderManager {
        * (`status='error'` + `lastError`, which `TradersPage` renders).
        */
       const detail = `启动恢复失败，已停止自动重试，需要人工处理：${result.error ?? '未知错误'}`;
-      traders.setStatus(trader.id, 'error', detail);
+      this.setTraderStatus(trader.id, 'error', detail);
       runtimeLogs.write(trader.id, 'error', 'manager', detail);
       eventBus.publish({
         type: 'log',
@@ -1814,7 +3583,233 @@ export class TraderManager {
       });
       log.error(`机器人「${trader.name}」恢复失败并已放弃重试：${result.error}`);
     }
+
+    /* 开机恢复完成后启动自检循环（用户需求 #6 的"持续观察"）。 */
+    this.startSelfCheckLoop();
   }
+
+  /**
+   * **自检的定时循环**（用户需求 #6 的"持续观察"）。
+   *
+   * ## 为什么必须定时，不能只靠手动触发
+   *
+   * 用户的原话：
+   *
+   * > 「你迭代更新系统得搞智能体团队**持续观察、测试**……
+   * >  **不要有任何 BUG，也不要老让我来测试和发现问题，你要自己发现问题自己解决**」
+   *
+   * 手动触发（`POST /api/traders/:id/selfcheck`）只在**我想起来的时候**跑 ——
+   * 那不叫持续观察。而这个系统的运行方式是 7×24 无人值守，
+   * 问题最可能在**没人看的时候**发生。
+   *
+   * ## 为什么是 30 分钟
+   *
+   * 判据是"多久能发现"与"噪音"的权衡：
+   *   · 太密（如 1 分钟）→ 日志里全是"未发现异常"，真问题被淹没；
+   *   · 太疏（如 6 小时）→ 裸奔仓位可能挂几个小时没人知道。
+   *
+   * 30 分钟对**裸奔仓位**这类风险偏长，但那类风险另有更快的兜底
+   *（启动对账会补挂保护单）。自检在这里的角色是**兜底的第二层**，
+   * 不是唯一防线。
+   *
+   * ## 只跑确定性层
+   *
+   * 不调模型 —— 于是它**不花额度、不依赖网关**，可以无条件常开。
+   * AI 层将来会挂在这个循环上（见 `runSelfCheck` 的 `ask` 参数）。
+   */
+  /**
+   * **构造自检的 AI 层**（用户需求 #6 里"AI 自检"的那一半）。
+   *
+   * ## 确定性层与 AI 层的分工
+   *
+   * | 层 | 抓什么 | 需要模型吗 |
+   * |---|---|---|
+   * | 确定性 | 裸奔仓位、连续失败、错误刷屏、实验积压 | **不需要** |
+   * | **AI（本方法）** | **把线索连起来** | 需要 |
+   *
+   * 确定性层只能发现"某一项越过了阈值"。而真实故障往往是**几条线索合起来**
+   * 才成立的，例如：
+   *
+   *   · 降级次数高 **+** 延迟升高 **+** 某个 provider 的错误集中
+   *     → **首选额度可能耗尽了**；
+   *   · 新闻材料为空 **+** 搜索端点 401
+   *     → **搜索密钥过期了**（而不是"市场没消息"）；
+   *   · 团队调用数少于角色数 **+** 某个阶段没有日志
+   *     → **某个角色静默失败了**。
+   *
+   * 这三条都是**我在过去几轮里人工发现的** —— 而用户明确要求
+   * 「不要老让我来测试和发现问题，**你要自己发现问题自己解决**」。
+   *
+   * ## 用 `system_engineer` 这个角色
+   *
+   * 它就是用户理想组织里的「**维护系统的程序员**」——
+   * 组织架构表里此前标着"规划中"，这个方法让它**真的在岗**。
+   *
+   * ## 用 T3（最强档）
+   *
+   * 自检要读日志与数字，而"把几条线索连起来"正是最需要判断力的活。
+   * 它每 30 分钟才跑一次 —— 成本可忽略（用户也说了不用考虑费用）。
+   *
+   * ## 拿不到网关时返回 `undefined`
+   *
+   * 于是自检**退回确定性层**（而不是整体失败）。这是刻意的：
+   * **网关挂掉的时候恰恰最需要自检**，那时更不该因为"AI 层不可用"而什么都不做。
+   */
+  private buildSelfCheckAsk(): ((prompt: string) => Promise<string>) | undefined {
+    let gateway;
+    try {
+      gateway = resolveTeamGateway(process.env);
+    } catch {
+      return undefined;
+    }
+    if (gateway === null) return undefined;
+
+    const router = new ModelRouter({
+      call: createMagpieCallFactory({
+        baseUrl: gateway.baseUrl,
+        apiKey: gateway.apiKey,
+        /*
+         * 自检用**比团队决策更短**的超时与更低的温度：
+         *   · 超时 120 秒 —— 它是后台任务，卡住不该拖过一个间隔；
+         *   · 温度 0.1 —— 这是"读证据下判断"，不是创意写作。
+         */
+        timeoutSeconds: SELF_CHECK_TIMEOUT_SECONDS,
+        maxRetries: 1,
+        temperature: 0.1,
+        pluginProvidersPath: process.env.MAGPIE_PLUGIN_PROVIDERS_PATH ?? null,
+      }),
+    });
+
+    return async (prompt: string): Promise<string> => {
+      const result = await router.callByTier(
+        tierForRole('system_engineer'),
+        [
+          {
+            role: 'system',
+            content:
+              '你是这套自动交易系统的「系统工程师」，负责**从运行证据里发现缺陷**。' +
+              '你的价值在于**把几条线索连起来**看出单一指标看不出的问题。' +
+              '⚠️ 只依据给出的证据，**不要猜测证据里没有的东西** —— ' +
+              '编造出的问题会让人去查一个不存在的地方，那比不报更糟。',
+          },
+          { role: 'user', content: prompt },
+        ],
+        { baseMaxTokens: 2_048 },
+      );
+      return result.text;
+    };
+  }
+
+  private startSelfCheckLoop(): void {
+    if (this.selfCheckTimer) return;
+    /*
+     * 间隔可由 `SELF_CHECK_INTERVAL_MINUTES` 覆盖（默认 30 分钟）。
+     *
+     * 为什么留这个口子：**自检的合适频率取决于部署形态**
+     *（机器人多、日志大时该稀疏些；排查期想密集些）。
+     * 而且它让"验证这个循环真的在跑"变得可行 ——
+     * 否则要等 30 分钟才能看到一次效果。
+     *
+     * 钳制在 1–1440 分钟：0 或负数会让 `setInterval` 疯狂空转。
+     */
+    const raw = Number(process.env.SELF_CHECK_INTERVAL_MINUTES ?? '');
+    const minutes = Number.isFinite(raw) && raw >= 1 ? Math.min(raw, 1440) : 30;
+
+    const timer = setInterval(() => {
+      void this.runSelfCheckSweep();
+    }, minutes * 60_000);
+    /*
+     * 不因为这个定时器把进程吊在退出前 —— 它是**可丢弃的**：
+     * 丢掉只是少跑一次自检，不是丢数据。
+     */
+    timer.unref();
+    this.selfCheckTimer = timer;
+    log.info(`自检循环已启动（每 ${minutes} 分钟一次）。`);
+  }
+
+  /** 给所有**在跑**的机器人各跑一次自检。 */
+  private async runSelfCheckSweep(): Promise<void> {
+    /* 上一遍还没跑完就跳过 —— 自检不该自己叠起来。 */
+    if (this.selfCheckSweepRunning) return;
+    this.selfCheckSweepRunning = true;
+    try {
+      /*
+       * ⚠️ **只查在跑的机器人**。
+       *
+       * 停掉的机器人"长时间没有成功决策"是**正常**的（操作员关了它），
+       * 查它只会产生噪音 —— 而噪音会让人开始忽略自检。
+       *（`selfcheck.ts` 里也有这道前提，两处都挡：这里省掉无谓的查询，
+       *  那里保证即使被调用也不会误报。）
+       */
+      const ids = [...this.running.keys()];
+      /*
+       * AI 层**只构造一次**（懒加载）—— 每次扫都新建一个路由器会丢掉
+       * `createMagpieCallFactory` 里的客户端缓存。
+       *
+       * 构造失败（网关读不到）时保持 `undefined`，于是自检退回确定性层 ——
+       * 见 `buildSelfCheckAsk()` 的说明。
+       */
+      if (this.selfCheckAsk === undefined && !this.selfCheckAskTried) {
+        this.selfCheckAskTried = true;
+        this.selfCheckAsk = this.buildSelfCheckAsk();
+        if (this.selfCheckAsk !== undefined) {
+          log.info('自检的 AI 层已就绪（system_engineer 角色）。');
+        }
+      }
+
+      for (const id of ids) {
+        try {
+          const result = await runSelfCheck(id, this.selfCheckAsk === undefined ? {} : { ask: this.selfCheckAsk });
+          /*
+           * 只在**有非 info 的发现**时写一条汇总 —— 否则每 30 分钟一条
+           * "未发现异常"会把日志刷满。
+           */
+          const notable = result.deterministic.filter((f) => f.severity !== 'info');
+          if (notable.length > 0) {
+            log.warn(
+              `自检 #${id}：${notable.length} 项需要注意 —— ${notable.map((f) => f.title).join('；')}`,
+            );
+          }
+        } catch (error) {
+          /* 一个机器人自检失败不该影响其它机器人。 */
+          log.warn(`自检 #${id} 失败：${(error as Error).message}`);
+        }
+      }
+    } finally {
+      this.selfCheckSweepRunning = false;
+    }
+  }
+
+  /**
+   * **自检循环的定时器**（见 `startSelfCheckLoop()`）。
+   *
+   * `null` = 循环没在跑。用 `unref()` 挂上，所以它**不会**把进程吊在退出前。
+   */
+  private selfCheckTimer: NodeJS.Timeout | null = null;
+
+  /**
+   * 上一遍自检扫过还没结束 —— 用它防止**自检自己叠起来**。
+   *
+   * 扫一遍要给每个在跑的机器人查日志、决策记录、持仓，最坏情况可能超过
+   * 一个间隔（例如机器人很多、日志表很大）。叠起来只会让负载雪上加霜。
+   */
+  private selfCheckSweepRunning = false;
+
+  /**
+   * 自检的 AI 层（懒构造一次，见 `buildSelfCheckAsk()`）。
+   *
+   * `undefined` = 网关不可用 → 自检只用确定性层。
+   */
+  private selfCheckAsk: ((prompt: string) => Promise<string>) | undefined;
+
+  /**
+   * 是否已经**尝试过**构造 AI 层。
+   *
+   * ⚠️ 必须与 `selfCheckAsk` 分开记 —— 否则"构造失败"（`undefined`）
+   * 会让下一次扫描再试一遍，形成"每 30 分钟重试一次"的隐性循环。
+   * 而网关不可用是**持续性**状态，重试没有意义（它自己恢复时会重启进程）。
+   */
+  private selfCheckAskTried = false;
 
   /**
    * 处于 `error` 且**没有**在运行的机器人 —— 也就是"自动恢复已经放弃"的那一批。

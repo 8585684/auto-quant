@@ -9,6 +9,7 @@ import {
   type TimeframeIndicators,
 } from '@aq/shared';
 import type { BinanceMarketData } from '../binance/market.js';
+import type { FunnelCandidate } from './funnel.js';
 import type { SymbolRegistry } from '../binance/symbols.js';
 import { normalizeSymbol } from '../binance/symbols.js';
 import type { BinancePremiumIndex, BinanceTicker24h } from '../binance/types.js';
@@ -396,6 +397,49 @@ export class MarketDataService {
    * Returns symbols ordered by the requested ranking, filtered by turnover and
    * open interest so the model never wastes attention on illiquid contracts.
    */
+  /**
+   * **全量候选行**（不排序、不截断）—— 给**分层漏斗**用。
+   *
+   * ## 为什么需要它（而不是复用 `screenUniverse`）
+   *
+   * `screenUniverse` 做的是"**一层**排序 + 截断"，而漏斗要的是
+   * "**先拿到全市场**，然后按自己的多层规则逐层收敛"。
+   *
+   * 两者不能互相替代：
+   *
+   * | | screenUniverse | 本方法 |
+   * |---|---|---|
+   * | 返回 | `string[]`（已排序、已截断）| **完整行**（含数值，供漏斗判断）|
+   * | 阈值 | 调用方给 | **不设** —— 由漏斗的每一层决定 |
+   * | 排序 | 有 | **无** —— 由漏斗的每一层决定 |
+   *
+   * ⚠️ 若复用 `screenUniverse`，那它的 `minQuoteVolume24h` 会**先砍掉一批**，
+   * 而漏斗的第一层**恰恰就是"流动性"** —— 那样漏斗就永远看不到被砍掉的那些，
+   * 于是"**每层淘汰了多少**"这个可解释性就没了（它会显示 0）。
+   *
+   * 走 `getUniverse(false)`（用缓存）：同一轮里 `screenUniverse` 可能已经拉过一次，
+   * **不重复强制刷新**（省一次全市场请求）。
+   */
+  async screenUniverseRows(): Promise<FunnelCandidate[]> {
+    const universe = await this.getUniverse(false);
+    const rows: FunnelCandidate[] = [];
+
+    for (const [symbol, ticker] of universe.tickers) {
+      if (!this.registry.get(symbol)) continue; // 不是可交易的 USDT-M 永续
+      const quoteVolume24h = Number(ticker.quoteVolume);
+      const changePercent24h = Number(ticker.priceChangePercent);
+      const high = Number(ticker.highPrice);
+      const low = Number(ticker.lowPrice);
+      rows.push({
+        symbol,
+        quoteVolume24h,
+        changePercent24h,
+        amplitudePercent: low > 0 && Number.isFinite(high) ? ((high - low) / low) * 100 : Number.NaN,
+      });
+    }
+    return rows;
+  }
+
   async screenUniverse(options: {
     rank: 'quote_volume' | 'gainers' | 'losers' | 'volatility' | 'funding_extreme';
     limit: number;

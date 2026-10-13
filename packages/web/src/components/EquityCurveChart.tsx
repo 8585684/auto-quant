@@ -21,26 +21,23 @@
 import { Area, AreaChart, CartesianGrid, ReferenceLine, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts';
 import { fmtTime } from '../lib/format';
 import { axisTicks, equityAxisFormatter, HOURLY_AXIS_MAX_MS, rangeSpanMs, type EquityPoint } from './equityCurve';
-
-/* -------------------------------------------------------------------------- */
-/*  Palette                                                                    */
-/* -------------------------------------------------------------------------- */
+import { useChartInk } from './useChartInk';
 
 /*
- * SVG `stroke` / `fill` attributes cannot take a Tailwind class, so these are
- * hex literals — the one place in the app where a raw colour is unavoidable.
- * They are kept **identical to the design tokens** in tailwind.config.js
- * (`up`, `down`, `base-750`, `ink-lo`, `base-950`, `base-850`, `accent`) and to
- * the values in `CandlestickChart.tsx`, so the curve, the candles and every
- * chip on the page agree. If a token changes, these five lines change with it.
+ * ⚠️ **这里不再有一份本地的调色板。**
+ *
+ * 原来这个文件里写着 `UP = '#2ed3a3'` / `ACCENT = '#5b8def'` 等七个字面量，
+ * 而 `DashboardCharts.tsx` 与 `CandlestickChart.tsx` 用的是
+ * `equityCurve.CHART_INK` —— **两套值，而且已经漂移了**（这里还是旧的
+ * 青绿 + 琥珀，那边已经是币安的绿红；主色这边是蓝、那边是紫）。
+ *
+ * 后果是：同一个账户的权益曲线，在总览页是青绿、在机器人详情页是另一种绿，
+ * 而两边看起来都"正常"。所以现在统一走 `useChartInk()`：它按**当前模板**
+ * 与深浅从 CSS 变量读，并在外观切换时重新读（见那个 hook 的注释）。
+ *
+ * 这也顺带解决了模板问题：两套模板的 `--aq-up` / `--aq-accent` 是不同的色，
+ * 而写死的字面量**不会**跟着变 —— 换模板后整页都换了，只剩这条曲线还是旧的。
  */
-const UP = '#2ed3a3';
-const DOWN = '#ff6b7a';
-const GRID = '#232a38';
-const AXIS = '#76839a';
-const BASELINE = '#3a4558';
-const TOOLTIP_BG = '#11151e';
-const ACCENT = '#5b8def';
 
 /** Two decimals in the tooltip: an axis label is a scale, not a number to act on. */
 const TOOLTIP_DIGITS = 2;
@@ -63,13 +60,22 @@ interface TooltipRow {
  * `contentStyle={{...}}` can only reach the wrapper — the inner rows stay
  * white-on-white.
  */
-function TooltipPanel({ rows, footer }: { rows: TooltipRow[]; footer: string }) {
+function TooltipPanel({
+  rows,
+  footer,
+  surface,
+}: {
+  rows: TooltipRow[];
+  footer: string;
+  /** 提示框底色 = 当前外观下的 `base-900`（不透明，免得曲线从数字后面透出来）。 */
+  surface: string;
+}) {
   return (
     <div
       /* border rather than only `shadow-overlay`: over the filled area a shadow
          alone is nearly invisible on a dark background. */
       className="pointer-events-none min-w-[10rem] rounded-md border border-base-600 px-2.5 py-1.5 shadow-overlay"
-      style={{ backgroundColor: TOOLTIP_BG }}
+      style={{ backgroundColor: surface }}
     >
       {rows.map((row) => (
         <div key={row.label} className="flex items-baseline justify-between gap-3">
@@ -87,6 +93,8 @@ interface TooltipOptions {
   primaryLabel: string;
   primaryValue: (point: EquityPoint) => string;
   primaryTone?: (point: EquityPoint) => string;
+  /** 当前外观的提示框底色（`ink.surface`），由调用方透传进来。 */
+  surface: string;
   extra?: (point: EquityPoint) => TooltipRow | null;
 }
 
@@ -106,7 +114,13 @@ function buildTooltip(options: TooltipOptions) {
     ];
     const extra = options.extra?.(point);
     if (extra) rows.push(extra);
-    return <TooltipPanel rows={rows} footer={new Date(point.t).toLocaleString('en-GB', { hour12: false })} />;
+    return (
+      <TooltipPanel
+        rows={rows}
+        footer={new Date(point.t).toLocaleString('en-GB', { hour12: false })}
+        surface={options.surface}
+      />
+    );
   };
 }
 
@@ -116,10 +130,10 @@ function buildTooltip(options: TooltipOptions) {
  * The default is a wide translucent grey band; over a dark chart that reads as a
  * smudge across the curve rather than as a pointer at one snapshot.
  */
-function Cursor({ points }: { points?: Array<{ x?: number; y?: number }> }) {
+function Cursor({ points, color }: { points?: Array<{ x?: number; y?: number }>; color: string }) {
   const x = points?.[0]?.x;
   if (typeof x !== 'number') return null;
-  return <line x1={x} x2={x} y1={0} y2="100%" stroke={BASELINE} strokeWidth={1} />;
+  return <line x1={x} x2={x} y1={0} y2="100%" stroke={color} strokeWidth={1} />;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -152,6 +166,8 @@ export function EquityCurveChart({
   primaryDigits = TOOLTIP_DIGITS,
   showUnrealized = false,
 }: EquityCurveChartProps) {
+  /* 当前外观（模板 + 深浅）下的图表配色，切的时候重绘。 */
+  const ink = useChartInk();
   const values = points.map((point) => point.equity);
 
   /*
@@ -174,7 +190,7 @@ export function EquityCurveChart({
   const last = finite[finite.length - 1] ?? 0;
   const rising = last >= first;
 
-  const stroke = rising ? UP : DOWN;
+  const stroke = rising ? ink.up : ink.down;
 
   /*
    * Y 轴的最小留白，而不是纯百分比留白。
@@ -219,6 +235,7 @@ export function EquityCurveChart({
     primaryLabel,
     primaryValue: (point) => `${equityAxisFormatter(point.equity)} USDT`,
     primaryTone: () => 'text-ink-hi',
+    surface: ink.surface,
     extra: showUnrealized
       ? (point) => ({
           label: '浮动盈亏',
@@ -242,7 +259,7 @@ export function EquityCurveChart({
 
         {/* Horizontal only: vertical grid lines land on top of the time axis
             labels and make a dense window look like a barcode. */}
-        <CartesianGrid stroke={GRID} strokeDasharray="3 3" vertical={false} />
+        <CartesianGrid stroke={ink.grid} strokeDasharray="3 3" vertical={false} />
 
         <XAxis
           dataKey="t"
@@ -251,16 +268,16 @@ export function EquityCurveChart({
           /* 刻度钉在真实整点/日界上，理由见 `equityCurve.axisTicks`。 */
           {...(ticks.length > 0 ? { ticks } : {})}
           tickFormatter={axisTick}
-          tick={{ fill: AXIS, fontSize: 11 }}
+          tick={{ fill: ink.axis, fontSize: 11 }}
           tickLine={false}
-          axisLine={{ stroke: GRID }}
+          axisLine={{ stroke: ink.grid }}
           minTickGap={44}
           tickMargin={6}
         />
         <YAxis
           domain={domain}
           tickFormatter={equityAxisFormatter}
-          tick={{ fill: AXIS, fontSize: 11 }}
+          tick={{ fill: ink.axis, fontSize: 11 }}
           tickLine={false}
           axisLine={false}
           width={62}
@@ -272,7 +289,7 @@ export function EquityCurveChart({
 
         <Tooltip
           content={<TooltipContent />}
-          cursor={<Cursor />}
+          cursor={<Cursor color={ink.rule} />}
           /* One point at a time: a band highlight over a single series just
              dims the curve the user is trying to read. */
           shared={false}
@@ -282,9 +299,9 @@ export function EquityCurveChart({
 
         <ReferenceLine
           y={reference}
-          stroke={BASELINE}
+          stroke={ink.rule}
           strokeDasharray="4 4"
-          label={{ value: '初始', fill: AXIS, fontSize: 10, position: 'insideTopRight' }}
+          label={{ value: '初始', fill: ink.axis, fontSize: 10, position: 'insideTopRight' }}
           ifOverflow="extendDomain"
         />
 
@@ -299,7 +316,7 @@ export function EquityCurveChart({
              re-draws itself from scratch on every refresh flickers badly in
              peripheral vision — which is exactly where a trading terminal lives. */
           isAnimationActive={false}
-          activeDot={{ r: 3, fill: stroke, stroke: TOOLTIP_BG, strokeWidth: 2 }}
+          activeDot={{ r: 3, fill: stroke, stroke: ink.surface, strokeWidth: 2 }}
         />
       </AreaChart>
     </ResponsiveContainer>

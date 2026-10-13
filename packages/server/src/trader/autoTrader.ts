@@ -633,8 +633,234 @@ const MARKET_DATA_UNAVAILABLE_MESSAGE =
  *   8. execute closes, then opens
  *   9. persist the decision, the orders, the trades and an equity point
  */
+
+/**
+ * **事件驱动唤醒**的目标延迟 —— 收到重要事件后大约多久重新评估。
+ *
+ * 45 秒而不是"立刻"：成交推送会在几秒内来好几帧（部分成交、保护单触发、
+ * 仓位更新），而**账本要先对齐**（`manager.scheduleFillReconcile` 有 5 秒防抖）。
+ * 给一点时间让状态稳定，再让团队看 —— 否则它会基于"半更新的账本"做判断。
+ */
+const EARLY_WAKE_DELAY_MS = 45_000;
+
+/**
+ * 两次事件驱动唤醒之间的**最小间隔**。
+ *
+ * ⚠️ 这是防死循环的闸门，不是性能优化。
+ *
+ * 调研里 MAST 分类法的实测数据：**步骤重复占 15.7%**。
+ * 而"成交 → 唤醒 → 决策 → 又成交 → 又唤醒"正是最典型的重复形状。
+ * 3 分钟意味着：即使行情剧烈到连续成交，团队最多每 3 分钟重新评估一次，
+ * 而**不会**陷入"刚决策完又被唤醒"的紧循环。
+ */
+const EARLY_WAKE_MIN_GAP_MS = 3 * 60_000;
+
+/**
+ * **进程关闭时**等一轮跑完的上限（毫秒）。
+ *
+ * ## 为什么比"操作员点停止"的 60 秒长得多
+ *
+ * 两种意图的等待成本完全不同（见 `stop()` 里的说明）：
+ *
+ * | 场景 | 谁在等 | 上限 |
+ * |---|---|---|
+ * | 操作员点停止 | **人**在屏幕前等 | 60 秒（再长就是"点了没反应"）|
+ * | 部署 / 进程关闭 | **没人**在等 | 3 分钟（一轮实测 1–5 分钟）|
+ *
+ * ## 为什么是 3 分钟
+ *
+ * 实测一轮团队决策 1–5 分钟（见设计文档的性能记录），而**大部分轮次在 1 分钟内**。
+ * 3 分钟覆盖了绝大多数轮次，同时把最坏情况（卡住的轮次）限制在部署脚本
+ * 能接受的范围里。
+ *
+ * ⚠️ **这个值要与 systemd 的 `TimeoutStopSec` 匹配** —— 如果 systemd 在 90 秒时
+ * 就 SIGKILL，那这里写 3 分钟也不会真的等到。deploy 脚本会设置它。
+ */
+const SHUTDOWN_DRAIN_TIMEOUT_MS = 3 * 60_000;
+
+/**
+ * **该不该因为一个事件提前唤醒** —— 纯函数，四条闸门都在这里。
+ *
+ * ## 为什么抽成纯函数
+ *
+ * 这四条闸门全是**防死循环**的（MAST 实测：步骤重复占 15.7%），
+ * 而它们嵌在一个需要真实数据库、交易所、模型的类里**几乎没法测**。
+ * 抽出来之后每一条都能被单独钉住 —— 而"少一条闸门"的后果是
+ * **机器人自己把自己唤醒到死循环**，那是灾难性的。
+ *
+ * @param input.mode          机器人模式（只有 `ai_team` 开启）
+ * @param input.running       是否在跑
+ * @param input.cycleInFlight 是否有一轮正在执行
+ * @param input.nextCycleAt   原定下一次的时刻（`null` = 没有排期）
+ * @param input.lastEarlyWakeAt 上次唤醒生效的时刻（`null` = 从未）
+ * @param input.now           当前时刻（注入，便于测试）
+ */
+export function shouldEarlyWake(input: {
+  mode: string;
+  running: boolean;
+  cycleInFlight: boolean;
+  nextCycleAt: number | null;
+  lastEarlyWakeAt: number | null;
+  now: number;
+}): { wake: boolean; reason: string } {
+  /* 闸门 0：没在跑 → 什么都不做。 */
+  if (!input.running) return { wake: false, reason: '机器人未在运行' };
+
+  /*
+   * 闸门 1：**只对 AI 团队模式**。
+   *
+   * 用户硬约束：「你现在的更新迭代**不要影响我现在实盘跑的机器人**：赚大钱」
+   *（`#10` 是 `ai_managed`）。对它在成交后插一次额外决策会**改变它的行为** ——
+   * 那正是用户说不要的。
+   */
+  if (input.mode !== 'ai_team') return { wake: false, reason: '只有 AI 团队模式使用事件驱动唤醒' };
+
+  /* 闸门 2：正在跑一轮 → 让它跑完（它本来就会重新评估）。 */
+  if (input.cycleInFlight) return { wake: false, reason: '上一轮仍在执行' };
+
+  /* 闸门 3：**最小间隔** —— 防"成交 → 唤醒 → 决策 → 成交"的紧循环。 */
+  if (
+    input.lastEarlyWakeAt !== null &&
+    input.now - input.lastEarlyWakeAt < EARLY_WAKE_MIN_GAP_MS
+  ) {
+    return { wake: false, reason: '距上次唤醒太近（防死循环）' };
+  }
+
+  /*
+   * 闸门 4：**只提前不推后** —— 已经排在更早的时刻就不动它。
+   *
+   * ⚠️ `nextCycleAt === null` 是**唤醒**而不是挡下（实测时被这条测试抓到）。
+   *
+   * `null` 的含义是"**当前没有下一次排期**"（`scheduleNextCycle` 排出定时器时写它，
+   * 定时器触发时清它）。而"没有排期"意味着**没有任何人会来看这个账户** ——
+   * 那时候收到成交事件，最该做的是**叫醒它**，而不是按"快到了"挡掉。
+   *
+   * 第一版写成 `null → remaining = 0 → 挡下`，方向正好反了。
+   */
+  if (input.nextCycleAt !== null && input.nextCycleAt - input.now <= EARLY_WAKE_DELAY_MS) {
+    return { wake: false, reason: '原定周期本来就快到了' };
+  }
+
+  return { wake: true, reason: 'ok' };
+}
+
+/**
+ * **持仓剧变的触发阈值**（百分比，2026-10-13）。
+ *
+ * ## 为什么是 3%
+ *
+ * 它必须同时满足两个约束：
+ * ```
+ *   ① 明显大于正常的分钟级波动 —— 否则震荡市里天天触发（那不是信号）；
+ *   ② 小于"一个值得重新评估"的幅度 —— 否则错过机会。
+ * ```
+ * 3% 是这两个约束的**保守交集**。
+ *
+ * ⚠️ 可由 `AQ_SHARP_MOVE_PERCENT` 覆盖 ——
+ * "多大的波动值得看一眼"取决于标的与周期，硬编码一个值不合适。
+ */
+const SHARP_MOVE_THRESHOLD_PERCENT = 3;
+
+/**
+ * **行情剧变检测**（2026-10-13 加）—— "持续工作"缺的最后一块。
+ *
+ * ## 之前缺的是什么
+ *
+ * 已有的提前唤醒只有**一个**触发源：
+ * ```
+ *   manager.ts   autoTrader.requestEarlyCycle('有成交')
+ * ```
+ * 也就是说：**只有在【成交】之后**团队才会提前醒来。
+ *
+ * 而真正需要"立刻看一眼"的情形里，**大多数没有成交**：
+ * ```
+ *   · 持仓标的突然拉升 8% —— 该考虑止盈/移动止损，但没成交就不唤醒
+ *   · 大盘急跌 —— 该考虑减仓，但没成交就不唤醒
+ *   · 一个候选突破 —— 该考虑开仓，但没成交就不唤醒
+ * ```
+ * 于是团队**只能等到下一个周期**（最长 120 分钟）。
+ *
+ * ## 判据：**相对基准价的变动幅度**
+ *
+ * 用"上次评估时的价格"作基准，而不是"前一分钟价格"——
+ * 后者会在震荡市里疯狂触发（1 分钟的噪音不是信号）。
+ *
+ * ⚠️ **必须配一道冷却期**（调用方负责）：行情单边时价格会**持续**偏离基准，
+ * 若只看幅度，每轮都会触发 —— 而那是"同一件事重复唤醒"。
+ *
+ * @param input.moves     各标的相对基准价的百分比变动
+ * @param input.threshold 触发阈值（百分比，取绝对值）
+ * @returns 触发原因（`null` = 不触发）
+ */
+export function detectSharpMove(input: {
+  moves: ReadonlyArray<{ symbol: string; changePercent: number }>;
+  threshold: number;
+}): string | null {
+  const hits = input.moves
+    .filter((m) => Number.isFinite(m.changePercent) && Math.abs(m.changePercent) >= input.threshold)
+    .sort((a, b) => Math.abs(b.changePercent) - Math.abs(a.changePercent));
+  if (hits.length === 0) return null;
+  const top = hits[0]!;
+  const dir = top.changePercent > 0 ? '涨' : '跌';
+  const more = hits.length > 1 ? `（另有 ${hits.length - 1} 个标的同向剧变）` : '';
+  return `${top.symbol} ${dir} ${Math.abs(top.changePercent).toFixed(2)}%${more}`;
+}
+
+/**
+ * **安全解析 `positions.intel_keys`**（2026-10-12）。
+ *
+ * ## 为什么不能直接 `JSON.parse`
+ *
+ * 这个字段来自 DB，而 DB 里的内容**可能不是合法 JSON**：
+ * · 老行（M17 之前）默认 `'[]'` —— 那个没问题；
+ * · 但如果将来有人手改过、或某次写入被截断，`JSON.parse` 会**抛错**，
+ *   而它发生在**平仓路径**上 —— 一笔正常的平仓会因为一个附属字段而失败。
+ *
+ * **附属的统计字段绝不该让主流程失败。**
+ *
+ * ## 为什么坏值降级成 `[]`（而不是跳过这笔成交）
+ *
+ * `[]` 的语义是"**纯技术面成交**" —— 那是**保守且安全**的降级：
+ * 最坏结果是"这笔成交没被计入某个消息面信号的统计"，
+ * 而不是"这笔成交没被记账"。
+ */
+function parseIntelKeysOf(raw: string | null | undefined): string[] {
+  if (raw === null || raw === undefined || raw.length === 0) return [];
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((k): k is string => typeof k === 'string' && k.length > 0);
+  } catch {
+    return [];
+  }
+}
 export class AutoTrader {
   private timer: NodeJS.Timeout | null = null;
+  /**
+   * **持仓剧变监控的定时器**（2026-10-13 加）。
+   *
+   * 与 `timer`（决策循环）**完全分开** —— 它的职责只有一个：
+   * 每隔一段时间问一次"我手上的仓位是不是发生了值得重新评估的变化"，
+   * 是就调 `requestEarlyCycle()` 把决策循环提前叫醒。
+   *
+   * ## 为什么必须是独立循环
+   *
+   * 决策循环的间隔**由模型自己定**（1–120 分钟）。而"持仓突然跌了 8%"
+   * 这件事**不等模型排期** —— 它可能发生在刚排完 120 分钟之后。
+   * 若等下一轮才发现，**止损可能已经被打掉了，而团队还在按"持有"思考**。
+   *
+   * ⚠️ 它**只在 `ai_team` 模式启动**（见 `startMoveWatch`）——
+   * 用户硬约束：不能改变现有实盘机器人（`#10 赚大钱` 是 `ai_managed`）。
+   */
+  private moveWatchTimer: NodeJS.Timeout | null = null;
+  /**
+   * **各标的的基准价**（`symbol → 价格`）—— 上次评估时记下的。
+   *
+   * ⚠️ 基准要"跟着评估走"，而不是"跟着时间走"：
+   * 用"1 分钟前的价格"做基准会在震荡市里疯狂触发，
+   * 而**1 分钟的噪音不是要重新评估的理由**。
+   */
+  private moveBaseline = new Map<string, number>();
   private running = false;
   /**
    * 模型这一轮要求的"下次什么时候再看盘"（分钟）。
@@ -647,6 +873,16 @@ export class AutoTrader {
    */
   private requestedNextCheckMinutes: number | undefined;
   private cycleInFlight = false;
+  /**
+   * 上一次**事件驱动唤醒**真的生效的时刻。
+   *
+   * ⚠️ 只在"真的重排了"时才更新 —— 否则被忽略的请求会不断刷新这个时间戳，
+   * 把后续真正的唤醒也一起挡掉（那会表现为"偶尔不唤醒"，很难查）。
+   *
+   * 作用见 `requestEarlyCycle()` 的第一道闸：防"成交 → 唤醒 → 决策 → 成交"
+   * 这种紧循环（MAST 实测：步骤重复占 15.7%）。
+   */
+  private lastEarlyWakeAt: number | null = null;
   /**
    * 当前那一轮的 `AbortController`。
    *
@@ -781,8 +1017,7 @@ export class AutoTrader {
      * 在这里算一次而不是每轮算：`aiModelId` 是机器人的属性，运行期不会变。
      */
     const modelLimit = aiModels.get(deps.trader.aiModelId)?.inputTokenLimit ?? 0;
-    this.promptBudget = promptTokenBudget(modelLimit);
-  }
+    this.promptBudget = promptTokenBudget(modelLimit);  }
 
   /**
    * 这一轮组装提示词用的 token 预算（见构造函数里的说明）。
@@ -874,9 +1109,82 @@ export class AutoTrader {
     this.setStatus('running', null);
     this.emit('info', `机器人「${this.deps.trader.name}」已启动`);
 
-    // Run the first cycle immediately so the operator is not left waiting.
-    void this.tick();
-    this.scheduleNextCycle();
+    /*
+     * ── 首次决策：**看上次决策过了多久**，而不是无条件立刻跑 ──────────────
+     *
+     * ## 用户报的问题（2026-10-12）
+     *
+     * > 「你改代码的时候（提交更新部署代码到服务器后，服务器会重启对吧，
+     * >  这时候运行中的机器人会被停止-启动，导致**决策周期刷新**……
+     * >  就例如我运行中的赚大钱，**这一分钟才运行了 AI 分析，你下一分钟更新了程序，
+     * >  机器人会被重新启动又马上进行分析**，你自己看着修，
+     * >  不要为了机器人正常而影响你更新，**应该是两全其美**」
+     *
+     * ## 原来的写法为什么错
+     *
+     * 原来这里是无条件的：
+     *
+     *     void this.tick();            // ← 每次启动都立刻跑一轮
+     *     this.scheduleNextCycle();
+     *
+     * 那句注释写的是「Run the first cycle immediately so the operator is not left waiting」
+     * —— 对**操作员手动点启动**是对的（他想马上看到结果），
+     * 但对**部署重启**是错的：机器人一分钟前刚跑完，重启后又跑一轮。
+     *
+     * 后果不只是"多花一次 AI 调用"：**决策周期被打乱**（AI 可能说"5 分钟后再看"，
+     * 却被重启打断），而且每次部署都这样，累积起来就是"一直在重复分析同一段行情"。
+     *
+     * ## 修法：按 `lastCycleAt` 算剩余时间
+     *
+     * · **从没跑过**（`lastCycleAt` 为空）→ 立刻跑（首次启动，操作员在等）；
+     * · **距上次不足一个周期** → 只排定时器等**剩余**时间（不重复分析）；
+     * · **已超过一个周期**（停机很久）→ 立刻跑（行情已经变了，该看新的）。
+     *
+     * ⚠️ 这才叫"两全其美"：**操作员手动启动仍立刻看到结果**（新机器人或停机已久），
+     * 而**部署重启不会打断正在跑的节奏**。
+     *
+     * ## 为什么用 `lastCycleAt` 而不是"进程内是否跑过"
+     *
+     * `lastCycleAt` 是**落库的**（`traders.last_cycle_at`），所以它跨重启有效 ——
+     * 而"进程内标记"在重启后就丢了，等于没修。
+     */
+    const lastCycleAtMs = this.deps.trader.lastCycleAt
+      ? new Date(this.deps.trader.lastCycleAt).getTime()
+      : null;
+    const cycleMs = Math.max(1, this.deps.trader.cycleIntervalMinutes) * 60_000;
+    const elapsedMs = lastCycleAtMs === null ? Number.POSITIVE_INFINITY : Date.now() - lastCycleAtMs;
+
+    /*
+     * **持仓剧变监控**（2026-10-13 加）—— 见 `moveWatchTimer` 的说明。
+     * 只对 `ai_team` 启动（用户硬约束：不改现有实盘机器人的行为）。
+     */
+    void this.startMoveWatch();
+
+    if (elapsedMs >= cycleMs) {
+      /* 从没跑过，或者停机超过一个周期 —— 立刻跑（操作员在等 / 行情已变）。 */
+      void this.tick();
+      this.scheduleNextCycle();
+    } else {
+      /*
+       * 距上次不足一个周期 —— **只等剩余时间**，不重复分析。
+       *
+       * 日志要说清"为什么没有立刻跑"，否则操作员会以为启动卡住了
+       *（这正是原来那句注释想避免的体验问题）。
+       */
+      const waitMs = cycleMs - elapsedMs;
+      this.emit(
+        'info',
+        `距上次决策仅 ${Math.max(0, Math.floor(elapsedMs / 60_000))} 分钟（周期 ${this.deps.trader.cycleIntervalMinutes} 分钟）` +
+          ` —— 不重复分析，约 ${Math.ceil(waitMs / 60_000)} 分钟后进行下一轮。`,
+      );
+      this.nextCycleAt = Date.now() + waitMs;
+      this.timer = setTimeout(() => {
+        this.timer = null;
+        this.nextCycleAt = null;
+        void this.tick();
+        this.scheduleNextCycle();
+      }, waitMs);
+    }
   }
 
   /**
@@ -981,6 +1289,207 @@ export class AutoTrader {
       void this.tick();
     }, delayMs);
   }
+
+
+  /**
+   * **事件驱动的提前唤醒** —— 让"不等定时"这件事真正落地。
+   * ## 用户的要求（这是本方法存在的理由）
+   *
+   * > 「系统**不再是像现在这样定时去工作**，而是持续、并发的工作，增加盈利的可能」
+   * > 「举例子：总管委派子代理去做市场调研……然后做相应的动作
+   * >  （**开仓、平仓、调仓**等等）」
+   *
+   * ## 缺的到底是哪一块
+   *
+   * 系统已经有两者：
+   *   · **AI 可以要求"下次什么时候再看"**（1–120 分钟，见 `cycleSchedule.ts`）；
+   *   · **成交后立刻对齐账本**（`manager.scheduleFillReconcile`）。
+   *
+   * 但没有的是：**成交（尤其是止损被打掉）之后，决策循环并不知道**。
+   * 账本已经对了，而团队要等到下一个周期（最长 120 分钟）才重新评估。
+   * 那意味着：**仓位已经没了，团队还在按"持有"思考。**
+   *
+   * ## 为什么只对 `ai_team` 开启（刻意的边界）
+   *
+   * 用户有一条硬约束：
+   *
+   * > 「你现在的更新迭代**不要影响我现在实盘跑的机器人**：赚大钱」
+   *
+   * `#10 赚大钱` 是 `ai_managed`。对它在成交后插一次额外决策**会改变它的行为**
+   *（多一次模型调用、可能多一次调仓判断）—— 而那正是用户说不要的。
+   *
+   * 所以门开在**新模式**上：`ai_team` 拿到事件驱动，现有模式的行为**逐字节不变**。
+   * 等新模式的这套机制在真实盘上验证够了，再考虑是否推广。
+   *
+   * ## 防死循环（这是必须的，不是可选的）
+   *
+   * 调研里 MAST 分类法的实测数据：**步骤重复占 15.7%**。
+   * 而"成交 → 唤醒 → 决策 → 又成交 → 又唤醒"正是最典型的重复形状。
+   * 三道闸：
+   *
+   *   ① **最小间隔** `EARLY_WAKE_MIN_GAP_MS` —— 上一次唤醒太近就不理；
+   *   ② **只提前不推后** —— 已经排在更早的时刻时什么都不做；
+   *   ③ **在飞轮次不打断** —— `cycleInFlight` 时不重排（否则会把正在跑的轮次切碎）。
+   */
+  requestEarlyCycle(reason: string): void {
+    /*
+     * 读数据库而不是内存里的快照 —— **模式是可以被操作员改的**，
+     * 而"改完模式之后事件驱动还按旧模式跑"会是一个很难查的偏差。
+     */
+    let mode: string = this.deps.trader.mode;
+    try {
+      const fresh = traderStore.get(this.deps.trader.id);
+      if (fresh) mode = fresh.mode;
+    } catch {
+      /* 读失败就用启动时那份 */
+    }
+
+    const verdict = shouldEarlyWake({
+      mode,
+      running: this.running,
+      cycleInFlight: this.cycleInFlight,
+      nextCycleAt: this.nextCycleAt,
+      lastEarlyWakeAt: this.lastEarlyWakeAt,
+      now: Date.now(),
+    });
+    if (!verdict.wake) {
+      /*
+       * 被挡下时**不写日志** —— 这条路径在行情剧烈时会被频繁触发，
+       * 每次都写会把自己的日志刷掉（而"闸门挡下了"本身不是异常）。
+       */
+      return;
+    }
+
+    this.lastEarlyWakeAt = Date.now();
+    this.emit('info', `收到重要事件（${reason}）—— 提前重新评估，不等原定周期`);
+    /*
+     * `requestedMinutes` 传 1（`MIN_NEXT_CHECK_MINUTES` 的下界）——
+     * 走同一个调度入口，于是"界面倒计时""AI 请求优先"这些行为都一致。
+     */
+    this.scheduleNextCycle(false, 1);
+  }
+
+  /**
+   * **启动持仓剧变监控**（2026-10-13 加）—— "持续工作"缺的最后一块。
+   *
+   * ## 为什么需要它（与 `requestEarlyCycle` 的分工）
+   *
+   * 已有的提前唤醒只有一个触发源：**成交**。而真正需要"立刻看一眼"的情形里，
+   * **大多数没有成交**：
+   * ```
+   *   · 持仓标的突然拉升 8% —— 该考虑止盈/移动止损，但没成交就不唤醒
+   *   · 大盘急跌 —— 该考虑减仓，但没成交就不唤醒
+   * ```
+   * 于是团队**只能等到下一个周期**（最长 120 分钟）——
+   * 而**止损可能已经被打掉了，团队还在按"持有"思考**。
+   *
+   * ## 边界（刻意收窄，理由都是实测）
+   *
+   * · **只对 `ai_team`** —— 用户硬约束：不改现有实盘机器人（`#10` 是 `ai_managed`）；
+   * · **只看【已持仓】的标的** —— 请求数有界（持仓数通常 0–3），
+   *   而不是"扫描 500 个候选"（那会变成另一个行情轮询器）；
+   * · **基准价跟着【评估】走，不跟着时间走** —— 见 `moveBaseline` 的说明。
+   *
+   * ⚠️ 间隔可用 `AQ_MOVE_WATCH_SECONDS` 覆盖（默认 60 秒）——
+   * 留这个口子是为了**能验证它真的在跑**（否则要等一分钟才看到一次效果）。
+   */
+  private async startMoveWatch(): Promise<void> {
+    if (this.moveWatchTimer !== null) return;
+    /* 只对 AI 团队模式 —— 见上面"边界"。 */
+    let mode: string = this.deps.trader.mode;
+    try {
+      const fresh = traderStore.get(this.deps.trader.id);
+      if (fresh) mode = fresh.mode;
+    } catch {
+      /* 读失败就用启动时那份 */
+    }
+    if (mode !== 'ai_team') return;
+
+    const raw = Number(process.env.AQ_MOVE_WATCH_SECONDS ?? '');
+    const seconds = Number.isFinite(raw) && raw >= 10 ? Math.min(raw, 3600) : 60;
+
+    const timer = setInterval(() => {
+      void this.checkPositionMoves();
+    }, seconds * 1000);
+    /* 不因为这个定时器把进程吊住 —— 它是可丢弃的。 */
+    timer.unref();
+    this.moveWatchTimer = timer;
+    this.emit('info', `持仓剧变监控已启动（每 ${seconds} 秒检查一次，只在 AI 团队模式）。`);
+  }
+
+  /** 停止监控（`stop()` 时调用）。 */
+  private stopMoveWatch(): void {
+    if (this.moveWatchTimer !== null) {
+      clearInterval(this.moveWatchTimer);
+      this.moveWatchTimer = null;
+    }
+    this.moveBaseline.clear();
+  }
+
+  /**
+   * **检查一次持仓剧变** —— 有的话把决策循环提前叫醒。
+   *
+   * ⚠️ **不抛错**：这是一个后台监控，它失败不该影响任何东西
+   *（下一轮决策仍会照常评估）。
+   */
+  private async checkPositionMoves(): Promise<void> {
+    try {
+      if (!this.running) return;
+      const traderId = this.deps.trader.id;
+      const open = positionStore.open(traderId);
+      if (open.length === 0) {
+        /* 没持仓就没有"持仓剧变"可言 —— 清掉基准，避免拿旧基准比对。 */
+        this.moveBaseline.clear();
+        return;
+      }
+
+      const moves: Array<{ symbol: string; changePercent: number }> = [];
+      for (const p of open) {
+        const price = await this.deps.broker.getMarkPrice(p.symbol).catch(() => 0);
+        if (!(price > 0)) continue;
+        const base = this.moveBaseline.get(p.symbol);
+        /*
+         * 第一次见到这个标的：只记基准，**不判断** ——
+         * 否则"刚开仓"会被误判成"剧变"（因为没有基准可比）。
+         */
+        if (base === undefined || !(base > 0)) {
+          this.moveBaseline.set(p.symbol, price);
+          continue;
+        }
+        moves.push({ symbol: p.symbol, changePercent: ((price - base) / base) * 100 });
+      }
+
+      const threshold = Number(process.env.AQ_SHARP_MOVE_PERCENT ?? '') || SHARP_MOVE_THRESHOLD_PERCENT;
+      const reason = detectSharpMove({ moves, threshold });
+      if (reason === null) return;
+
+      /*
+       * ⚠️ **触发后立刻重置基准** —— 否则价格持续偏离时会**反复触发**
+       *（那是"同一件事重复唤醒"，而 `EARLY_WAKE_MIN_GAP_MS` 只能挡住其中一部分）。
+       */
+      for (const m of moves) {
+        const price = await this.deps.broker.getMarkPrice(m.symbol).catch(() => 0);
+        if (price > 0) this.moveBaseline.set(m.symbol, price);
+      }
+      this.requestEarlyCycle(`持仓剧变：${reason}`);
+    } catch (error) {
+      /* 后台监控失败不该影响任何东西 —— 下一轮决策仍会照常评估。 */
+      this.emit('warn', `持仓剧变监控失败（不影响决策）：${(error as Error).message}`);
+    }
+  }
+
+  /**
+   * **记下这一轮各标的的价格作为剧变基准**（`tick` 成功拿到行情后调用）。
+   *
+   * ⚠️ 基准必须**跟着评估走** —— 那正是"重新评估过了，从现在开始算"的语义。
+   * 若基准不更新，一个持续偏离的价格会让监控每轮都触发。
+   */
+  private rememberMoveBaseline(snapshots: ReadonlyArray<{ symbol: string; price: number }>): void {
+    for (const s of snapshots) {
+      if (Number.isFinite(s.price) && s.price > 0) this.moveBaseline.set(s.symbol, s.price);
+    }
+  }
+
   /**
    * Stop the loop and **wait for the cycle already running** to finish.
    *
@@ -1012,7 +1521,60 @@ export class AutoTrader {
     this.running = false;
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
-    const drained = await this.waitForIdle();
+    /* 持仓剧变监控也要停 —— 否则它会对已停止的机器人调用 requestEarlyCycle。 */
+    this.stopMoveWatch();
+    /*
+     * ⚠️ **先把在途那一轮掐断，再去等它结束（2026-10-10，用户报的卡顿）。**
+     *
+     * 用户的原话：「机器人启动\停止，用户点击以后应该是瞬间完成……如果点了停止按钮，
+     * 如果此时有运行中的 AI 请求也应该是立即终止」。
+     *
+     * 原来这里直接 `await waitForIdle()` —— 而那一轮可能正卡在一次 LLM 调用上
+     * （实测单轮 1.8–9.9 分钟，硬超时更是 60 分钟），于是"点停止"要干等
+     * 最多 `waitForIdle` 的 60 秒。**操作员点的是"停"，得到的却是"再等等"。**
+     *
+     * `abortCurrentCycle` 本来就有 —— 硬超时那条路径一直在用它真的拆掉在途请求
+     *（见 `inCycle` 里那段注释：abort 会把 `work()` 掀掉）。所以这里只是
+     * **让操作员的意图走同一条路**，而不是新造一个取消机制。
+     *
+     * 为什么可以安全地掐：那一轮此刻要么还没下单（纯 LLM 等待），要么在等交易所回执。
+     * abort 影响的是 HTTP 等待，**不会撤销已经发出的下单请求** —— 已成交的仓位
+     * 仍由对账与保护单兜住（`waitForIdle` 之后仍然照常等它收尾）。
+     *
+     * ---
+     *
+     * ## ⚠️ 但**进程关闭不能掐**（2026-10-12 修正，用户要求的"两全其美"）
+     *
+     * 用户的原话：
+     *
+     * > 「你改代码的时候（提交更新部署代码到服务器后，服务器会重启对吧，
+     * >  这时候运行中的机器人会被停止-启动……**这个你得自己看着修**……
+     * >  不要为了机器人正常而影响你更新，**应该是两全其美**」
+     *
+     * 实测证据（生产日志）：
+     *
+     * ```
+     *   01:08:33  停止时上一轮决策未在时限内结束，可能留下未挂保护单的仓位
+     *   01:08:41  机器人已启动（实盘）      ← 部署在 01:08 打断了一轮决策
+     * ```
+     *
+     * **掐断正是那个窗口的成因**：一轮跑到"入场已成交、保护单还没挂"时被掐掉，
+     * 循环也停了（`this.running = false`），于是**没有任何人会去补那张保护单** ——
+     * 直到下一次启动对账才补上。中间那段就是**裸奔窗口**。
+     *
+     * 而"操作员点停止"与"部署重启"是**两种不同的意图**：
+     *
+     * | 场景 | 谁在等 | 该怎么做 |
+     * |---|---|---|
+     * | 操作员点停止（`persist=true`）| **人**在屏幕前等 | **立刻掐断**（要快）|
+     * | 部署/进程关闭（`persist=false`）| **没人**在等 | **让它跑完**（可以等）|
+     *
+     * 所以掐断只在 `persist === true` 时做。
+     */
+    if (persist) {
+      this.abortCurrentCycle?.abort();
+    }
+    const drained = await this.waitForIdle(persist ? 60_000 : SHUTDOWN_DRAIN_TIMEOUT_MS);
     if (!drained) {
       /*
        * The wait is bounded so a wedged exchange call cannot hang shutdown
@@ -1037,6 +1599,16 @@ export class AutoTrader {
    * exchange call — but it returns `false` in that case rather than pretending
    * the cycle finished, so the caller can say so in the log.
    */
+  /**
+   * **立刻中止在途的那一轮决策**（拆掉正在等待的 LLM 请求）。
+   *
+   * 给操作员的"停止"用：那条路径不该干等一轮跑完（见 `stop()` 里的说明）。
+   * 幂等，没有在途轮次时是空操作。
+   */
+  abortInFlightCycle(): void {
+    this.abortCurrentCycle?.abort();
+  }
+
   async waitForIdle(timeoutMs = 60_000): Promise<boolean> {
     const pending = this.cyclePromise;
     if (!pending) return true;
@@ -1081,6 +1653,33 @@ export class AutoTrader {
       traderId: this.deps.trader.id,
       raw: message,
     });
+    /*
+     * ⚠️ **一轮里发生的每一件事，顺带作为"当前步骤"推给界面（2026-10-10）。**
+     *
+     * ## 为什么挂在 `emit` 上，而不是在一轮的六个节点各写一次
+     *
+     * `emit` 本来就是"这一轮发生了什么"的唯一出口 —— 取数、模型调用与重试、
+     * 执行、挂保护单、对账**全都走它**。挂在六个节点上意味着六处各自漂移；
+     * 挂在这里则**自动覆盖未来新增的每一个步骤**，一行都不用改。
+     *
+     * ## 归属哪一轮：用 `cyclePromise` 判断，不加任何状态位
+     *
+     * `cyclePromise` 非空**恰好等价于**"有一轮在跑"（`inCycle` 里赋值、`finally` 清）。
+     * 所以不需要额外的 set/clear，也就没有"异常路径忘了清"的那种 bug ——
+     * 轮次外的日志（启动、对账、错误）不会被误当成某轮的步骤。
+     *
+     * **不落库**：它只活到这一轮结束（结论由 `decision` 事件带 `executionLog` 落库）。
+     */
+    if (this.cyclePromise !== null) {
+      eventBus.publish({
+        type: 'cycle_step',
+        traderId: this.deps.trader.id,
+        cycleNumber: this.cycleNumber,
+        level,
+        message,
+        at: new Date().toISOString(),
+      });
+    }
   }
 
   /**
@@ -2206,6 +2805,32 @@ export class AutoTrader {
       preferred: [...consensusSymbols, ...watched],
       /* 候选池的大小直接由它决定 —— 见构造函数里 `promptBudget` 的说明。 */
       budgetTokens: this.promptBudget,
+      /*
+       * ── **漏斗每层的淘汰写进日志**（2026-10-12 接线）──────────────────────
+       *
+       * 用户的要求：
+       * > 「交易所有 500 个可以交易的币……**层层筛选**」
+       *
+       * 而"层层筛选"要真的有用，操作员必须能回答一个问题：
+       * **「我的币为什么没被看到？」**
+       *
+       * 若不写日志，漏斗就是一个**黑盒** —— 用户看到候选池里只有 8 个标的，
+       * 却不知道那 8 个是怎么从 500 个里选出来的、更不知道自己关心的那个
+       * 死在哪一层。那正是"感觉不是给人看的"。
+       *
+       * 只在 `funnel` 模式下会触发（另两种模式走 `coinpool`，不传这个回调）。
+       */
+      onFunnelReport: (stages, survivors) => {
+        const detail = stages
+          .map((s) => `${s.name}: ${s.input}→${s.output}（淘汰 ${s.dropped}）`)
+          .join(' · ');
+        /*
+         * ⚠️ 用 `this.emit()` 而不是 `runtimeLogs.write()` —— 见 `emit()` 的说明：
+         * **只走 logger 这一条路径**，否则一条日志会变成两条库记录加两个前端事件
+         *（界面上同一句话出现两遍），而且归属还对不上。
+         */
+        this.emit('info', `[漏斗] ${detail} · 最终 ${survivors} 个候选`);
+      },
     });
 
     let snapshots = await this.deps.marketData.buildSnapshots(
@@ -2350,6 +2975,13 @@ export class AutoTrader {
     }
 
     const snapshotBySymbol = new Map(snapshots.map((s) => [s.symbol, s]));
+    /*
+     * **把这一轮的价格记成剧变基准**（2026-10-13）。
+     *
+     * ⚠️ 基准必须**跟着评估走** —— 语义是"从现在开始，涨跌多少才值得再看一眼"。
+     * 若不更新，一个持续偏离的价格会让监控每轮都触发（同一件事重复唤醒）。
+     */
+    this.rememberMoveBaseline(snapshots.map((s) => ({ symbol: s.symbol, price: s.price })));
 
     /* --- 7. Ask the model ------------------------------------------------ */
     const promptPositions = this.buildPromptPositions(localPositions, snapshotBySymbol);
@@ -2520,6 +3152,24 @@ export class AutoTrader {
       now: new Date(),
       config,
       /*
+       * **交易所对这个标的的最小名义额**（2026-10-12 修一个真 BUG）。
+       *
+       * 提示词里有一段"帮你把风险规则联立算一遍"，它原来把最低名义
+       * **硬编码成 20** —— 而真实风控用的是
+       * `max(minPositionSize, minNotionalOf(symbol))`（交易所下限按 symbol 查）。
+       *
+       * 后果实测（`#11`，权益 20.75、`minPositionSize=12`）：
+       * ```
+       *   提示词算出 0.415 ÷ (20 × 1.5) = 止损上限 1.38%
+       *   真实口径   0.415 ÷ (12 × 1.5) = 止损上限 2.31%
+       * ```
+       * **低估 40%** → 模型得出"上限 < 下限（1.5×ATR）"→ **连续 11+ 轮零决策**。
+       *
+       * ⚠️ 用**与风控引擎同一个数据源**（`registry`）—— 两处口径必须一致，
+       * 否则又会分叉出同类 BUG（本项目在"两处各算一遍"上踩过多次）。
+       */
+      minNotionalOf: (symbol: string) => this.deps.registry.minNotional(symbol),
+      /*
        * ⚠️ **AI 托管时不能替它预设交易性格。**
        *
        * `buildSystemPrompt` 会按这个标志决定第 2 段写什么：非托管时注入写死的
@@ -2529,8 +3179,48 @@ export class AutoTrader {
        * 实测 `#9` 修之前的样子：角色句说「对资金保持保守」、MODE_GUIDANCE 又说
        * 一遍「稳健/保住本金压倒一切」、而它自己写的 `entryStandards` 里还抄了
        * 第三遍 —— **三层都在替它回答一个本该它自己回答的问题。**
+       *
+       * ── ⚠️⚠️ **`ai_team` 也必须算"托管"**（2026-10-13 修一个真 BUG）────────
+       *
+       * ## 原来写的是 `mode === 'ai_managed'` —— 于是 `ai_team` 被漏掉了
+       *
+       * 后果（实测 `#11`，55 轮零决策后抓到的）：
+       * ```
+       *   system_prompt 含"由你自己判断"? **false**
+       *   system_prompt 含"稳健"?        **true**   ← conservative 那段确实生效了
+       * ```
+       * 也就是说团队模式的机器人一直在吃**系统写死的"稳健"性格**：
+       * ```
+       *   「保住本金压倒一切。宁可交易更少、质量更高。」
+       *   「当信号互相冲突时，正确的动作是 `wait`。」
+       *   「错过一波行情不花一分钱；一笔糟糕的入场不是。」
+       * ```
+       * **而裁决官正是引用了它**（原文）：
+       * > 「账户与模式不允许赌：权益仅20.75U、**conservative**、逐仓、无持仓……
+       * >  **40轮空仓不是必须打破的错误。**」
+       *
+       * ## 为什么这是 BUG 而不是"配置如此"
+       *
+       * 用户的需求 ③ 明确说了：
+       * > 「系统**不再设置内置风控**（我的想法是既然都要做这么智能了，
+       * >  那么**风格也应该由一个智能体来负责**，而不是系统内置简单风控规则）」
+       *
+       * `tradingMode` 是**系统预设的风格档**（稳健/进取/短线）——
+       * 让团队模式吃它，等于**系统替智能体回答了"该多保守"这个问题**。
+       * 而 `defaultAiTeamConfig()` 里那些数值（`minConfidence: 0`、
+       * `minRiskRewardRatio: 0`、`maxMarginUsage: 100`）**全都放开了** ——
+       * 说明本意就是"不预设"，**只有这一段文本漏了**。
+       *
+       * ## 修法：两种托管模式都走"由你自己判断"
+       *
+       * ```
+       *   ai_managed → 风格由你自己判断
+       *   ai_team    → 风格由你自己判断（团队里那由**风控官**负责把关）
+       *   strategy   → 仍然按 tradingMode 注入（固定策略需要它，行为不变）
+       * ```
+       * ⚠️ **`strategy` 模式的行为逐字节不变** —— 那是写死策略的人真的选了那一档。
        */
-      aiManaged: this.deps.trader.mode === 'ai_managed',
+      aiManaged: this.deps.trader.mode === 'ai_managed' || this.deps.trader.mode === 'ai_team',
       account: {
         equity: account.equity,
         availableBalance: account.availableBalance,
@@ -4760,6 +5450,21 @@ export class AutoTrader {
       source: 'bot',
       entryOrderId: authoritative?.entryOrderId ?? null,
       exitOrderId: authoritative?.exitOrderId ?? null,
+      /*
+       * **把开仓时记下的情报归因搬到成交上**（归因链最后一环，2026-10-12）。
+       *
+       * `local` 就是那行**仓位记录** —— 开仓时（`positions.insert`）
+       * 已把 `decision.intelKeys` 存在它的 `intel_keys` 上。
+       * 平仓时**直接搬过来**，不需要回查决策记录
+       *（那需要靠 symbol + 时间猜，正是我拒绝过的"猜测式归因"）。
+       *
+       * ⚠️ 仓位行缺这个字段（老数据、收养的仓位）时 `?? []` ——
+       * 语义是"**纯技术面成交**"，与 225 笔历史成交一致。
+       *
+       * ⚠️ 对账路径（`reconcileTradeHistory`）从交易所历史重建时**拿不到**它 ——
+       * 那时为空是**正确的**：那条路径本来就没有决策上下文。
+       */
+      intelKeys: parseIntelKeysOf(local.intel_keys),
       // 这是一笔真实平仓：先查重，别把同一回合记两次（§2.5 的幂等）。
       idempotent: true,
     });
@@ -6968,6 +7673,13 @@ reduceQuantity: null,
         stopOrderId: null,
         tpOrderId: null,
         openReasoning: decision.reasoning,
+        /*
+         * **情报归因**（见 `db/schema.ts` M17）—— 归因链的中间一环。
+         *
+         * ⚠️ 这里存的是**裁决官标注并经 `filterKnownIntelKeys` 校验过**的键
+         *（编造的已被剔除）。`undefined` 时仓库层写 `[]` = 纯技术面。
+         */
+        ...(decision.intelKeys !== undefined ? { intelKeys: decision.intelKeys } : {}),
         status: 'pending',
         entryOrderId: placed.id,
         /* 模型为这一张指定的耐心（没给就是 null = 用配置值）。 */
@@ -7711,6 +8423,14 @@ reduceQuantity: null,
         stopOrderId: null as string | null,
         tpOrderId: null as string | null,
         openReasoning: decision.reasoning,
+        /*
+         * **情报归因**（见 `db/schema.ts` M17）—— 归因链的中间一环。
+         *
+         * 与限价那条路径同一个字段、同一个来源（裁决官标注 + 已校验）。
+         * **两条开仓路径都要写它** —— 否则市价开仓的成交会永远没有归因，
+         * 而 `signalHealth` 会以为"这个消息面信号从没被用过"。
+         */
+        ...(decision.intelKeys !== undefined ? { intelKeys: decision.intelKeys } : {}),
         /*
          * ⚠️ **入场单号必须落在这里**（2026-10-03 实测抓到）。
          *

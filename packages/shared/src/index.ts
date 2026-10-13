@@ -1,4 +1,5 @@
 export * from './strategy.js';
+export * from './firm.js';
 export * from './decision.js';
 export * from './domain.js';
 export * from './llm.js';

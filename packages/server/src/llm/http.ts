@@ -141,6 +141,25 @@ export async function executeJsonRequest(
  * （把客户端 `timeout_seconds` 提到 600 秒解决不了这个问题：
  * 那个计时器在客户端，限制在中间的网关那里。）
  */
+/**
+ * 流式请求的**"卡住"阈值**（毫秒）：多久没有收到任何字节才算断了。
+ *
+ * ## 为什么不是"总时长"（2026-10-10，用户实测）
+ *
+ * 用户的原话：「我实测换了其他模型\第三方提供商，模型速度慢、有时候不通……只要重试\等待
+ * 基本能正常使用的情况下，系统会判定为失败……在我看来不管是什么模型\提供商，
+ * **只要请求上游在吐字返回**，偶发失败都是正常情况，系统应当正常运行下去」。
+ *
+ * 原来的做法是给整条流式请求套一个总时长超时（`AbortSignal.timeout`），
+ * 而那个值是按当年的 `v4.1-flash`（约 300 tok/s）设计的。换成约 30 tok/s 的模型，
+ * 一次长回答的总时长涨十倍，于是**它一边正常吐字、一边被判超时**。
+ *
+ * 所以判据换成"**有没有在动**"：只要还收到数据就重置计时器，真的静默这么久才中止。
+ * 外层还有轮次硬超时（60 分钟）兜底，不会真的无限等。
+ *
+ * 180 秒是留足前置（prefill）的：大提示词在慢提供商上可能几十秒才吐第一个字。
+ */
+export const STREAM_IDLE_TIMEOUT_MS = 180_000;
 export async function executeStreamRequest(
   provider: LlmProviderId | string,
   request: OutboundRequest,
@@ -149,15 +168,33 @@ export async function executeStreamRequest(
     timeoutMs?: number;
   } = {},
 ): Promise<JsonResponse> {
+  /*
+   * 流式用"卡住超时"而不是"总时长超时" —— 见 `STREAM_IDLE_TIMEOUT_MS` 的说明。
+   */
+  const idleMs = Math.max(STREAM_IDLE_TIMEOUT_MS, options.timeoutMs ?? 0);
+  const stall = new AbortController();
+  let idleTimer: NodeJS.Timeout | null = null;
+  const bumpIdle = (): void => {
+    if (idleTimer) clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => stall.abort(new Error('stream idle')), idleMs);
+    idleTimer.unref?.();
+  };
+  bumpIdle();
+  const signals = options.signal ? [stall.signal, options.signal] : [stall.signal];
+  const signal = signals.length === 1 ? signals[0]! : AbortSignal.any(signals);
+
   let response: Response;
   try {
     response = await fetch(request.url, {
       method: 'POST',
       headers: { ...request.headers, accept: 'text/event-stream' },
       body: JSON.stringify(request.body),
-      ...(options.signal ? { signal: options.signal } : {}),
+      signal,
     });
   } catch (error) {
+    if (idleTimer) clearTimeout(idleTimer);
+    /* 我们自己因为"卡住"而中止的算**可重试的超时**（它是慢，不是坏）。 */
+    if (stall.signal.aborted) throw timeoutError(String(provider), idleMs);
     if (error instanceof Error && error.name === 'TimeoutError') {
       throw timeoutError(String(provider), options.timeoutMs ?? 0);
     }
@@ -178,7 +215,16 @@ export async function executeStreamRequest(
     throw error;
   }
 
-  const lines = await readOpenAiStreamLines(response);
+  let lines: string[];
+  try {
+    /* 每收到一块数据就重置"卡住"计时器 —— 慢模型因此不会被总时长误杀。 */
+    lines = await readOpenAiStreamLines(response, bumpIdle);
+  } catch (error) {
+    if (stall.signal.aborted) throw timeoutError(String(provider), idleMs);
+    throw error;
+  } finally {
+    if (idleTimer) clearTimeout(idleTimer);
+  }
   const merged = mergeOpenAiStreamChunks(lines);
   return {
     status: response.status,

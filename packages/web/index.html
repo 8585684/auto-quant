@@ -5,6 +5,58 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="color-scheme" content="dark" />
     <title>AutoQuant · LLM 合约终端</title>
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <!--
+      ⚠️ **下面这段脚本必须留在样式表之前，而且是同步的。**
+
+      它做的是把用户选的外观（模板 / 深浅 / 密度）在**解析样式表之前**写到
+      `<html>` 上。放到 `<body>` 末尾、或者加 `defer`，效果就是每次刷新都先
+      用默认外观画一帧 —— 深色用户会看到一道白闪，浅色用户会看到一帧黑底。
+
+      键名是**两份代码之间的契约**：这里是纯 JS 字符串，没法 import
+      `templates/store.ts` 与 `templates/lib/appearance.ts`。改那边的键名
+      必须同时改这里 —— 不一致的表现是"设置存下来了，但下次打开又回到默认"，
+      而不会有任何报错。
+    -->
+    <script>
+      (function () {
+        var root = document.documentElement;
+        var read = function (key) {
+          try {
+            return window.localStorage.getItem(key);
+          } catch (e) {
+            return null;
+          }
+        };
+        var template = read('aq.appearance.v1');
+        if (template) {
+          try {
+            if (template.charAt(0) === '{') template = JSON.parse(template).template;
+          } catch (e) {
+            /* 内容损坏：当成没设置过，用默认模板。 */
+          }
+        }
+        /*
+         * 内置模板的根类名 → id 的映射。
+         *
+         * ⚠️ **这里是唯一一处必须手写的模板清单**（纯 JS 字符串没法 import
+         * `registry.ts`），所以加一套内置模板时要同时改这一处与
+         * `templates/registry.ts`。漏改的表现是"刷新时先闪一下经典模板"——
+         * 不是坏掉，只是一帧的抖动，所以很容易被忽略。
+         */
+        var BUILT_IN = { classic: 1, console: 1, quill: 1 };
+        if (template && BUILT_IN[template]) root.classList.add('aq-' + template);
+        else {
+          root.classList.add('aq-classic');
+          template = 'classic';
+        }
+        root.dataset.template = template;
+        root.dataset.skin = read('aq.skin') === 'light' ? 'light' : 'dark';
+        var density = read('aq.density');
+        root.dataset.density =
+          density === 'compact' || density === 'cozy' ? density : 'normal';
+      })();
+    </script>
   </head>
   <body class="bg-base-950">
     <div id="root"></div>

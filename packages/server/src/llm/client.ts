@@ -8,7 +8,8 @@ import * as openai from './openaiCompatible.js';
 import * as anthropic from './anthropic.js';
 import * as gemini from './gemini.js';
 import { EMPTY_USAGE, type ChatMessage, type ChatResult, type OutboundRequest } from './types.js';
-import { checkOutboundUrl } from './urlGuard.js';
+import { checkOutboundUrl, parseHostAllowlist } from './urlGuard.js';
+import { env } from '../env.js';
 
 const log = createLogger('llm');
 
@@ -29,7 +30,20 @@ const log = createLogger('llm');
  * 但它**避免把"我们跑得慢"误报成"上游挂了"** —— 那是两条完全不同的诊断路径。
  */
 const DEFAULT_TIMEOUT_SECONDS = 300;
-const DEFAULT_MAX_RETRIES = 3;
+/*
+ * ⚠️ **默认重试从 3 提到 10（2026-10-10，用户实测）。**
+ *
+ * 用户的原话：「那些不稳定的提供商（偶发连接失败）……**只要重试\等待基本能正常使用**……
+ * 偶发失败（重连大概 20 次以内）都是正常情况，系统应当正常运行下去」。
+ *
+ * 原来的 3 只有 3 次尝试、退避合计约 1.5 秒 —— 对偶发断连的第三方几乎等于不重试，
+ * 于是"能靠重试救回来"的一轮被直接判成失败。退避是 `min(30s, 0.5s·2^n)`，
+ * 10 次的总等待仍然远小于一轮的硬超时（60 分钟）。
+ *
+ * **这不是"掩盖故障"**：真失败（401/402/模型不存在）仍然是不可重试的，
+ * 一次就结束；这里放宽的只有"网络抖动/限流/超时"那一类。
+ */
+const DEFAULT_MAX_RETRIES = 10;
 /** Full-jitter backoff bounds from B.14 (`base ≈ 500ms`, cap ≈ 30s). */
 const BACKOFF_BASE_MS = 500;
 const BACKOFF_CAP_MS = 30_000;
@@ -131,10 +145,20 @@ export function backoffDelayMs(attempt: number, random: () => number = Math.rand
 export function usesAnthropicProtocol(provider: string, model: string): boolean {
   if (provider === 'anthropic') return true;
   /*
-   * 依据是**网关自己的模型 id**（文档逐条列了 id 与端点的对应），不是猜测。
-   * 用前缀匹配而不是穷举名单：网关新增同族模型时不必改代码，
-   * 而 `claude-` / `minimax-` / `qwen3.7-` / `qwen3.8-` 这几族在文档里**全部**属于 /messages。
+   * ⚠️ **这条"按模型名判协议"的规则只对 `opencode` 生效（2026-10-11 审查发现）。**
+   *
+   * 原来它对**任何** provider 都按模型名前缀判协议，于是：
+   *
+   *   · `commandcode`（OpenAI 兼容聚合网关）选 claude 系模型 → 被发到 `/messages`；
+   *   · 任何自有部署的 MiniMax / qwen3.7 / qwen3.8 → 同样被改道。
+   *
+   * 而那些网关**只有 OpenAI 兼容端点**，改道等于把请求发到一个不存在的路径上。
+   *
+   * 判据是"**这个网关会不会按模型换协议**"，而不是"模型叫什么名字" ——
+   * 只有 OpenCode Go 是后者（它的文档逐条列了模型与端点的对应）。
+   * 所以这里显式限定供应商；以后接同类网关时**显式加进来**，不要放宽成通配。
    */
+  if (provider !== 'opencode') return false;
   return /^(claude-|minimax-|qwen3\.7-|qwen3\.8-)/i.test(model);
 }
 export class LlmClient {
@@ -210,7 +234,12 @@ export class LlmClient {
      *
      * 不重试、直接失败：这不是网络抖动，重试只会把同一个内网请求再发一遍。
      */
-    const verdict = checkOutboundUrl(this.baseUrl);
+    /*
+     * 操作员显式声明的内网目标（`ALLOW_PRIVATE_LLM_HOSTS`）——
+     * 自建网关/私有部署要连内网地址，而默认规则会挡掉它们。
+     * 每次读 env 而不是模块级常量：测试可以按用例改环境。
+     */
+    const verdict = checkOutboundUrl(this.baseUrl, parseHostAllowlist(env.allowPrivateLlmHosts));
     if (!verdict.allowed) {
       throw new LlmError(
         `baseUrl 不被允许：${verdict.reason}`,
@@ -275,7 +304,30 @@ export class LlmClient {
 
   async chat(
     messages: ChatMessage[],
-    options: { probe?: boolean; signal?: AbortSignal } = {},
+    options: {
+      probe?: boolean;
+      signal?: AbortSignal;
+      /**
+       * **本次调用**的输出预算覆盖（不传则用构造时的 `maxTokens`）。
+       *
+       * ## 为什么需要它（2026-10-12，多智能体路由的必需能力）
+       *
+       * 实测：思维链模型（如 `gpt-6-astra`）的 `reasoning_content` 与正文**共享**
+       * `max_tokens`，预算太小会返回 `content: null` + `finish_reason: length`：
+       *
+       *     mt=16  → content=null · reasoning=435
+       *     mt=128 → content=null · reasoning=475
+       *     mt=512 → content="…"            ← 够用了
+       *
+       * 而 `maxTokens` 原来是**构造时定死的实例字段**，于是"这一轮预算不够、
+       * 加大重试"在结构上做不到 —— 只能整轮失败或换模型，而**换模型会白白丢掉
+       * 最强的那一个**（它只是这次说得多了一点）。
+       *
+       * 所以加这个可选的 per-call 覆盖：**默认行为完全不变**（不传就用实例值），
+       * 只有需要它的调用方（模型路由器的"空内容重试"）才传。
+       */
+      maxTokens?: number;
+    } = {},
   ): Promise<ChatResult> {
     const startedAt = Date.now();
     const startedAtIso = new Date(startedAt).toISOString();
@@ -295,6 +347,7 @@ export class LlmClient {
       });
 
       try {
+        /* options 原样透传 —— 含 per-call maxTokens 覆盖（见 chat() 的说明）。 */
         const result = await this.attempt(messages, startedAt, startedAtIso, options);
         log.info(`模型调用成功：${this.provider} / ${result.model}`, {
           provider: this.provider,
@@ -465,7 +518,12 @@ export class LlmClient {
     return usesAnthropicProtocol(this.provider, this.model);
   }
 
-  private buildRequest(messages: ChatMessage[], probe: boolean): OutboundRequest {
+  private buildRequest(messages: ChatMessage[], probe: boolean, maxTokensOverride?: number): OutboundRequest {
+    /*
+     * **本次调用的输出预算**：per-call 覆盖优先，否则用实例值。
+     * 见 `chat()` 的 `maxTokens` 参数说明（思维链吃光预算时要能加大重试）。
+     */
+    const effectiveMaxTokens = maxTokensOverride ?? this.maxTokens;
     // A probe must be as cheap as possible and must not request a schema. It
     // keeps the sampling temperature so it exercises the real request path.
     const bodyOptions: openai.OpenAiBodyOptions = probe
@@ -475,7 +533,7 @@ export class LlmClient {
         }
       : {
           ...(this.temperature !== undefined ? { temperature: this.temperature } : {}),
-          ...(this.maxTokens !== undefined ? { maxTokens: this.maxTokens } : {}),
+          ...(effectiveMaxTokens !== undefined ? { maxTokens: effectiveMaxTokens } : {}),
           jsonMode: this.jsonMode,
           ...(this.jsonSchema !== undefined ? { jsonSchema: this.jsonSchema } : {}),
           /*
@@ -552,10 +610,10 @@ export class LlmClient {
     messages: ChatMessage[],
     startedAt: number,
     startedAtIso: string,
-    options: { probe?: boolean; signal?: AbortSignal } = {},
+    options: { probe?: boolean; signal?: AbortSignal; maxTokens?: number } = {},
   ): Promise<ChatResult> {
     const probe = options.probe === true;
-    const request = this.buildRequest(messages, probe);
+    const request = this.buildRequest(messages, probe, options.maxTokens);
     /*
      * ⚠️ **OpenAI 兼容的 provider 默认走流式**（探测请求除外）。
      *
@@ -596,8 +654,18 @@ export class LlmClient {
      * 任一信号触发都会中止这一跳；重试循环会照常进入下一次尝试，
      * 而那时 `signal.aborted` 仍为真 —— 上层会看到这一轮被判定为失败。
      */
-    const signal =
-      options.signal === undefined
+    /*
+     * ⚠️ **流式路径不能套"总时长超时"（2026-10-10，用户实测）。**
+     *
+     * 那条判据会误杀慢模型：≈30 tok/s 的模型回答长问题时，总时长必然比
+     * 按 ≈300 tok/s 设计的阈值大得多 —— 于是它**一边正常吐字、一边被判失败**。
+     * 流式自己按"多久没有数据"判定卡住（见 `http.ts` 的 `STREAM_IDLE_TIMEOUT_MS`），
+     * 外层还有轮次硬超时兜底。
+     */
+    const signal = useStream
+      ? /* 流式：只把调用方的取消信号交出去，"卡住"由 http 层判。 */
+        (options.signal ?? new AbortController().signal)
+      : options.signal === undefined
         ? AbortSignal.timeout(this.timeoutMs)
         : AbortSignal.any([AbortSignal.timeout(this.timeoutMs), options.signal]);
     const response = useStream

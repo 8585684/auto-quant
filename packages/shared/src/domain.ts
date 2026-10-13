@@ -148,7 +148,35 @@ export interface DiscoveredModel {
 }
 
 /** 机器人的运行模式。**这是机器人的属性，不是一个策略** —— 见 `M7_TRADER_MODE` 的注释。 */
-export type TraderMode = 'strategy' | 'ai_managed';
+/**
+ * 机器人的运行模式。
+ *
+ * ## `ai_team` 与 `ai_managed` 是**两个不同的东西**（用户 2026-10-12 明确要求）
+ *
+ * 用户原话：
+ *
+ * > 「这次更新应该是一个**全新的项目**，和现在智能托管是 2 个东西，也就是说你现在的
+ * >  更新迭代**不要影响我现在实盘跑的机器人**……等这个更新做完以后新建机器人就应该
+ * >  有**除了智能托管外**这次更新的模式」
+ *
+ * | 模式 | 是什么 | 谁在跑 |
+ * |---|---|---|
+ * | `strategy` | 固定策略：参数由人对策略配置决定 | — |
+ * | `ai_managed` | **智能托管**：单智能体 + 定时轮询，AI 自己调参 | 实盘机器人 #10 `赚大钱` |
+ * | `ai_team` | **多智能体团队**（本次新增）：7×24 事件驱动、分工协作、辩论裁决 | 待建 |
+ *
+ * ⚠️ **隔离纪律**：`ai_team` 必须走**独立代码路径**。
+ * 前两个模式的语义一个字都不能改 —— 它们上面挂着用户的真金白银。
+ */
+export type TraderMode = 'strategy' | 'ai_managed' | 'ai_team';
+
+/** 需要 AI 自己决策（而不是按固定策略执行）的模式 —— 加新模式时**必须**在这里登记。 */
+export const AI_DRIVEN_MODES: readonly TraderMode[] = ['ai_managed', 'ai_team'];
+
+/** 这个模式是不是由 AI 驱动。 */
+export function isAiDriven(mode: TraderMode): boolean {
+  return AI_DRIVEN_MODES.includes(mode);
+}
 
 export type TraderStatus = 'running' | 'stopped' | 'starting' | 'error' | 'safe_mode';
 
@@ -973,6 +1001,13 @@ export const COIN_SOURCE_TYPE_LABELS: Record<CoinSourceType, string> = {
   coinpool: '动态币种池',
   oi_top: '持仓量领先',
   mixed: '混合（并集）',
+  /*
+   * **团队模式专用**：分层漏斗（全市场 → 流动性 → 波动区间 → 交给 AI）。
+   *
+   * 与 `coinpool` 的区别在**层数**：`coinpool` 是一次排序取前 N（一层），
+   * 而漏斗是**多层**、且每层的淘汰都能解释（"你的币死在哪一层"）。
+   */
+  funnel: '分层漏斗（团队模式）',
 };
 
 export function coinSourceTypeLabel(sourceType: string): string {
@@ -1224,6 +1259,42 @@ export type ServerEvent = Replayable<
   | { type: 'trader_status'; traderId: number; status: TraderStatus; detail?: string }
   | { type: 'cycle_start'; traderId: number; cycleNumber: number; timestamp: string }
   | { type: 'cycle_end'; traderId: number; cycleNumber: number; summary: string; success: boolean }
+  /*
+   * **一轮**内部**的实时步骤**（2026-10-10，用户提的观测需求）。
+   *
+   * 用户的原话：「智能模式下，每一期最近决策里面能展开（就像你 DSH 一样），
+   * 能折叠实时显示当前步骤（默认是缩起来的，用户可以手动展开），
+   * 这样用户可以手动展开看系统到底在做什么，也可以判断系统到底是否正常工作」。
+   *
+   * 它**不落库**：这是"现在在做什么"，只需要活到这一轮结束。
+   * 落库的结论由 `decision` 那条事件给（它带 `executionLog`）。
+   */
+  | {
+      type: 'cycle_step';
+      traderId: number;
+      cycleNumber: number;
+      level: 'info' | 'warn' | 'error';
+      message: string;
+      at: string;
+      /**
+       * **哪个智能体做的这一步**（`ai_team` 模式才有）。
+       *
+       * 用户 2026-10-12 要求团队看板「直观显示**有哪些智能体，都是什么分工，都在做什么**」。
+       * 没有这个字段，界面上只有一串按时间排的日志 —— 看不出"谁在干活"。
+       *
+       * `null`/缺省 = 这一步不属于某个角色（普通/智能托管模式的步骤，或调度层）。
+       */
+      role?: string | null;
+      /**
+       * **处于哪个阶段**（团队模式的编排阶段）。
+       *
+       * `dispatch`（派发）· `analysis`（并行分析）· `debate`（对抗辩论）·
+       * `verdict`（裁决）· `execute`（执行）
+       *
+       * 界面靠它把步骤**分组**显示，而不是一条流水账。
+       */
+      phase?: string | null;
+    }
   | { type: 'decision'; traderId: number; record: DecisionRecord }
   | { type: 'positions'; traderId: number; positions: PositionView[] }
   | { type: 'order'; traderId: number; order: OrderRecord }
