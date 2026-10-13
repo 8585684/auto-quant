@@ -223,8 +223,68 @@ export function headOfMarket(marketContext: string, budgetChars: number): {
    * 那正是这个 BUG 的形态。 */
   if (picked.length === 0 && parts.length > 0) picked.push(parts[0]!);
 
+  /*
+   * ══════════════════════════════════════════════════════════════════════════
+   *  ⚠️⚠️ **最后一个 part 里的"非候选尾巴"必须单独保留**（2026-10-13 实测 P0）
+   * ══════════════════════════════════════════════════════════════════════════
+   *
+   * ## 事故：策略师写的规则【到不了辩论者与裁决官】
+   *
+   * 上面那个 `break` 会把**超预算之后的候选全部丢掉** —— 而
+   * `routedModel.ts:863` 拼材料时把**规则段放在【最后】**：
+   * ```
+   *   marketContext = userPrompt
+   *                 + '\n---\n\n## 团队需要遵守的规则（来自交易循环）\n'
+   *                 + systemPrompt        ← 策略师的 entryStandards 都在这里
+   * ```
+   * 预算 12,000 用完时 `break` → **规则段永远不会进 `picked`**。
+   *
+   * ## 线上实证（决定性）
+   *
+   * `#11` 的 `cot_trace`（四个分析师 + 裁决官的产出）里：
+   * ```
+   *   "MUST open at least one position"  ❌ 未命中
+   *   "default-to-action"                ❌ 未命中
+   *   "opportunity cost"                 ❌ 未命中
+   * ```
+   * 而策略师自己写的规则原文就是：
+   * ```
+   *   「You MUST open at least one position per 6 cycles if any symbol
+   *     showed a ≥2% move. …your entry standards are too strict by construction」
+   * ```
+   * → **裁决官（最终决策者）从来不知道它有"必须开仓"的义务。**
+   * 结果：**95 轮 · 217 条决策 · 全部 skip · 0 成交。**
+   *
+   * ## 修法：把尾巴【无条件】接回去（它不属于"可裁的候选"）
+   *
+   * ```
+   *   规则段不是候选材料 —— 它是【行为约束】。
+   *   裁候选是为了省 token，而裁掉约束是【改变系统行为】。
+   * ```
+   * ⚠️ 无条件保留的代价是几 KB（`systemPrompt` 13162 字符里的规则段部分）——
+   * 而它换来的是"模型知道自己该做什么"，那**远远值得**。
+   *
+   * ⚠️ 判据用 `routedModel` 拼材料时的那个独特分隔符；找不到时**原样返回**
+   *（退化成修之前的行为，而不是把材料弄坏）。
+   */
+  const RULES_MARKER = '\n---\n\n## 团队需要遵守的规则';
+  /*
+   * ⚠️ 只有当规则段**还没随某个 picked 带进来**时才补 —— 否则会重复两份。
+   * 判据用"已收内容里有没有那个 marker"，比"最后一个 part 是否被 picked"
+   * 更稳（不依赖 `picked` 与 `parts` 的下标对应关系）。
+   */
+  const alreadyHasRules = picked.some((p) => p.includes(RULES_MARKER));
+  let rulesTail = '';
+  if (!alreadyHasRules) {
+    const lastPart = parts[parts.length - 1];
+    if (lastPart !== undefined) {
+      const at = lastPart.indexOf(RULES_MARKER);
+      if (at >= 0) rulesTail = lastPart.slice(at);
+    }
+  }
+
   return {
-    text: [head, ...picked].join(''),
+    text: [head, ...picked, rulesTail].join(''),
     candidatesShown: picked.length,
     totalCandidates: total,
   };
