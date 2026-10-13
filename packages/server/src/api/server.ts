@@ -2202,8 +2202,26 @@ export async function buildServer(deps: ApiDependencies): Promise<FastifyInstanc
    * 机器人在**停止**时是 `null`（那时没有内存里的配置可用来判定），
    * 客户端据此不渲染那一行 —— 而不是渲染成"没有熔断"。
    */
-  app.get('/api/traders/:id/stats', authed, async (request) => {
+  app.get('/api/traders/:id/stats', authed, async (request, reply) => {
     const id = idOf(request);
+    /*
+     * ⚠️ **不存在的机器人必须回 404，不能回 200 + 全零**（外部 issue #162）。
+     *
+     * 原来这里不检查存在性：`computeTraderStats()` 走的是 SQL 聚合
+     *（`aggregateTrades()` 的 `COUNT(*)` / `SUM(...)`），一个不存在的 id 会得到
+     * `COUNT = 0` 与 `SUM = NULL`（被兜底成 0）—— 于是响应是
+     * **200 + 权益 0 / 收益 0% / 胜率 0%**。
+     *
+     * 而同一个资源族的 `/api/traders/:id/account`（下方几行）**是回 404 的**。
+     * 两者不一致的后果不是"不好看"：**"权益 0"会被读成"这个机器人亏光了"** ——
+     * 一个打错的 id、或一个刚被删掉的机器人，在界面上表现为"账户归零"。
+     * 这个项目下的是真实订单，"权益 0"是最需要被当真的一类读数。
+     *
+     * 对齐 `/account` 的写法（同一句话、同一个状态码），
+     * 这样两个端点在"机器人不存在"这件事上给出同一个答案。
+     */
+    const trader = traders.get(id);
+    if (!trader) return reply.code(404).send({ error: '找不到该机器人' });
     return {
       ...computeTraderStats(id),
       circuitBreaker: deps.manager.readCircuitBreaker(id),
