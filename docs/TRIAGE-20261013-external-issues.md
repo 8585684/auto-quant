@@ -1015,3 +1015,88 @@ npm run sim         → 18/18
 - **没有开启分支保护 / 任何 GitHub 自动化**（红线）。
 - **没有跑 deploy.ps1 / liveSmokeTest / sim:live**（红线）。
 - **没有把 `gh` 放进任何循环** —— 全部为单次调用，写操作之间间隔 3-4 秒。
+
+---
+
+## 11. 第 5 轮：3 个「真实资金」issue + 1 个重复项
+
+这一轮外部贡献者批量提了 issue（open 数一度到 34）。按 COLLABORATION.md §4
+的优先级，**先处理标题带【真实资金】的那三个**，因为它们直接关系账目与敞口。
+
+### #142 —— ✅ 已修（`ce15745`）
+
+`bookClosedPosition()` 分摊已记手续费时用了 `partialQty / local.quantity`，
+而这两个数是**互不相交的两块**（已记量 / 剩余量），原始总量是两者之和。
+
+我实测复现了你的数值表，并**修正了标题里的一处**：不是"只要减过仓"就恒为 0，
+而是**减仓量 ≥ 剩余量**（减掉一半或更多）才会被 `Math.min(...,1)` 夹顶。
+
+修法是**分两条分支**（两位审计者独立指出了同一个坑）：
+
+```ts
+const partialShare =
+  authoritative && partialQty > 0 && local.quantity > 0
+    ? Math.min(partialQty / (partialQty + local.quantity), 1)
+    : 0;
+const exitFee = authoritative ? exitFeeRaw * (1 - partialShare) : exitFeeInput;
+```
+
+回退路径的 `exitFeeInput` 是**本腿自己那一笔**，本来就不含已减仓部分 ——
+再乘 `(1 - share)` 会新引入少记。
+
+**测试（修复前实测失败）**：两条端到端用例，断言打在 `trades.fee` **原值**上
+（`trades.list()` 的 `exitFee` 是 `Math.max(0, fee - entry_fee)` 派生的，
+会把负数夹成 0，看不出"有没有被记下来"）。写用例时发现一个值得记的事实：
+**减过仓的仓位天然更容易落到回退路径**（`findRoundTrip()` 按
+`symbol + quantity + entryPrice` 匹配，减过仓的 `quantity` 已是剩余量）。
+
+### #143 —— ✅ 已修（`d938926`）
+
+`attemptStart()` 成功路径不检查 `cancelledStarts` → 启动飞行中点「停止」被忽略 →
+界面显示已停止、机器人照样用真钱开单。
+
+**一处修正**：issue 说"`cancelledStarts` 全部读点都在失败分支"不准确 ——
+`2387` 行在重试循环里也有读点。但结论不变：**成功路径一处都没有**。
+
+**修复要点**（issue 的建议基本照做，并补了一个它没提的坑）：
+- 两道守卫：`running.set` **之前**（别把实例放进 running）、`start()` **之后**（立刻停掉）；
+- `permanent: true` —— 否则 `canRetry` 会把"停止"重新拉起来，等于停止被否决；
+- ⚠️ **`autoTrader.stop()` 的 `persist` 必须传 `true`**：`false` 是**进程关闭**的语义
+  （`resumePersisted()` 刻意不恢复 `stopped`），传 false 会丢掉操作员的停止意图，
+  下次部署又把它拉起来。**我第一版正是传了 false，复核时发现并改正**。
+
+**测试**：`startCancellation.test.ts` 5 条，修复前 3 条失败。
+⚠️ 诚实说明：`attemptStart` 要真实建交易所连接才能走到那几行，
+所以这是**源码结构断言**（守卫存在 + 位置正确 + `permanent` + `persist`），
+**不能证明运行时行为** —— 与同目录 `researchLifecycle.test.ts` 同一类判断。
+写提取逻辑时连错两次（块注释当边界、返回类型里的大括号当函数体起始），
+教训都写进了测试注释。
+
+### #144 —— ✅ 已修（`bf1c192`）
+
+`closeAllPositions` 前端类型漏了服务端的 `failed` → 部分标的平仓失败被静默报成功。
+
+修法**没有在组件里拼句子**，而是抽成纯函数 `lib/closeSummary.ts` 的 `summarizeClose()`：
+语气（`success` / `danger` / `neutral`）与文案只在一处决定，且可被直接单测
+（`packages/web` 没有组件级测试 —— 这是「导出的纯函数优先」那条约定在这里的用法）。
+9 条用例，核心不变量是「**只要有标的没平掉，语气就不能是成功**」。
+
+### #139 —— ❌ 以 `duplicate` 关闭
+
+与 #142 **同一行代码、同一根因、同一修法**。两份报告独立得出同一结论，
+反而增强了可信度。但它**独立指出了 #142 没提的两点**（回退路径要拆开、缺测试），
+两点都被采纳 —— 在关闭留言里逐条说明了。
+
+### 本轮验证
+
+```
+npm run typecheck   → 0
+npm test            → 46 + 1425 + 147，0 fail
+npm run build       → 0
+npm run lint        → 0
+npm run check:links → 0
+npm run check:routes→ 0
+npm run sim         → 18/18
+```
+
+（web 从 138 → 147 是 #144 的 9 条新用例；server 从 1420 → 1425 是 #142/#143 的 7 条。）
