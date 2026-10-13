@@ -630,6 +630,18 @@ function coerceRawDecision(input: unknown): LenientDecision | null {
  *
  * 返回值**不做边界钳制**（那是 `cycleSchedule.clampNextCheckMinutes` 的职责）——
  * 解析器只如实读出模型说了什么，钳制规则集中在一处。
+ *
+ * ## ⚠️ 为什么用循环求最小值，而不是 `Math.min(...seen)`
+ *
+ * 展开运算符会把数组长度变成**实参个数**，而实参受 V8 的栈上限约束：
+ * 实测（node 22）约 **125219 个**就抛 `RangeError: Maximum call stack size exceeded`。
+ *
+ * 而 `rawItems` 是**模型返回的决策数组**，长度完全由模型决定 ——
+ * 模型输出是不可信输入（docs/AGENTS.md §2.4）。更要命的是本函数在
+ * `parseDecisionResponse` 内、**遍历决策之前**被调用，所以异常会让整轮
+ * `parsed` 整个拿不到：**一条决策都不会执行**，连续失败还会把机器人推进 `safe_mode`。
+ *
+ * 一个循环既没有实参上限，也不改变"取最小 = 最早醒"的语义。
  */
 export function extractNextCheckMinutes(rawItems: readonly unknown[], root?: unknown): number | undefined {
   const seen: number[] = [];
@@ -642,7 +654,12 @@ export function extractNextCheckMinutes(rawItems: readonly unknown[], root?: unk
   read(root);
   for (const item of rawItems) read(item);
   if (seen.length === 0) return undefined;
-  return Math.min(...seen);
+
+  let min = seen[0] as number;
+  for (const value of seen) {
+    if (value < min) min = value;
+  }
+  return min;
 }
 
 export function parseDecisionResponse(raw: string, ctx: ParseContext): ParsedDecisionSet {

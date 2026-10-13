@@ -4,6 +4,7 @@ import type { Decision } from '@aq/shared';
 import {
   extractCoTTrace,
   extractDecisions,
+  extractNextCheckMinutes,
   hasDecisionBlock,
   parseDecisionResponse,
   repairEncoding,
@@ -641,4 +642,54 @@ test('市价单没有"等多久"可言 —— waitMinutes 归 null', () => {
   const raw = '<decision>[{"symbol":"BTCUSDT","action":"open_long","wait_minutes":180,"reasoning":"追突破"}]</decision>';
   const parsed = parseDecisionResponse(raw, context());
   assert.equal(parsed.decisions[0]!.waitMinutes, null, '市价立即成交，耐心无意义');
+});
+
+/* -------------------------------------------------------------------------- */
+/*  轮级的"下次什么时候再看盘"（next_check_in_minutes）                          */
+/* -------------------------------------------------------------------------- */
+
+test('extractNextCheckMinutes 取最小 —— "最早醒"就是最保守的那一侧', () => {
+  /*
+   * 语义来自 `extractNextCheckMinutes` 的注释：它是**轮级**属性，
+   * 数组里任何一个元素带了它就算数，多个时取**最小**。
+   * 取最大会让"某个标的想盯着"被另一条的"两小时后"吞掉，从而错过。
+   */
+  const items = [{ next_check_in_minutes: 30 }, {}, { next_check_in_minutes: 5 }];
+  assert.equal(extractNextCheckMinutes(items), 5, '必须取最小，不是最大、也不是第一个');
+});
+
+test('extractNextCheckMinutes 也认 camelCase 与 root 上的写法', () => {
+  assert.equal(extractNextCheckMinutes([], { nextCheckInMinutes: 12 }), 12, '模型写法看当天习惯');
+  assert.equal(extractNextCheckMinutes([{ nextCheckInMinutes: 7 }]), 7);
+});
+
+test('extractNextCheckMinutes 没有该字段时返回 undefined（不是 0）', () => {
+  /* 默认值方向必须与安全相反：0 会被下游当成"立刻再看一眼"，那是另一件事。 */
+  assert.equal(extractNextCheckMinutes([{}]), undefined);
+  assert.equal(extractNextCheckMinutes([], { reasoning: '没什么可看的' }), undefined);
+});
+
+test('★ 元素极多时不炸栈 —— `Math.min(...seen)` 会在约 12.5 万实参上抛 RangeError', () => {
+  /*
+   * 这是**真实缺陷的复现用例**（外部 issue #120），不是防御性测试。
+   *
+   * 原实现把累计到的值 `Math.min(...seen)` 一次性展开成实参，
+   * 而实参数量受 V8 的栈上限约束 —— 实测本机（node 22）边界是
+   * **125218 个 OK、125219 个抛 RangeError: Maximum call stack size exceeded**。
+   *
+   * 为什么后果严重：该函数在 `parseDecisionResponse` 内、**遍历决策之前**被调用，
+   * 所以异常会让本轮 `parsed` 整个拿不到 —— **整轮决策报废**（一条都不会执行），
+   * 连续失败还会把机器人推进 `safe_mode`。
+   *
+   * 而 `rawItems` 就是模型返回的决策数组，**长度由模型完全决定** ——
+   * 模型输出是不可信输入（docs/AGENTS.md §2.4），这条路径上原本**没有任何长度护栏**。
+   *
+   * 数量取 20 万（安全越过 125219 那个边界），并断言**返回值语义不变**：
+   * 不抛异常只是第一步，取最小的约定也不能在改写时丢掉。
+   */
+  const items = Array.from({ length: 200_000 }, () => ({ next_check_in_minutes: 30 }));
+  items[199_999] = { next_check_in_minutes: 3 };
+
+  assert.doesNotThrow(() => extractNextCheckMinutes(items), '不得再抛 RangeError');
+  assert.equal(extractNextCheckMinutes(items), 3, '改写成循环之后，取最小的语义必须保持');
 });
