@@ -143,6 +143,73 @@ export function renderDeskOutcome(
   const extracted = verdict?.ok === true ? extractFirstJsonArray(verdict.raw) : { decisions: null, status: 'no-block' as const };
 
   /*
+   * ══════════════════════════════════════════════════════════════════════════
+   *  ⚠️⚠️ **把模型产出整理成"人能读的一行"**（2026-10-14 两次用户反馈）
+   * ══════════════════════════════════════════════════════════════════════════
+   *
+   * ## 第一次反馈：「出现大量 `<reasoning>`、空的，还有杂乱无章」
+   *
+   * 两件事：
+   * ```
+   *   ① 模型的产出是【多行 markdown】，它的列表项 `- **实体**：…`
+   *      被前端 `teamTrace.ts` 当成了"角色" → 看板上冒出十几行假岗位
+   *   ② 展开后第一行是 `<reasoning>` —— 那是模型输出的**机器包装标签**，
+   *      不是给人看的内容，却占了 300 字预算里最显眼的位置
+   * ```
+   *
+   * ## 修法：**先剥标签，再压单行**
+   *
+   * ```
+   *   ✗ <reasoning> 让我先把这轮材料按我自己的规则走一遍…
+   *   ✓ 让我先把这轮材料按我自己的规则走一遍…
+   * ```
+   *
+   * ⚠️ 剥的是**项目自己的输出契约标签**（`AGENTS.md` §5.2：XML 标签是机器契约）——
+   * `renderDeskOutcome` 自己也在产出 `<decision>` / `<risk>` / `<team>`，
+   * 那些块各有自己的渲染，所以剥掉不会丢信息。
+   *
+   * ⚠️ 压单行**不是"只截断"**：截断到 300 字仍保留换行，解析照旧被污染。
+   *
+   * ⚠️ 前端也有一道防线（`teamTrace.ts` 的 role 形态判据）——
+   * 两层都要：单行化依赖这里记得做，形态判据是解析器的自保。
+   *
+   * ⚠️ 定义在函数**顶部**：它被汇报段与角色段两处用到，
+   * 放在中间会触发 TS2448（块级作用域变量在用之前声明）。
+   */
+  /*
+   * ⚠️⚠️ **只剥"包装类"标签，绝不碰 `<tool>`**（2026-10-14 实测踩到）。
+   *
+   * ## 事故：我的兜底正则把 `<tool>` 块拆散了
+   *
+   * 第一版写了两条规则：
+   * ```
+   *   .replace(/<\/?(?:reasoning|thinking|…)>/gi, ' ')   ← 白名单，对的
+   *   .replace(/<\/?[a-z_]+>/gi, ' ')                     ← 兜底，错的
+   * ```
+   * 那条兜底会把 `<tool>{"tool":"list_candidates"}</tool>` 的**标签**剥掉、
+   * 留下裸 JSON —— 而 `stripToolBlocks()` 是按**整块**匹配的，
+   * 标签被拆散后它就找不到了 → `teamModel.test.ts` 当场变红。
+   *
+   * ⚠️ **而且后果不只是测试**：`<tool>` 残留会让 `autoTrader` 的按需取数循环
+   * 以为"模型想调工具"，于是**重跑整个交易台**（实测 8 次交易台 = 64 次调用零产出）。
+   *
+   * ## 所以：白名单，且**只列"模型的思考/结论包装"**
+   *
+   * ```
+   *   reasoning / thinking   —— 思考包装（模型习惯用，不是给人看的）
+   *   answer                 —— 结论包装
+   *   ⚠️ decision / risk / team —— 不剥！renderDeskOutcome 自己要用它们
+   *      （剥了会把审计块的边界弄坏）
+   *   ⚠️ tool                —— 不剥！那是 stripToolBlocks 的职责
+   * ```
+   */
+  const stripModelTags = (s: string): string =>
+    s.replace(/<\/?(?:reasoning|thinking|answer)>/gi, ' ').trim();
+
+  const oneLine = (s: string, limit: number): string =>
+    stripModelTags(s).replace(/\s*\n+\s*/g, ' ').replace(/\s{2,}/g, ' ').trim().slice(0, limit);
+
+  /*
    * ── 风控官的应用（用户需求 #3）────────────────────────────────────────
    *
    * 三种情况：
@@ -213,7 +280,11 @@ export function renderDeskOutcome(
   if (typeof outcome.report === 'string' && outcome.report.length > 0) {
     lines.push('');
     lines.push('## 本轮汇报（给人看）');
-    lines.push(outcome.report.slice(0, 2_000));
+    /*
+     * ⚠️ 同样剥标签 + 压单行（见 `oneLine` 的说明）。
+     * 汇报员的产出是 JSON，压单行后仍可读（JSON 本来就不该换行占版面）。
+     */
+    lines.push(oneLine(outcome.report, 2_000));
   } else if (outcome.report === null) {
     lines.push('');
     lines.push('## 本轮汇报');
@@ -268,10 +339,29 @@ export function renderDeskOutcome(
    *
    * ⚠️ 前端也加了一道防线（`teamTrace.ts` 的 role 形态判据）——
    * 两层都要，因为"单行化"依赖这里记得做，而"形态判据"是解析器的自保。
+   *
+   * ## ⚠️ 2026-10-14 第二次修：剥掉 `<reasoning>` 这类【机器包装标签】
+   *
+   * 用户第二次反馈（同一处）：
+   * > 「出现大量 `<reasoning>`、空的，还有杂乱无章」
+   *
+   * 压成单行解决了"杂乱无章"，但**展开后第一行仍然是 `<reasoning>`** ——
+   * 因为模型的输出本来就是 `<reasoning>…</reasoning>` 包着的，
+   * 而那个标签**是机器标记，不是给人看的内容**。
+   * 它占了 300 字预算里最显眼的位置，看起来像"空内容"。
+   *
+   * 所以：**先剥标签，再压单行**。
+   * ```
+   *   ✗ <reasoning> 让我先把这轮材料按我自己的规则走一遍…
+   *   ✓ 让我先把这轮材料按我自己的规则走一遍…
+   * ```
+   *
+   * ⚠️ 剥的标签是**项目自己的输出契约**（`AGENTS.md` §5.2：XML 标签是机器契约）——
+   * `renderDeskOutcome` 自己也在产出 `<decision>` / `<risk>` / `<team>`，
+   * 所以这里剥掉它们**不会丢信息**（那些块有各自的渲染）。
+   *
+   * ⚠️ 实现已上移到函数顶部（它被汇报段与这里两处用到）。
    */
-  const oneLine = (s: string, limit: number): string =>
-    s.replace(/\s*\n+\s*/g, ' ').trim().slice(0, limit);
-
   for (const a of outcome.analyses) {
     lines.push(`- ${a.role}（${a.modelId}）：${a.ok ? oneLine(a.raw, 300) : `失败 —— ${a.error ?? '未知'}`}`);
   }
