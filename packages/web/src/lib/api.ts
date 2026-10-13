@@ -334,18 +334,19 @@ export interface LogLine {
 
 export interface TraderRow extends Trader {
   isRunning: boolean;
-  /**
-   * **AI 主动停手**的状态（没停手时是 `null`）。
+  /*
+   * ⚠️ 这里**曾经**有一个 `agentPaused: { at, reason } | null` 字段，已随
+   * `2fb0881`「彻底剔除 pause/resume —— 全自动托管里暂停就是每轮的 skip」删掉。
    *
-   * 用户 2026-10-04 的原话：「**再也不会开新仓？你确定？那这个机器人存在意义是什么？**」
+   * 它原先的用途是让界面显示"AI 已主动停手 + 恢复按钮"，对应 2026-10-04 的一次
+   * 用户投诉：模型停了手，界面却同时显示「开多」和「本轮不开新仓」，自相矛盾。
    *
-   * 他说得对：模型能调 `pause_trading` 设上这个开关、交易循环也照它拦开仓，
-   * **而清除它的入口原本不存在**（`clearPause()` 只在测试里被调用）。
-   * 于是界面只显示「开多 / 未执行（已跳过）」，人既看不出原因、也找不到出口。
+   * 今天**没有任何机制**支撑它：没有 `pause_trading` 工具、没有停手开关、
+   * 服务端也不发这个字段。真正让机器人不开新仓的是**熔断**与 `safe_mode`
+   * （见 `TraderPage` 的熔断提示），那两者都有现成的展示路径。
    *
-   * 现在服务端把它发出来，界面据此显示"停手中 + 恢复按钮"。
+   * 留这段是防止下一个人再"补"一个停手开关 —— 那个缺口是已做过的决定，不是遗漏。
    */
-  agentPaused?: { at: string; reason: string } | null;
   /**
    * 最近一次**账目校验**的结论（交易循环每轮自己算的）。
    *
@@ -736,13 +737,18 @@ export const api = {
   startTrader: (id: number, dryRun: boolean) =>
     request<StartResult>(`/traders/${id}/start`, { method: 'POST', body: { dryRun } }),
   stopTrader: (id: number) => request<{ ok: boolean }>(`/traders/${id}/stop`, { method: 'POST', body: {} }),
-  /**
-   * **恢复交易** —— 撤掉 AI 主动设下的停手开关（`pause_trading`）。
+  /*
+   * ⚠️ 这里**曾经**有一个 `resumeTrader(id)`，它 POST `/traders/${id}/resume`
+   * 去撤销 AI 主动设下的停手开关 —— 已随 `2fb0881` 删除。
    *
-   * 那个开关原本**没有任何撤销入口**：模型设得上、循环照它拦开仓，
-   * 而清除函数只在测试里被调用过 —— 机器人会永久停在新仓之外。
+   * 它在被删之前**已经是坏的**：停手开关本身被移除后，后端从来没有注册过
+   * `POST /api/traders/:id/resume`，所以任何一次调用都会 404。而前端也没有
+   * 任何组件调它（恢复按钮在 2026-10-04 就已撤掉），它是一个点了必然失败、
+   * 且没有入口能点到的方法。
+   *
+   * 今天想恢复一个不跑的机器人，正确的入口是 `startTrader` / `stopTrader`，
+   * 熔断与 `safe_mode` 有各自的说明路径 —— 不存在"AI 停手"这一态需要恢复。
    */
-  resumeTrader: (id: number) => request<{ ok: boolean }>(`/traders/${id}/resume`, { method: 'POST', body: {} }),
   /** Force one decision cycle now instead of waiting for the interval. */
   runTraderOnce: (id: number) =>
     request<{ ok: boolean; summary: string }>(`/traders/${id}/run-once`, { method: 'POST', body: {} }),

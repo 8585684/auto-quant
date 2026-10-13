@@ -21,8 +21,9 @@
  *
  * 每个工具只暴露**一个明确的查询**，而不是"给我一段 SQL"或"给我任意字段"。
  * 工具面就是模型的手：**手能伸多远，决定了它出错时能造成多大后果**。
- * 目前所有工具要么只读，要么只能收紧（`pause_trading`），只有 `set_params` 会
- * 改变系统状态，而它过守卫层（`patch.ts`）。
+ * 目前工具分成两类：8 次只读查询，加 `set_params` / `set_cycle_interval` / `finish`
+ * 三个写操作 —— 前两个都过守卫层（`patch.ts` / `clamp` 与全局熔断），
+ * `finish` 只结束本轮、不碰任何状态。
  */
 
 import type { StrategyConfig } from '@aq/shared';
@@ -424,8 +425,6 @@ export interface ToolOutcome {
   finished?: { summary: string };
   /** `set_params` 的守卫结果（含被钳制的项），调用方要落库。 */
   patch?: AgentPatchResult;
-  /** `pause_trading` 被调用。 */
-  paused?: { reason: string };
 }
 
 /**
