@@ -81,3 +81,27 @@ test('★ digests 的渲染必须含 依据 与 失效条件（裁决官直接�
   assert.ok(/依据：\$\{d\.evidence\}/.test(CODE), '★ 必须渲染 evidence（依据）');
   assert.ok(/失效条件：\$\{d\.invalidates\}/.test(CODE), '★ 必须渲染 invalidates（失效条件）');
 });
+
+test('★★★ 按币并行的 task 必须写清【JSON 输出契约】（2026-10-13 全失败的根因）', () => {
+  /*
+   * ## 事故：20 个标的全部解析失败
+   *
+   * 第一版 task 只写了"方向判断、信号强度、关键位、依据" ——
+   * `parseDigest` 要求严格 JSON（symbol/direction/score/confidence/evidence/
+   * invalidates，缺一即整体失败），而模型自然输出了散文。
+   *
+   * 线上：`按币并行完成：成功 0 · 失败 20`
+   *
+   * ## 判据：task 文本里必须出现契约的关键字段名
+   */
+  for (const field of ['"symbol"', '"direction"', '"score"', '"confidence"', '"evidence"', '"invalidates"']) {
+    assert.ok(
+      CODE.includes(field),
+      `★ task 里必须写明输出字段 ${field} —— 否则模型输出散文，parseDigest 全部失败`,
+    );
+  }
+  assert.ok(
+    /只输出一个 JSON 对象/.test(CODE),
+    '★ task 必须开宗明义"只输出一个 JSON 对象" —— 与 judge 的"先输出 JSON 数组"同一条纪律',
+  );
+});

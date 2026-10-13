@@ -1587,9 +1587,35 @@ async function runTradingDeskInner(input: {
             role: 'market_analyst',
             tier: 'T2_mid',
             context: task.context,
+            /*
+             * ⚠️⚠️ **必须逐字段写清输出契约**（2026-10-13 线上实测抓到的接线 BUG）。
+             *
+             * 第一版只写了"方向判断、信号强度、关键位、依据" —— 结果
+             * **20 个标的全部解析失败**（`按币并行完成：成功 0 · 失败 20`）。
+             *
+             * 根因：`parseDigest` 要求一个**严格的 JSON 对象**（symbol/direction/
+             * score/confidence/evidence/invalidates，缺一个字段就整体失败），
+             * 而 task 里没有告诉模型这件事 —— 它自然输出了散文。
+             *
+             * 这与 `judge` 那条"先输出 JSON 数组再写理由"是**同一条纪律**：
+             * 输出契约必须写进任务描述，不能指望模型猜。
+             *
+             * ⚠️ `invalidates`（失效条件）必填 —— 它防的是"谄媚"：
+             * 没有失效条件的判断无法被推翻，也就无法被学习。
+             */
             task:
-              '分析这个标的的当前状态：方向判断、信号强度（0–100）、关键支撑/阻力位、' +
-              '以及一段**可被裁决官直接使用**的依据（含具体数字）。',
+              '只输出一个 JSON 对象（不要多余文字），字段：\n' +
+              '{\n' +
+              '  "symbol": "本标的（必须与你收到的材料一致）",\n' +
+              '  "direction": "bullish | bearish | neutral | unclear 之一",\n' +
+              '  "score": 0-100 的整数（信号强度，不是上涨概率）,\n' +
+              '  "confidence": 0-100 的整数（你对自己这个判断的置信度）,\n' +
+              '  "keyLevels": { "support": 数字或null, "resistance": 数字或null },\n' +
+              `  "evidence": "结论依据（含具体数字：价格/均线/指标值）",\n` +
+              '  "invalidates": "失效条件（出现什么情况这个判断就错了）",\n' +
+              '  "dataGaps": ["哪些数据你没拿到，没有就空数组"]\n' +
+              '}\n' +
+              '数据不足时 direction 用 "unclear"，不要编。',
           });
           if (!out.ok) return { ok: false as const, text: '', error: out.error ?? '调用失败' };
           return { ok: true as const, text: out.raw };
