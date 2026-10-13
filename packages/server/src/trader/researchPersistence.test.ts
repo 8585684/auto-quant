@@ -34,31 +34,10 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
+import { codeOnly } from '../testUtils/sourceText.js';
 
 const MANAGER = readFileSync(new URL('./manager.ts', import.meta.url), 'utf8');
 
-/**
- * **只取代码行**（去掉注释）。
- *
- * ⚠️ 这是本项目**第四次**因为"注释里引用了旧代码"而假失败：
- * ```
- *   ① riskBudget.test.ts        `const riskPerTradePercent = 2;`
- *   ② marginLimit.test.ts       `这一条门槛就已经把可行集压到接近空了`
- *   ③ hunterConcurrency.test.ts `AQ_HUNTER_CONCURRENCY ?? '' || 2`
- *   ④ 本文件                    `researchCache.get(` （在解释批量替换的注释里）
- * ```
- * **"在注释里引用旧代码"是有价值的** —— 它解释了"为什么改"。
- * 所以该修的是**断言**，不是注释。
- */
-function codeOnly(src: string): string {
-  return src
-    .split('\n')
-    .filter((line) => {
-      const t = line.trim();
-      return !t.startsWith('*') && !t.startsWith('//') && !t.startsWith('/*');
-    })
-    .join('\n');
-}
 
 const CODE = codeOnly(MANAGER);
 

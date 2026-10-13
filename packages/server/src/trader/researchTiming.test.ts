@@ -27,18 +27,10 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
+import { codeOnly } from '../testUtils/sourceText.js';
 
 const MANAGER = readFileSync(new URL('./manager.ts', import.meta.url), 'utf8');
 
-function codeOnly(src: string): string {
-  return src
-    .split('\n')
-    .filter((line) => {
-      const t = line.trim();
-      return !t.startsWith('*') && !t.startsWith('//') && !t.startsWith('/*');
-    })
-    .join('\n');
-}
 const CODE = codeOnly(MANAGER);
 
 test('★★★ TTL 必须【由刷新间隔推导】，而不是写死', () => {
