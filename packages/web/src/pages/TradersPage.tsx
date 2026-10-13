@@ -206,6 +206,8 @@ export function TradersPage() {
    */
   const fleetTotal = fleetTotals({ traders, stats: statsMap, snapshots: equitySnapshots });
   const totalEquity = fleetTotal.accountEquityFleet;
+  /** 读数已过期的账户（机器人全停了 → 没有新快照）。见上面那个 Metric 的说明。 */
+  const staleAccounts = fleetTotal.accounts.filter((a) => a.accountEquityStale);
   const totalRealized = traders.reduce((sum, trader) => sum + (statsMap[trader.id]?.realizedPnl ?? 0), 0);
   const openPositions = traders.reduce((sum, trader) => sum + (statsMap[trader.id]?.openPositions ?? 0), 0);
 
@@ -289,8 +291,27 @@ export function TradersPage() {
           value={fmtUsd(totalEquity, 2)}
           size="lg"
           tone="strong"
-          sub={`${fmtInt(openPositions)} 个未平仓合约`}
-          title="按交易所账户合计的权益：同一账户下的多个机器人共用同一个钱包，只算一次；账户之间再相加。表格每一行的「归属权益」是那个机器人自己的贡献。原文：账户里的钱 —— 账户权益见机器人页与交易所凭证页。"
+          /*
+           * ⚠️ **读数过期时必须说出来**（2026-10-14）。
+           *
+           * 快照在每次决策周期结束时写一条。若某账户下的机器人**全都停了**，
+           * "最新快照"也可能是几周前的 —— 而那个数字**看起来和实时值一模一样**。
+           * `#9` 就是这种情况：停了 10 天、快照是 43 天前的。
+           *
+           * 判据来自 `fleetTotals` 的 `accountEquityStale`（> 60 分钟）。
+           * 有任何一个账户过期，这里就标出来 —— 而不是让操作员以为它是实时的。
+           */
+          sub={
+            staleAccounts.length > 0
+              ? `⚠️ ${staleAccounts.length} 个账户的读数已过期（机器人未在运行）`
+              : `${fmtInt(openPositions)} 个未平仓合约`
+          }
+          title={
+            staleAccounts.length > 0
+              ? `⚠️ 其中 ${staleAccounts.map((a) => `#${a.exchangeAccountId}`).join('、')} 的权益读数是**旧的** —— ` +
+                '那些账户下的机器人都不在运行，所以没有新快照。这个数字是最后一次读到的值，不代表现在的钱包。'
+              : '按交易所账户合计的权益：同一账户下的多个机器人共用同一个钱包，只算一次；账户之间再相加。表格每一行的「归属权益」是那个机器人自己的贡献。'
+          }
         />
         <Metric
           label="已实现盈亏"

@@ -107,6 +107,20 @@ export interface FleetAccount {
    */
   accountEquity: number;
   equitySource: AccountEquitySource;
+  /**
+   * **这条读数是【什么时候】的**（epoch ms；`null` = 不是从快照来的，是推算的）。
+   *
+   * ⚠️ 它防的是"过期读数冒充实时值"：`#9` 停了 10 天、快照是 43 天前的，
+   * 而那个数字**看起来和实时值一模一样**（见 `latestAccountReading` 的说明）。
+   * 页面据此可以说"读数过期"。
+   */
+  accountEquityAtMs: number | null;
+  /**
+   * 这条读数是否**已过期**（距现在超过 `ACCOUNT_READING_STALE_MS`）。
+   *
+   * 页面应当在它为 `true` 时**明确标注**，而不是把它当成"账户现在的钱"。
+   */
+  accountEquityStale: boolean;
   /** 该账户的起始资金（本金），见 `committedCapitalOf`。 */
   committedCapital: number;
   /** 该账户下各机器人自己的净已实现盈亏之和（可加）。 */
@@ -170,10 +184,25 @@ export interface FleetInputs {
  * 所以这里取**时间最新的那一条快照**，而不是相加、也不是取最大值 —— 取最大值
  * 在账户亏损时会把旧的高点当成当前的钱。
  */
+/**
+ * **该账户最新一次读数 + 它是什么时候的**（2026-10-14 加时刻）。
+ *
+ * ## 为什么必须把时刻一起返回（真事故）
+ *
+ * 线上 `#9` 与 `#11` 共用账户 #2，而 **`#9` 已停止 10 天**、它的快照是
+ * **43 天前**的。修复前的实现"取第一个读数"→ 用到了 `#9` 的旧值。
+ * 修成"取最新"之后，只要**同账户下还有一台在跑**，读到的就是新鲜值。
+ *
+ * ⚠️ **但两台都停了之后呢？** 那时"最新"也是 43 天前的 ——
+ * 而页面会把它当成"账户现在的钱"显示。那正是 `LAYOUT.md` §7 禁止的
+ * "文字说的不是事实"：一个过期 43 天的数字**看起来和实时值一模一样**。
+ *
+ * 所以调用方需要知道时刻，才能说"读数过期"而不是冒充实时值。
+ */
 function latestAccountReading(
   group: readonly TraderRow[],
   snapshots: Record<number, EquitySnapshot[]> | undefined,
-): number | null {
+): { value: number; atMs: number } | null {
   let newestAt = Number.NEGATIVE_INFINITY;
   let newestValue: number | null = null;
   if (snapshots) {
@@ -188,8 +217,22 @@ function latestAccountReading(
       }
     }
   }
-  return newestValue;
+  return newestValue === null ? null : { value: newestValue, atMs: newestAt };
 }
+
+/**
+ * **账户读数超过多久算"过期"**（毫秒）。
+ *
+ * ## 为什么是 60 分钟
+ *
+ * 快照在**每次决策周期结束时**写一条，而机器人的周期是 15–30 分钟。
+ * 取 60 分钟 = 最慢那档的两个周期 —— 即"连着两轮都没写进新快照"。
+ * 那已经不只是网络抖动，而是"这台机器人真的没在跑"。
+ *
+ * ⚠️ 不能用"一个周期"（15–30 分钟）：正常轮询与写库有延迟，
+ * 一次瞬时故障就会让页面闪"读数过期"，那是假告警（本项目反复踩过这一类）。
+ */
+const ACCOUNT_READING_STALE_MS = 60 * 60_000;
 
 /** 舰队合计。见本文件顶部：账户口径与机器人归属口径在这一处分开。 */
 export function fleetTotals({ traders, stats, snapshots }: FleetInputs): FleetTotals {
@@ -235,8 +278,14 @@ export function fleetTotals({ traders, stats, snapshots }: FleetInputs): FleetTo
      * 「起始资金 + Σ 本机器人净盈亏 + Σ 本机器人浮盈」这条推算与归属权益用的是
      * 同一个恒等式，只是**本金只取一次** —— 这正是它和 Σ归属权益 的区别。
      */
-    let accountEquity = latestAccountReading(group, snapshots);
+    const reading = latestAccountReading(group, snapshots);
+    let accountEquity = reading === null ? null : reading.value;
     let equitySource: AccountEquitySource = 'snapshot';
+    /*
+     * ⚠️ **读数时刻只对快照来源有意义** —— 另两个来源（stats / derived）没有
+     * 可比的时刻，所以是 `null`（页面不会误标它们"过期"）。
+     */
+    let accountEquityAtMs: number | null = reading === null ? null : reading.atMs;
 
     if (accountEquity === null) {
       const fromStats = group.reduce(
@@ -261,11 +310,21 @@ export function fleetTotals({ traders, stats, snapshots }: FleetInputs): FleetTo
       equitySource = 'capital';
     }
 
+    /*
+     * ⚠️ **过期判定只在"读数来自快照"时才成立** ——
+     * stats / derived 两条来源没有可比时刻（`accountEquityAtMs === null`），
+     * 把它们标成"过期"是假告警。
+     */
+    const accountEquityStale =
+      accountEquityAtMs !== null && Date.now() - accountEquityAtMs > ACCOUNT_READING_STALE_MS;
+
     const account: FleetAccount = {
       exchangeAccountId,
       traderIds: group.map((trader) => trader.id),
       accountEquity,
       equitySource,
+      accountEquityAtMs,
+      accountEquityStale,
       committedCapital,
       realizedPnl,
       unrealizedPnl,
