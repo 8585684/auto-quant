@@ -124,6 +124,44 @@ export function preserveBigIds(text: string): string {
 export const WEIGHT_WINDOW_MS = 60_000;
 
 /**
+ * 收到一条新的 `x-mbx-used-weight-1m` 读数时，本地窗口锚点该怎么走。
+ *
+ * 抽成注入时间的纯函数，与 `decayWeight()` 同一个理由（AGENTS.md §5.4：导出的纯函数
+ * 优先于需要打桩的对象）——「币安换窗」这件事没法在测试里真等一分钟。
+ *
+ * 两个重锚条件，缺一个就会失明：
+ *
+ *  1. **读数下降**（`reading < previous`）：服务器计数器归零重启的唯一无歧义信号。
+ *     用挂钟分钟当锚点是相位盲的——币安的分钟边界不是我们的，提前重置等于朝着我们
+ *     想躲开的那个上限连发。
+ *  2. **本地窗口已过期**（`now - windowStart >= WEIGHT_WINDOW_MS`）：
+ *     ⚠️ 这是补上的第二个条件，缺了它本文件就有一个真实缺陷。只认"读数下降"时，
+ *     **币安换窗后新窗口用量恰好 ≥ 本地记忆值** 的情形（`reading >= previous`）不触发
+ *     重锚，锚点便一直停在旧窗口起点；`decayWeight()` 于是看到 `elapsed >= 60s` 直接
+ *     返回 0，**把新窗口的真实用量整段忽略** —— 软限速对整个新窗口失明，只剩币安自己
+ *     的 429 与 418 IP 封禁兜底（正是本文件顶部极力要避免的结局）。时间过期本身就是
+ *     充分信号：币安窗口最多 60 秒，本地 60 秒后的读数必属新窗口。
+ *
+ * @param previousReading 上一次记账的读数（尚无读数时为 0）
+ * @param windowStartMs   本地记录的窗口起点；0 = 从未收到过任何读数
+ * @param nowMs           当前本地时间
+ * @param reading         本条响应携带的读数
+ * @returns 需要重锚时返回 `nowMs`，否则返回 0（调用方据此保持原锚点不动）。
+ *          首次收到读数（`windowStartMs === 0`）一定重锚。
+ */
+export function reanchorWindow(
+  previousReading: number,
+  windowStartMs: number,
+  nowMs: number,
+  reading: number,
+): number {
+  const firstEver = windowStartMs === 0;
+  const dropped = reading < previousReading;
+  const stale = nowMs - windowStartMs >= WEIGHT_WINDOW_MS;
+  return dropped || firstEver || stale ? nowMs : 0;
+}
+
+/**
  * How much of a weight reading we still believe is charged, `elapsedMs` into the
  * window it belongs to.
  *
@@ -505,16 +543,12 @@ export class BinanceRest {
     const parsed = Number.parseInt(raw, 10);
     if (!Number.isFinite(parsed)) return;
     /*
-     * Re-anchor the window when the server's counter goes *down*, which is the
-     * one unambiguous signal that Binance has rolled its minute over. Anchoring
-     * on a wall-clock minute instead would be phase-blind: Binance's minute
-     * boundary is not ours, and resetting early means burst-sending straight
-     * into the limit we are trying to stay away from.
+     * 重锚条件写在 `reanchorWindow()` 里（纯函数，可单测）：
+     * 读数下降、或本地窗口已过期 —— 后者缺了会让整个新窗口失明。详见那个函数的注释。
      */
     const now = Date.now();
-    if (parsed < this.usedWeight1m || this.weightWindowStart === 0) {
-      this.weightWindowStart = now;
-    }
+    const reanchor = reanchorWindow(this.usedWeight1m, this.weightWindowStart, now, parsed);
+    if (reanchor > 0) this.weightWindowStart = reanchor;
     this.usedWeight1m = parsed;
   }
 
