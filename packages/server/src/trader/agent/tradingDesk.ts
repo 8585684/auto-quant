@@ -186,16 +186,96 @@ export function headOfMarket(marketContext: string, budgetChars: number): {
   totalCandidates: number;
 } {
   /*
+   * ══════════════════════════════════════════════════════════════════════════
+   *  ⚠️⚠️ **先把规则段摘出来，让它【不参与任何截断】**（2026-10-13 实测 P0）
+   * ══════════════════════════════════════════════════════════════════════════
+   *
+   * ## 事故：规则段被 `overviewCap` 腰斩（每轮 100% 触发）
+   *
+   * 这条是**独立审计**发现的第三条路径，而**线上证据当天就印证了它**：
+   * ```
+   *   #2590 c97（修①之前）: MUST=false  default-to-action=false   ← 全丢
+   *   #2592 c98（修①之后）: MUST=**true**  default-to-action=false ← 只有前半段到了
+   * ```
+   * 也就是"规则开始被引用了，但**只有前 3.9k 字符幸存**"。
+   *
+   * ## 根因：`compacted.shared` 被当成"概览"再截一次
+   *
+   * 材料形状（默认压缩路径）：
+   * ```
+   *   analystContext = compacted.shared + 前 6 个候选切片
+   *                    ↑ 含【概览 + 账户 + 绩效 + 规则段】
+   *   headOfMarket(analystContext, 24000)
+   *     → overview = 第一个候选之前的全部内容（= compacted.shared）
+   *     → overviewCap = 24000/4 = 6000
+   *     → overview.slice(0, 6000)   ← ❌ 规则段 12.9k，被砍到只剩约 3.9k
+   * ```
+   * 实测（真实 `systemPrompt` 12858 字符 + 线上材料形状）：
+   * ```
+   *   # 入场标准          offset 2587  → 幸存
+   *   # 输出格式          offset 4098  → **丢失**
+   *   # 你自己写下的长期指示 offset 12860 → **丢失**
+   * ```
+   * 边界：`shared` 的"规则段之前"部分 ≥ 3502 字符时，**连 `# 入场标准` 都丢**。
+   *
+   * ## 为什么上一轮的修②救不回来
+   *
+   * 修② 的判据是"在**最后一个 part** 里找 marker" —— 而修① 已经把规则段
+   * 搬到了 `shared`（不在任何 part 里）→ 修② 在这条路径上**永远找不到东西可补**。
+   *
+   * **这是"两个各自正确的修复合起来失效"** —— 与本项目记录过的
+   * `ai_requested` + "只取前 6 个"是同一类组合性缺陷。
+   *
+   * ## 修法：规则段是【行为约束】，不是"可裁的背景材料"
+   *
+   * ```
+   *   裁候选/裁概览  → 省 token（材料是"参考"）
+   *   裁规则段       → **改变系统行为**（模型不知道自己的义务）
+   * ```
+   * 所以它在**任何截断之前**就被摘出来，最后无条件接回。
+   * 代价是几 KB，换来的是"模型知道自己该做什么"。
+   */
+  const RULES_MARKER = '\n---\n\n## 团队需要遵守的规则';
+  /*
+   * ⚠️ 规则段可能出现在**两处**（取决于材料怎么拼的）：
+   *   · 在 `shared` 里（压缩路径：修① 把它搬进了 shared）
+   *   · 在**最后一个候选之后**（未压缩路径：routedModel 直接拼在末尾）
+   * 两处都要处理。
+   */
+  const extractRules = (text: string): { body: string; rules: string } => {
+    const at = text.indexOf(RULES_MARKER);
+    if (at < 0) return { body: text, rules: '' };
+    return { body: text.slice(0, at), rules: text.slice(at) };
+  };
+
+  /*
    * 找候选段的起点：第一处 `### 1. `（或 `### <数字>. `）。
    * ⚠️ 用行首锚定，避免命中正文里偶然出现的 `### 1.`。
    */
   const firstCand = /^###\s*\d+\.\s*\S/m.exec(marketContext);
   if (firstCand === null) {
-    /* 没有候选段（例如持仓管理轮）→ 退回前缀（那是唯一可做的事实）。 */
-    return { text: marketContext.slice(0, budgetChars), candidatesShown: 0, totalCandidates: 0 };
+    /*
+     * 没有候选段（例如持仓管理轮）→ 退回前缀。
+     *
+     * ⚠️⚠️ **但规则段仍要保住**（2026-10-13 审计发现的第四条路径）：
+     * 持仓轮的材料 = 概览 + 持仓 + 绩效 + 规则段，实测 29612 字符，
+     * 而预算 24000 → 直接 `slice` 会把规则段尾巴砍掉。
+     */
+    const { body, rules } = extractRules(marketContext);
+    const room = Math.max(0, budgetChars - rules.length);
+    return {
+      text: (body.length > room ? body.slice(0, room) : body) + rules,
+      candidatesShown: 0,
+      totalCandidates: 0,
+    };
   }
   const overviewEnd = firstCand.index;
-  const overview = marketContext.slice(0, overviewEnd);
+  /*
+   * ⚠️ **先把规则段从 overview 里摘出来** —— 它不参与 `overviewCap`。
+   * 摘完再截断，这样规则段永远不会被腰斩。
+   */
+  const rawOverview = marketContext.slice(0, overviewEnd);
+  const { body: overview, rules: overviewRules } = extractRules(rawOverview);
   const rest = marketContext.slice(overviewEnd);
 
   /* 按 `### N. ` 切开候选段。 */
@@ -267,15 +347,31 @@ export function headOfMarket(marketContext: string, budgetChars: number): {
    * ⚠️ 判据用 `routedModel` 拼材料时的那个独特分隔符；找不到时**原样返回**
    *（退化成修之前的行为，而不是把材料弄坏）。
    */
-  const RULES_MARKER = '\n---\n\n## 团队需要遵守的规则';
   /*
-   * ⚠️ 只有当规则段**还没随某个 picked 带进来**时才补 —— 否则会重复两份。
-   * 判据用"已收内容里有没有那个 marker"，比"最后一个 part 是否被 picked"
-   * 更稳（不依赖 `picked` 与 `parts` 的下标对应关系）。
+   * ⚠️⚠️ **判据必须同时看 `head` 与 `picked`**（2026-10-13 审计发现的坑）。
+   *
+   * 上一版只查 `picked.some(...)` —— 而修① 把规则段搬进了 `shared`，
+   * 于是它出现在 `head` 里（不在任何 part 里）→ 那个判据**永远为 false**，
+   * 又去 `parts[last]` 找 marker（那里已经被搬空）→ 补不上。
+   *
+   * 现在改成三段来源合并：
+   * ```
+   *   ① overviewRules —— 从 `head` 里摘出来的（压缩路径，修① 搬进 shared 的那份）
+   *   ② picked 里的    —— 未压缩路径下，规则段随最后一个候选一起被收进来
+   *   ③ parts[last] 的 —— 未压缩路径下，规则段被 break 挡在外面时单独取
+   * ```
+   * ⚠️ 三处**只取一份**（重复会让模型以为有两套规则）。
    */
-  const alreadyHasRules = picked.some((p) => p.includes(RULES_MARKER));
+  const rulesFromPicked = picked.find((p) => p.includes(RULES_MARKER));
   let rulesTail = '';
-  if (!alreadyHasRules) {
+  if (overviewRules !== '') {
+    /* ① 优先：从 head 里摘出来的那份（最完整 —— 它没被截断过）。 */
+    rulesTail = overviewRules;
+  } else if (rulesFromPicked !== undefined) {
+    /* ② 已经在 picked 里了 → 不用再补（避免重复）。 */
+    rulesTail = '';
+  } else {
+    /* ③ 未压缩路径：规则段在最后一个 part 里、且被 break 挡在外面。 */
     const lastPart = parts[parts.length - 1];
     if (lastPart !== undefined) {
       const at = lastPart.indexOf(RULES_MARKER);
