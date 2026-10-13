@@ -458,7 +458,7 @@ Vanta（另一个账号/agent）的提交全部是【真 BUG 修复】：
 | 文件 | 作用 |
 | --- | --- |
 | [`COLLABORATION.md`](COLLABORATION.md) | PR/Issue 处理的五道闸门 |
-| [`../AGENTS.md`](../AGENTS.md) | 项目不变量、验证阶梯、代码风格 |
+| [`AGENTS.md`](AGENTS.md) | 项目不变量、验证阶梯、代码风格 |
 | [`RELEASING.md`](RELEASING.md) | 发版流程 |
 | [`../.github/workflows/ci.yml`](../.github/workflows/ci.yml) | 自动化校验 |
 | [`archive/`](archive/) | 已归档的一次性文档（保历史，不再是长期文档）|
