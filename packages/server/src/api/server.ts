@@ -313,6 +313,32 @@ export function publicAccount<T extends { apiKey: string }>(account: T) {
   return { ...rest, apiKeyMasked: maskSecret(apiKey) };
 }
 
+/**
+ * 读 `:id` 路由参数，转不成有限数字就抛一个 **400**。
+ *
+ * 以前 22 条路由各自写 `Number((request.params as { id: string }).id)`，
+ * 而 `NaN` 会被 `db/index.ts` 的 `normalise()` 静默绑成 NULL —— 于是
+ * `WHERE id = NULL` 查不到行，接口回 **404「找不到该凭据/该机器人」**。
+ *
+ * 一个拼错的 URL 因此得到"这条记录不存在"的回答：操作员会去找一条
+ * 从来没存在过的记录，而真正的病因（路径写错）被完全藏住。
+ */
+export function idParamOf(params: unknown): number {
+  const raw = (params as { id?: unknown }).id;
+  /*
+   * 空串要先拦掉：`Number('')` 是 **0**，而 0 是有限数 —— 少了这一步，
+   * `/api/traders//positions` 这种少了一段路径的 URL 会变成"查 id 0"，
+   * 同样是个看不出病因的错误答案。
+   */
+  const id = typeof raw === 'string' && raw.trim() !== '' ? Number(raw) : NaN;
+  if (!Number.isFinite(id)) {
+    const error = new Error('请求路径里的 ID 无效。');
+    (error as { statusCode?: number }).statusCode = 400;
+    throw error;
+  }
+  return id;
+}
+
 /* -------------------------------------------------------------------------- */
 /*  Health truth                                                               */
 /* -------------------------------------------------------------------------- */
@@ -538,6 +564,9 @@ export async function buildServer(deps: ApiDependencies): Promise<FastifyInstanc
     if (status >= 500) log.error(`unhandled API error: ${error.message}`, error);
     void reply.code(status).send({ error: error.message });
   });
+
+  /** `:id` 路由参数的读取入口（解析与拒绝逻辑见 `idParamOf`）。 */
+  const idOf = (request: AuthedRequest): number => idParamOf(request.params);
 
   /** Wrap a handler so thrown errors become clean 400s with a message. */
   const guard =
@@ -1024,7 +1053,7 @@ export async function buildServer(deps: ApiDependencies): Promise<FastifyInstanc
    * "now", and serving them a stale number would be a lie.
    */
   app.get('/api/exchange-accounts/:id/balance', authed, async (request, reply) => {
-    const id = Number((request.params as { id: string }).id);
+    const id = idOf(request);
     if (!exchanges.get(id)) return reply.code(404).send({ ok: false, error: '找不到该凭据' });
 
     const refresh = String((request.query as { refresh?: string }).refresh ?? '') === '1';
@@ -1078,7 +1107,7 @@ export async function buildServer(deps: ApiDependencies): Promise<FastifyInstanc
   });
 
   app.patch('/api/exchange-accounts/:id', authed, guard(async (body: unknown, request) => {
-    const id = Number((request.params as { id: string }).id);
+    const id = idOf(request);
     const parsed = ExchangeAccountInputSchema.partial().safeParse(body);
     if (!parsed.success) throw new Error(parsed.error.issues[0]?.message ?? 'Invalid input');
 
@@ -1097,7 +1126,7 @@ export async function buildServer(deps: ApiDependencies): Promise<FastifyInstanc
   }));
 
   app.delete('/api/exchange-accounts/:id', authed, guard(async (_body: unknown, request, reply) => {
-    const id = Number((request.params as { id: string }).id);
+    const id = idOf(request);
     const inUse = exchanges.usageCount(id);
     if (inUse > 0) {
       return reply.code(409).send({
@@ -1111,7 +1140,7 @@ export async function buildServer(deps: ApiDependencies): Promise<FastifyInstanc
 
   /** Connect with the stored key and report exactly what is wrong, if anything. */
   app.post('/api/exchange-accounts/:id/test', authed, async (request, reply) => {
-    const id = Number((request.params as { id: string }).id);
+    const id = idOf(request);
     const row = exchanges.getWithSecret(id);
     if (!row) return reply.code(404).send({ error: '找不到该凭据' });
 
@@ -1365,7 +1394,7 @@ export async function buildServer(deps: ApiDependencies): Promise<FastifyInstanc
   }));
 
   app.patch('/api/ai-models/:id', authed, guard(async (body: unknown, request) => {
-    const id = Number((request.params as { id: string }).id);
+    const id = idOf(request);
     const parsed = AiModelInputSchema.partial().safeParse(body);
     if (!parsed.success) throw new Error(parsed.error.issues[0]?.message ?? 'Invalid input');
 
@@ -1406,7 +1435,7 @@ export async function buildServer(deps: ApiDependencies): Promise<FastifyInstanc
    * refused everything" both look like "the bot did nothing" from outside.
    */
   app.post('/api/strategies/:id/check', authed, async (request, reply) => {
-    const id = Number((request.params as { id: string }).id);
+    const id = idOf(request);
     const strategy = strategies.get(id);
     if (!strategy) return reply.code(404).send({ ok: false, error: '找不到该策略' });
 
@@ -1451,7 +1480,7 @@ export async function buildServer(deps: ApiDependencies): Promise<FastifyInstanc
   });
 
   app.delete('/api/ai-models/:id', authed, guard(async (_body: unknown, request, reply) => {
-    const id = Number((request.params as { id: string }).id);
+    const id = idOf(request);
     const inUse = aiModels.usageCount(id);
     if (inUse > 0) {
       return reply.code(409).send({ error: `该模型正被 ${inUse} 个机器人使用。` });
@@ -1467,7 +1496,7 @@ export async function buildServer(deps: ApiDependencies): Promise<FastifyInstanc
    * 刷新页面,「最近测试」就回到"从未测试" —— 结果只活在前端内存里。
    */
   app.post('/api/ai-models/:id/test', authed, async (request, reply) => {
-    const id = Number((request.params as { id: string }).id);
+    const id = idOf(request);
     const row = aiModels.getWithSecret(id);
     if (!row) return reply.code(404).send({ error: '找不到该模型' });
 
@@ -1511,7 +1540,7 @@ export async function buildServer(deps: ApiDependencies): Promise<FastifyInstanc
    * 新机器人仍然要手动改回来。这个端点补上缺的那一头。
    */
   app.post('/api/ai-models/:id/set-default', authed, async (request, reply) => {
-    const id = Number((request.params as { id: string }).id);
+    const id = idOf(request);
     if (!aiModels.get(id)) return reply.code(404).send({ error: '找不到该模型' });
     settings.set('default_ai_model_id', String(id));
     return { ok: true, defaultAiModelId: id };
@@ -1546,7 +1575,7 @@ export async function buildServer(deps: ApiDependencies): Promise<FastifyInstanc
   );
 
   app.get('/api/strategies/:id', authed, async (request, reply) => {
-    const strategy = strategies.get(Number((request.params as { id: string }).id));
+    const strategy = strategies.get(idOf(request));
     if (!strategy) return reply.code(404).send({ error: '找不到该策略' });
     return strategy;
   });
@@ -1563,7 +1592,7 @@ export async function buildServer(deps: ApiDependencies): Promise<FastifyInstanc
   }));
 
   app.patch('/api/strategies/:id', authed, guard(async (body: unknown, request, reply) => {
-    const id = Number((request.params as { id: string }).id);
+    const id = idOf(request);
     const parsed = StrategyInputSchema.partial().safeParse(body);
     if (!parsed.success) throw new Error(parsed.error.issues[0]?.message ?? 'Invalid strategy');
 
@@ -1579,7 +1608,7 @@ export async function buildServer(deps: ApiDependencies): Promise<FastifyInstanc
   }));
 
   app.delete('/api/strategies/:id', authed, guard(async (_body: unknown, request, reply) => {
-    const id = Number((request.params as { id: string }).id);
+    const id = idOf(request);
     const inUse = strategies.usageCount(id);
     if (inUse > 0) {
       return reply.code(409).send({ error: `该策略正被 ${inUse} 个机器人使用。` });
@@ -1810,7 +1839,7 @@ export async function buildServer(deps: ApiDependencies): Promise<FastifyInstanc
   }));
 
   app.patch('/api/traders/:id', authed, guard(async (body: unknown, request, reply) => {
-    const id = Number((request.params as { id: string }).id);
+    const id = idOf(request);
     if (deps.manager.isRunning(id)) {
       return reply.code(409).send({ error: '请先停止该机器人，再修改它的配置。' });
     }
@@ -1862,14 +1891,14 @@ export async function buildServer(deps: ApiDependencies): Promise<FastifyInstanc
   }));
 
   app.delete('/api/traders/:id', authed, guard(async (_body: unknown, request) => {
-    const id = Number((request.params as { id: string }).id);
+    const id = idOf(request);
     await deps.manager.stopTrader(id);
     traders.remove(id);
     return { ok: true };
   }));
 
   app.post('/api/traders/:id/start', authed, async (request, reply) => {
-    const id = Number((request.params as { id: string }).id);
+    const id = idOf(request);
     if (env.globalTradingDisabled) {
       return reply.code(503).send({
         error: '交易已被 GLOBAL_TRADING_DISABLED 全局禁用。要启动机器人请先移除该设置。',
@@ -1887,7 +1916,7 @@ export async function buildServer(deps: ApiDependencies): Promise<FastifyInstanc
 
   app.post('/api/traders/:id/stop', authed, async (request) => {
     /* ⚠️ 不 await：stopTrader 已先把状态翻成 stopped 并掐断在途 AI 请求（2026-10-10）。 */
-    void deps.manager.stopTrader(Number((request.params as { id: string }).id));
+    void deps.manager.stopTrader(idOf(request));
     return { ok: true };
   });
 
@@ -1917,7 +1946,7 @@ export async function buildServer(deps: ApiDependencies): Promise<FastifyInstanc
    * 与单币种平仓同样**不做任何前置检查** —— 见上面那条的说明。
    */
   app.post('/api/traders/:id/positions/close-all', authed, async (request, reply) => {
-    const id = Number((request.params as { id: string }).id);
+    const id = idOf(request);
     try {
       const result = await deps.manager.closeAllPositions(id);
       return { ok: true, ...result };
@@ -1927,7 +1956,7 @@ export async function buildServer(deps: ApiDependencies): Promise<FastifyInstanc
   });
 
   app.post('/api/traders/:id/positions/:symbol/close', authed, async (request, reply) => {
-    const id = Number((request.params as { id: string }).id);
+    const id = idOf(request);
     const symbol = String((request.params as { symbol: string }).symbol).toUpperCase();
     try {
       const result = await deps.manager.closePosition(id, symbol);
@@ -1938,7 +1967,7 @@ export async function buildServer(deps: ApiDependencies): Promise<FastifyInstanc
   });
 
   app.post('/api/traders/:id/run-once', authed, async (request, reply) => {
-    const id = Number((request.params as { id: string }).id);
+    const id = idOf(request);
     if (env.globalTradingDisabled) {
       return reply.code(503).send({ error: '交易已被全局禁用。' });
     }
@@ -1967,7 +1996,7 @@ export async function buildServer(deps: ApiDependencies): Promise<FastifyInstanc
    * 参数写回后**不会**立刻变成订单：下单是决策周期的事，而周期在熔断下不跑。
    */
   app.post('/api/traders/:id/agent-review', authed, async (request, reply) => {
-    const id = Number((request.params as { id: string }).id);
+    const id = idOf(request);
     try {
       const result = deps.manager.requestAgentReview(id);
       if (!result.accepted) return reply.code(409).send({ ok: false, ...result });
@@ -1985,7 +2014,7 @@ export async function buildServer(deps: ApiDependencies): Promise<FastifyInstanc
    * able to do while trading is disabled.
    */
   app.post('/api/traders/:id/reconcile', authed, async (request, reply) => {
-    const id = Number((request.params as { id: string }).id);
+    const id = idOf(request);
     try {
       const result = await deps.manager.reconcileTrader(id);
       return { ok: true, ...result };
@@ -1995,9 +2024,6 @@ export async function buildServer(deps: ApiDependencies): Promise<FastifyInstanc
   });
 
   /* --- Trader data ------------------------------------------------------- */
-
-  const traderIdOf = (request: { params: unknown }): number =>
-    Number((request.params as { id: string }).id);
 
   /**
    * Read the exchange directly for a trader's live account and positions.
@@ -2177,7 +2203,7 @@ export async function buildServer(deps: ApiDependencies): Promise<FastifyInstanc
    * 客户端据此不渲染那一行 —— 而不是渲染成"没有熔断"。
    */
   app.get('/api/traders/:id/stats', authed, async (request) => {
-    const id = traderIdOf(request);
+    const id = idOf(request);
     return {
       ...computeTraderStats(id),
       circuitBreaker: deps.manager.readCircuitBreaker(id),
@@ -2200,7 +2226,7 @@ export async function buildServer(deps: ApiDependencies): Promise<FastifyInstanc
   });
 
   app.get('/api/traders/:id/positions', authed, async (request, reply) => {
-    const id = traderIdOf(request);
+    const id = idOf(request);
     const live = await liveExchangeView(id);
 
     /*
@@ -2265,7 +2291,7 @@ export async function buildServer(deps: ApiDependencies): Promise<FastifyInstanc
 
   /** Live exchange view, so the console can show truth rather than our mirror. */
   app.get('/api/traders/:id/account', authed, async (request, reply) => {
-    const trader = traders.get(traderIdOf(request));
+    const trader = traders.get(idOf(request));
     if (!trader) return reply.code(404).send({ error: '找不到该机器人' });
     return liveExchangeView(trader.id);
   });
@@ -2284,7 +2310,7 @@ export async function buildServer(deps: ApiDependencies): Promise<FastifyInstanc
    * 操作员看到余额不对，而机器人已经停了、不会再跑对账。
    */
   app.get('/api/traders/:id/foreign-activity', authed, (request, reply) => {
-    const trader = traders.get(traderIdOf(request));
+    const trader = traders.get(idOf(request));
     if (!trader) return reply.code(404).send({ error: '找不到该机器人' });
     return readForeignActivityFor(trader.id);
   });
@@ -2308,7 +2334,7 @@ export async function buildServer(deps: ApiDependencies): Promise<FastifyInstanc
     // `before` 是非数字/缺失时按"第一页"处理：发不出正确游标的调用方应该拿到
     // 最新的一页，而不是一个 400（与 `limit` 的钳制同一个取舍）。
     const before = Number(query.before);
-    return orderStore.list(traderIdOf(request), limit, Number.isFinite(before) ? before : null);
+    return orderStore.list(idOf(request), limit, Number.isFinite(before) ? before : null);
   });
 
   /**
@@ -2353,7 +2379,7 @@ export async function buildServer(deps: ApiDependencies): Promise<FastifyInstanc
    * 分三个请求会让面板出现三次加载闪烁。
    */
   app.get('/api/traders/:id/agent-audit', authed, (request) => {
-    const traderId = traderIdOf(request);
+    const traderId = idOf(request);
     const query = request.query as { limit?: string };
     const parsed = Number(query.limit ?? 20);
     /* 钳制而不报错 —— 与 `clampDecisionLimit` 同一个原则（界面传错不该 500）。 */
@@ -2401,7 +2427,7 @@ export async function buildServer(deps: ApiDependencies): Promise<FastifyInstanc
    * AI 层建在这一层之上，见 `selfcheckRunner.runSelfCheck` 的 `ask` 参数。
    */
   app.post('/api/traders/:id/selfcheck', authed, async (request) => {
-    const traderId = traderIdOf(request);
+    const traderId = idOf(request);
     const query = request.query as { windowHours?: string };
     const parsed = Number(query.windowHours ?? 6);
     /* 钳制而不报错 —— 与其它端点同一原则。 */
@@ -2421,7 +2447,7 @@ export async function buildServer(deps: ApiDependencies): Promise<FastifyInstanc
     const limit = Number(query.limit ?? TRADE_PAGE_DEFAULT);
     const before = Number(query.before);
     return tradeStore.list(
-      traderIdOf(request),
+      idOf(request),
       limit,
       Number.isFinite(before) ? before : null,
       typeof query.beforeClosedAt === 'string' && query.beforeClosedAt.length > 0
@@ -2449,7 +2475,7 @@ export async function buildServer(deps: ApiDependencies): Promise<FastifyInstanc
     // `before` 是新参数，非数字/缺失一律按"第一页"处理：发不出正确游标的调用方
     // 应该拿到最新的一页，而不是一个 400。
     const before = Number(query.before);
-    const records = decisionStore.list(traderIdOf(request), limit, Number.isFinite(before) ? before : null);
+    const records = decisionStore.list(idOf(request), limit, Number.isFinite(before) ? before : null);
     /*
      * ⚠️ **列表绝不返回提示词全文。**
      *
@@ -2469,7 +2495,7 @@ export async function buildServer(deps: ApiDependencies): Promise<FastifyInstanc
   app.get('/api/traders/:id/decisions/:recordId', authed, async (request, reply) => {
     const recordId = Number((request.params as { recordId: string }).recordId);
     const record = decisionStore.get(recordId);
-    if (!record || record.traderId !== traderIdOf(request)) {
+    if (!record || record.traderId !== idOf(request)) {
       return reply.code(404).send({ error: '找不到该决策记录' });
     }
     return record;
@@ -2488,7 +2514,7 @@ export async function buildServer(deps: ApiDependencies): Promise<FastifyInstanc
      */
     const raw = Number((request.query as { limit?: string }).limit ?? 500);
     const limit = Number.isFinite(raw) ? Math.min(Math.max(Math.trunc(raw), 1), 5000) : 500;
-    return equityStore.list(traderIdOf(request), limit);
+    return equityStore.list(idOf(request), limit);
   });
 
   /* --- Public market data ------------------------------------------------ */
