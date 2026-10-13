@@ -48,8 +48,6 @@ curl -fsSL https://raw.githubusercontent.com/laolaoshiren/auto-quant/main/deploy
 
 📖 完整说明：[deploy/README.md](deploy/README.md) · [部署指南](docs/DEPLOYMENT.md)
 
-📖 完整说明：[deploy/README.md](deploy/README.md) · [部署指南](docs/DEPLOYMENT.md)
-
 ---
 
 ## ✨ 能力

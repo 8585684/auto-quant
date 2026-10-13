@@ -58,7 +58,7 @@
 
 ### 闸门 ②：有没有碰这五个「不可违反的不变量」
 
-见 [`AGENTS.md`](../AGENTS.md#2-改动规则不可违反的不变量)。逐条问：
+见 [`AGENTS.md`](AGENTS.md#2-改动规则不可违反的不变量)。逐条问：
 
 | 不变量 | 怎么快速查 |
 | --- | --- |
@@ -186,4 +186,4 @@ gh pr merge <n> --squash --delete-branch
 | [`../labeler.yml`](../.github/labeler.yml) | 路径 → 标签 |
 | [`RELEASING.md`](RELEASING.md) | 发版流程 |
 | [`../CONTRIBUTING.md`](../CONTRIBUTING.md) | 贡献者规则（外部协作者看的那份）|
-| [`AGENTS.md`](../AGENTS.md) | 不变量、验证阶梯、代码风格 |
+| [`AGENTS.md`](AGENTS.md) | 不变量、验证阶梯、代码风格 |
