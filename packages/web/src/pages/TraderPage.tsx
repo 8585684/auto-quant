@@ -2145,7 +2145,6 @@ export function TraderPage() {
           tab={tableTab}
           onChange={setTableTab}
           positionCount={openPositionCount}
-          openOrderCount={openOrders.length}
           onSelectSymbol={(symbol) => {
             /*
              * ⚠️ **点币种要同时把图表切到「行情」** —— 只设币种是不够的。
