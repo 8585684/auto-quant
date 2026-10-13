@@ -190,6 +190,39 @@ export function renderDeskOutcome(
   lines.push('');
   lines.push('<team>');
   lines.push(`交易台：${outcome.summary}`);
+  /*
+   * ══════════════════════════════════════════════════════════════════════════
+   *  ⭐ **汇报员的人话**（2026-10-14 渲染进审计块）
+   * ══════════════════════════════════════════════════════════════════════════
+   *
+   * ## 为什么放在"各角色产出"之前
+   *
+   * 它是**给操作员看的一段人话**（用户需求 ⑤ 的"汇报工作的"）——
+   * 应该最先看到，而不是埋在技术产出里。角色产出是"过程"，
+   * 汇报是"结论"，两者读者不同。
+   *
+   * ## ⚠️ 三态必须区分（`reporter.test.ts` 已钉住语义）
+   *
+   * ```
+   *   string      它跑了，这是它的话 —— 原样展示
+   *   null        它跑了但失败 —— 明说"汇报失败"（不是空白）
+   *   undefined   预算不足没被调用 —— 明说"没跑"（不是空白）
+   * ```
+   * 空白是"看不出异常的失败" —— 操作员会以为"这轮没有值得汇报的"。
+   */
+  if (typeof outcome.report === 'string' && outcome.report.length > 0) {
+    lines.push('');
+    lines.push('## 本轮汇报（给人看）');
+    lines.push(outcome.report.slice(0, 2_000));
+  } else if (outcome.report === null) {
+    lines.push('');
+    lines.push('## 本轮汇报');
+    lines.push('（汇报员跑了但失败 —— 决策本身不受影响，见下方各角色产出）');
+  } else {
+    lines.push('');
+    lines.push('## 本轮汇报');
+    lines.push('（本轮预算不足，汇报员没有被调用 —— 结论是完整的，只是没有写成人话）');
+  }
   if (outcome.truncatedByBudget) {
     lines.push('⚠️ 本轮因预算/轮次上限提前收尾 —— 结论是在受限条件下得出的。');
   }
