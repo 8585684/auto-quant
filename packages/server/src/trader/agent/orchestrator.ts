@@ -244,7 +244,54 @@ export async function runStrategyReview(input: {
   // 4. 跑循环
   const budget = chosen.intensity === 'panel' ? STRATEGIST_MAX_STEPS.panel : STRATEGIST_MAX_STEPS.single;
   const task = strategistTask(budget);
-  const factsText = `唤醒原因：${decision.why}\n当前参数：${JSON.stringify(input.ports.readConfig())}`;
+  /*
+   * ══════════════════════════════════════════════════════════════════════════
+   *  ⚠️⚠️ **不要把 `tradingMode` 交给策略师**（2026-10-13 实测抓到）
+   * ══════════════════════════════════════════════════════════════════════════
+   *
+   * ## 事故：它据此写下了一条【系统并不执行】的约束
+   *
+   * 原来这里是 `JSON.stringify(input.ports.readConfig())` —— **整份配置**，
+   * 含 `"tradingMode":"conservative"`。而策略师据此写了
+   *（`agent_experiments #81` 的 patch 原文）：
+   * ```
+   *   "For the **conservative mode** on this small account (~20 USDT equity):
+   *    1. Enter when the 15m or 1h chart shows a directional move…"
+   * ```
+   * **它把"conservative"当成了一个必须遵守的档位** ——
+   * 而系统在**托管模式下并不按那一档约束任何东西**
+   *（`defaultAiTeamConfig()` 把 `minConfidence`/`minRiskRewardRatio`/
+   *  `maxMarginUsage` 全放开了，只留 `requireStopLoss` 那个结构要求）。
+   *
+   * ## 为什么这比"不告诉它"更糟
+   *
+   * 这是**同一个假约束的第三个出口**：
+   * ```
+   *   ① `system_prompt` 里的 `MODE_GUIDANCE['conservative']`   ← 已修
+   *   ② `user_prompt` 里的"交易模式：conservative"             ← 已修
+   *   ③ **本处**：策略师的参数 dump 里的 `"tradingMode"`        ← 本轮修
+   * ```
+   * 前两处修完后，策略师**仍然**从这第三处读到了它 ——
+   * 而它的反应是**把那个不存在的档位写进自己的规则**，
+   * 于是那个假约束**从提示词搬进了它的 `entryStandards`**（会一直生效）。
+   *
+   * ## 修法：给它**该管的字段**，而不是整份配置
+   *
+   * ```
+   *   ✗ tradingMode      —— 系统预设档，托管模式下不执行（给了就是假约束）
+   *   ✗ name/description —— 与调参无关的元数据
+   *   ✓ riskControl / throttle / circuitBreaker / coinSource / promptSections
+   *                      —— 这些**确实是它能用 `set_params` 改的**
+   * ```
+   * ⚠️ 这正是"**只给它需要的**"那条原则：一份"什么都给"的 dump 里，
+   * 每一个它管不到的字段都可能被它当成约束。
+   */
+  const configForStrategist = (() => {
+    const cfg = input.ports.readConfig() as unknown as Record<string, unknown>;
+    const { tradingMode: _drop, name: _n, description: _d, ...rest } = cfg;
+    return rest;
+  })();
+  const factsText = `唤醒原因：${decision.why}\n当前参数：${JSON.stringify(configForStrategist)}`;
 
   /*
    * 工具调用的序列要进实验记录，而 `set_params` 会在**循环中途**写那条记录。
