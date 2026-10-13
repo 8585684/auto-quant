@@ -55,17 +55,24 @@ import {
   SKIN_KEY,
   getDensity,
   getSkin,
+  isSkinSupported,
   setDensity,
   setSkin,
   type Density,
   type Skin,
 } from '../templates/lib/appearance';
+import { getTemplate } from '../templates/registry';
 
 export function AppearancePage() {
   useDocumentTitle('外观');
 
   const templateId = useTemplateStore((s) => s.id);
   const setTemplateId = useTemplateStore((s) => s.setId);
+  /*
+   * 当前模板的完整定义 —— 「主题」那一段要用 `supportedSkins` 判断哪些选项
+   * 真的会生效（见那里的注释：classic 固定深色）。
+   */
+  const activeTemplate = getTemplate(templateId);
   const [skin, setSkinState] = useState<Skin>(() => getSkin());
   const [density, setDensityState] = useState<Density>(() => getDensity());
 
@@ -170,15 +177,37 @@ export function AppearancePage() {
         <div className="grid grid-cols-1 items-start gap-2 sm:grid-cols-2">
           {SKINS.map((option) => {
             const active = skin === option.id;
+            /*
+             * ⚠️ **不支持的选项要禁用，而不是让它看起来可点**（外部 issue #171）。
+             *
+             * classic 没有浅色 CSS 规则（`templates/classic/` 下 `skin` 零命中），
+             * 所以它在 classic 下点了会：写进 localStorage、`data-skin` 也写对、
+             * 按钮显示已选中 —— **而界面一个像素都不变**。
+             *
+             * 原来只在页面底部小字里写了一句「经典模板只有深色……切了不会坏，
+             * 只是看不出来」—— 那是**点击之后**才可能读到的说明，
+             * 而按钮本身仍然承诺"这会生效"。禁用 + 就地说明才是诚实的形态。
+             */
+            const supported = isSkinSupported(activeTemplate.supportedSkins, option.id);
             return (
               <button
                 key={option.id}
                 type="button"
+                disabled={!supported}
                 onClick={() => pickSkin(option.id)}
                 aria-pressed={active}
+                title={
+                  supported
+                    ? undefined
+                    : `「${activeTemplate.label}」模板固定深色，不支持浅色主题`
+                }
                 className={cn(
                   'flex min-w-0 items-start gap-3 rounded-lg border px-3 py-2.5 text-left transition',
-                  active ? 'border-accent bg-accent-soft' : 'border-base-700 bg-base-900 hover:border-base-600',
+                  !supported
+                    ? 'cursor-not-allowed border-base-800 bg-base-900/40 opacity-50'
+                    : active
+                      ? 'border-accent bg-accent-soft'
+                      : 'border-base-700 bg-base-900 hover:border-base-600',
                 )}
               >
                 <span
@@ -194,9 +223,15 @@ export function AppearancePage() {
                   )}
                 </span>
                 <span className="min-w-0 flex-1">
-                  <span className="flex items-center gap-1.5">
+                  <span className="flex flex-wrap items-center gap-1.5">
                     <span className="text-base font-semibold text-ink-hi">{option.label}</span>
-                    {active && <Check aria-hidden className="h-3.5 w-3.5 shrink-0 text-accent" />}
+                    {active && supported && <Check aria-hidden className="h-3.5 w-3.5 shrink-0 text-accent" />}
+                    {/* 就地说明"为什么不能选"，而不是把理由藏在页面底部的小字里。 */}
+                    {!supported && (
+                      <span className="chip chip-plain shrink-0 border-base-700 text-ink-lo">
+                        该模板固定深色
+                      </span>
+                    )}
                   </span>
                   <span className="mt-0.5 block text-xs leading-relaxed text-ink-lo">{option.hint}</span>
                 </span>
@@ -210,7 +245,8 @@ export function AppearancePage() {
           里的一段内联脚本在样式表生效前读出来 —— 所以刷新时不会先闪一下另一种底色。
           <br />
           ⚠️ <strong className="font-semibold text-ink-lo">经典模板只有深色</strong>
-          ：它的配色就是原版配色，这一项在那套外壳下不生效（切了不会坏，只是看不出来）。
+          ：它的配色就是原版配色，所以那一项在当前模板下**是禁用的**（不再是一个点了
+          没反应的开关）。切到「控制台」或「静谧」即可使用浅色。
         </p>
       </section>
 

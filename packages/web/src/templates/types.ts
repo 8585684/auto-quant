@@ -109,6 +109,22 @@ export interface TemplateDefinition {
    * 内置的 `classic` 是 `false`，`console` 是 `true`。
    */
   ownsPalette: boolean;
+  /**
+   * **这套模板真的支持哪几套主题**（`dark` / `light`）。
+   *
+   * ## 为什么必须是独立声明，不能拿 `ownsPalette` 当代理（issue #171）
+   *
+   * `ownsPalette` 回答的是"这套模板**是否覆盖 CSS 变量**"；而"支持几套主题"是
+   * **另一件事** —— 一套模板可以自带配色却只有深色（`classic` 就是：
+   * 它用 `:root` 的默认色板，而浅色规则只写在 `console` / `quill` 的 theme.css 里）。
+   *
+   * 拿前者当后者的代理，将来加模板时两者一旦不同步，就会重现同一个缺陷：
+   * **外观页把「浅色」摆出来、用户点了、按钮还显示已选中，而界面毫无变化。**
+   *
+   * 省略（`undefined`）= 不做限制 —— 第三方模板不必知道这个字段。
+   * 内置三套都显式声明，并由 `appearance.test.ts` 检查"声明与 CSS 规则一致"。
+   */
+  supportedSkins?: readonly ('dark' | 'light')[];
 }
 
 /**

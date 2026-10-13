@@ -33,6 +33,17 @@ export const BUILT_IN: TemplateDefinition[] = [
     rootClass: 'aq-classic',
     Shell: ClassicShell,
     ownsPalette: false,
+    /*
+     * ⚠️ **只有深色 —— 这是"原版外观"的定义，不是漏了浅色。**
+     *
+     * `templates/classic/` 下 `grep skin` 零命中：浅色规则只写在
+     * `console/theme.css:210` 与 `quill/theme.css:215`。
+     *
+     * 声明在这里之后，外观页会**禁用**「浅色」并说明原因 —— 在那之前它是个
+     * 点了没反应的开关：设置写进了 localStorage、`data-skin` 也写对了、
+     * 按钮还显示已选中，而**界面一个像素都不变**（外部 issue #171）。
+     */
+    supportedSkins: ['dark'],
   },
   {
     id: 'console',
@@ -41,6 +52,7 @@ export const BUILT_IN: TemplateDefinition[] = [
     rootClass: 'aq-console',
     Shell: ConsoleShell,
     ownsPalette: true,
+    supportedSkins: ['dark', 'light'],
   },
   {
     id: 'quill',
@@ -49,6 +61,7 @@ export const BUILT_IN: TemplateDefinition[] = [
     rootClass: 'aq-quill',
     Shell: QuillShell,
     ownsPalette: true,
+    supportedSkins: ['dark', 'light'],
   },
 ];
 
