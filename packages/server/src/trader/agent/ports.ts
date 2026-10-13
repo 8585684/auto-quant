@@ -286,7 +286,43 @@ export function makeAgentPorts(deps: AgentPortDeps): OrchestratorPorts {
           at: d.timestamp,
           success: d.success,
           error: d.error,
-          decisions: d.decisions.map((x) => ({ symbol: x.symbol, action: x.action })),
+          /*
+           * ══════════════════════════════════════════════════════════════════
+           *  ⚠️ **`reasoning` 必须给它**（2026-10-14 实测抓到的缺口）
+           * ══════════════════════════════════════════════════════════════════
+           *
+           * ## 事故：策略师写的规则被裁决官用【规则外的理由】绕过，而它不知道
+           *
+           * 线上实测（`#11` `c127`）：
+           * ```
+           *   策略师的 entryStandards（明文）：
+           *     「skip 的【唯一】合法理由是 (a) 无标的 ≥0.8% 位移 或 (b) 点差/深度不足。
+           *       No other condition gates entry.
+           *       若 (a) 满足 → 【必须】开仓，'选择不交易'是违规」
+           *
+           *   bull 的论证：BLURUSDT 位移 +2.43% ≥ 0.8% → 【触发】
+           *   裁决官的判决：skip，理由「反弹追多是接飞刀，两边赔率都不成立」
+           *                ← 这是【第 (c) 个理由】，而规则说没有别的理由能挡住入场
+           * ```
+           * **规则被绕过了，而策略师看不到** —— 因为这里只给了 `action`。
+           *
+           * ## 为什么这是缺口而不是"它自己该去查"
+           *
+           * 它**能**读到"BLUR 被 skip 了"（`decisions` 字段），
+           * 但**读不到"为什么"**。而"为什么"才是它判断
+           * "我的规则是否被遵守"的唯一依据 —— 没有它，规则永远不会被校准。
+           *
+           * ⚠️ 这与 `rejected` 字段同一个道理（那里给了 detail）——
+           * 决策理由的重要性不比拒绝理由低，反而更高（它是主动判断）。
+           *
+           * ⚠️ 截断到 200 字：一轮 20 条 × 完整理由会让这个工具的输出
+           * 吃掉策略师的上下文预算。200 字足够看出"它用了什么理由"。
+           */
+          decisions: d.decisions.map((x) => ({
+            symbol: x.symbol,
+            action: x.action,
+            reasoning: x.reasoning.length > 200 ? `${x.reasoning.slice(0, 200)}…` : x.reasoning,
+          })),
           // 被风控拒绝/跳过/失败 —— 这是"参数与市场脱节"的证据
           rejected: d.executionLog
             .filter((e) => e.status !== 'ok')
