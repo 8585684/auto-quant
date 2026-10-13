@@ -86,6 +86,39 @@ export function parseTeamTrace(rawResponse: string): TeamTrace | null {
     const role = parenOpen < 0 ? head.trim() : head.slice(0, parenOpen).trim();
     const modelId = parenOpen < 0 ? null : head.slice(parenOpen + 1).replace(/）\s*$/, '').trim();
     if (role.length === 0) continue;
+    /*
+     * ══════════════════════════════════════════════════════════════════════════
+     *  ⚠️⚠️ **`role` 必须是"角色 id 的形态"，否则这是【正文里的列表项】**
+     *      （2026-10-14 用户截图抓到：「出现大量 <reasoning>、空的，杂乱无章」）
+     * ══════════════════════════════════════════════════════════════════════════
+     *
+     * ## 事故：把模型输出里的 markdown 列表当成了角色
+     *
+     * 解析器原来只要求「以 `- ` 开头 + 含 `：`」—— 而**角色的产出本身就是多行
+     * markdown，里面全是列表项**。线上实测（`#11` `c134` 的 `<team>` 块）：
+     * ```
+     *   - newscaster（group/team-grunt）：# 新闻事件卡      ← 真角色行
+     *   - **实体**：Interactive Brokers（IBKR）、ZeroHash    ← 新闻卡的内容！被当成角色
+     *   - **方向**：bullish（对 ETH 需求面偏多）              ← 同上
+     *   - 6 个候选的完整指标序列：BTCUSDT、TRUTHUSDT、…      ← market_analyst 的正文
+     *   - ARC开空75分                                        ← bull 的正文
+     * ```
+     * 结果是看板上冒出十几行"岗位"（`**实体**`、`6 个候选的完整指标序列`…），
+     * 而它们其实是某个角色的**正文内容** —— 用户看到的"杂乱无章"就是这个。
+     *
+     * ## 判据：角色 id 是**纯小写英文 + 下划线**（`market_analyst` / `judge` / `bull`…）
+     *
+     * ```
+     *   ✓ market_analyst · technical · newscaster · sentiment · bull · bear · judge · reporter
+     *   ✗ **实体**                    ← 含 `*`
+     *   ✗ 6 个候选的完整指标序列        ← 含中文与空格
+     *   ✗ BTC 83372.70 +0.57%，ETH…   ← 含空格、数字、标点
+     *   ✗ ARC开空75分                  ← 含中文与数字
+     * ```
+     * ⚠️ 用**形态**判据而不是"已知角色白名单"：后端加新角色时前端不该跟着改
+     *（`rosterEntries` 已经能处理"编制表之外的角色"那种情况）。
+     */
+    if (!/^[a-z][a-z0-9_]*$/.test(role)) continue;
     members.push({ role, modelId, text });
   }
 

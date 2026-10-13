@@ -240,11 +240,43 @@ export function renderDeskOutcome(
   }
   lines.push('');
   lines.push('## 各角色产出');
+  /*
+   * ══════════════════════════════════════════════════════════════════════════
+   *  ⚠️⚠️ **产出必须压成【单行】再放进来**（2026-10-14 用户截图抓到的 BUG）
+   * ══════════════════════════════════════════════════════════════════════════
+   *
+   * ## 事故：模型的正文被当成了"角色"
+   *
+   * 用户看到看板上冒出十几行莫名其妙的"岗位"：
+   * ```
+   *   **实体** · **方向** · **强度** · 6 个候选的完整指标序列 · ARC开空75分 …
+   * ```
+   * 而它们其实是**某个角色产出里的 markdown 列表项**。
+   *
+   * 根因链（两处合起来）：
+   * ```
+   *   ① 这里把 raw.slice(0, 300) 原样插进一行 —— 而 raw 是【多行】的
+   *   ② 前端 teamTrace.ts 逐行扫 '## 各角色产出' 之后的内容，
+   *      见到 `- xxx：yyy` 就当角色行
+   *   → 多行正文里的 `- **实体**：…` 于是变成了一行"角色"
+   * ```
+   *
+   * ## 修法：压成单行（换行 → 空格），并保留截断提示
+   *
+   * ⚠️ **不是"只截断"**：截断到 300 字仍会保留正文里的换行，问题照旧。
+   * 必须把**所有换行压掉**，让每个角色严格占一行。
+   *
+   * ⚠️ 前端也加了一道防线（`teamTrace.ts` 的 role 形态判据）——
+   * 两层都要，因为"单行化"依赖这里记得做，而"形态判据"是解析器的自保。
+   */
+  const oneLine = (s: string, limit: number): string =>
+    s.replace(/\s*\n+\s*/g, ' ').trim().slice(0, limit);
+
   for (const a of outcome.analyses) {
-    lines.push(`- ${a.role}（${a.modelId}）：${a.ok ? a.raw.slice(0, 300) : `失败 —— ${a.error ?? '未知'}`}`);
+    lines.push(`- ${a.role}（${a.modelId}）：${a.ok ? oneLine(a.raw, 300) : `失败 —— ${a.error ?? '未知'}`}`);
   }
-  if (outcome.bull) lines.push(`- bull（${outcome.bull.modelId}）：${outcome.bull.ok ? outcome.bull.raw.slice(0, 400) : '失败'}`);
-  if (outcome.bear) lines.push(`- bear（${outcome.bear.modelId}）：${outcome.bear.ok ? outcome.bear.raw.slice(0, 400) : '失败'}`);
+  if (outcome.bull) lines.push(`- bull（${outcome.bull.modelId}）：${outcome.bull.ok ? oneLine(outcome.bull.raw, 400) : '失败'}`);
+  if (outcome.bear) lines.push(`- bear（${outcome.bear.modelId}）：${outcome.bear.ok ? oneLine(outcome.bear.raw, 400) : '失败'}`);
   /*
    * ⚠️ **裁决官要留完整**（2026-10-13 修）。
    *
@@ -267,8 +299,11 @@ export function renderDeskOutcome(
    * 现在给 4,000 字（实测最长约 3,000）—— 完整保留它的推理与数组。
    * 分析师的 300 字**保持不变**：他们是并行产出、量大，
    * 而且他们的结论已经在辩论材料里被完整引用过。
+   *
+   * ⚠️ 2026-10-14：**同样要压成单行**（见上面 `oneLine` 的说明）——
+   * 裁决官的输出是多行 markdown，它的列表项会被解析器当成"角色"。
    */
-  if (verdict) lines.push(`- judge（${verdict.modelId}）：${verdict.ok ? verdict.raw.slice(0, 4_000) : `失败 —— ${verdict.error ?? '未知'}`}`);
+  if (verdict) lines.push(`- judge（${verdict.modelId}）：${verdict.ok ? oneLine(verdict.raw, 4_000) : `失败 —— ${verdict.error ?? '未知'}`}`);
   lines.push('</team>');
 
   return lines.join('\n');

@@ -43,15 +43,25 @@ test('★★★ 裁决官的产出不能被截到看不出结论的长度', () =
   /*
    * ⚠️ 这是那个假结论的直接来源：`verdict.raw.slice(0, 800)`。
    * 800 字**不够**装下它的推理 + JSON 数组。
+   *
+   * ⚠️ 2026-10-14：渲染从 `verdict.raw.slice(0, N)` 改成了
+   * `oneLine(verdict.raw, N)`（**多一层"压成单行"** —— 多行正文里的
+   * markdown 列表项会被前端误解析成"角色"，见 `deskOutput.ts` 的说明）。
+   * 截断长度**没有变**（仍是 4,000），所以这条测试的意图不变，只改判据形态。
    */
   assert.ok(
     !/verdict\.raw\.slice\(0,\s*800\)/.test(DESK_OUTPUT),
     '★ 裁决官不能再截到 800 字（实测它的输出 1,500–3,000 字）',
   );
-  const m = /verdict\.raw\.slice\(0,\s*([\d_]+)\)/.exec(DESK_OUTPUT);
-  assert.ok(m !== null, '★ 应当有裁决官的截断长度');
+  const m = /oneLine\(verdict\.raw,\s*([\d_]+)\)/.exec(DESK_OUTPUT);
+  assert.ok(m !== null, '★ 应当有裁决官的截断长度（形态：oneLine(verdict.raw, N)）');
   const len = Number((m[1] ?? '0').replace(/_/g, ''));
   assert.ok(len >= 3_000, `★ 至少要 3,000 字才装得下它的推理与数组（实际 ${len}）`);
+  /* ⚠️ 且必须走 oneLine（不能退回裸 slice —— 那会让多行正文污染解析）。 */
+  assert.ok(
+    !/verdict\.raw\.slice\(0,\s*4_000\)/.test(DESK_OUTPUT),
+    '★ 必须走 oneLine（压成单行），不能用裸 slice —— 多行会破坏前端解析',
+  );
 });
 
 test('★★★ 提示词必须明确"不许只给空数组"', () => {
