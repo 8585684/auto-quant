@@ -705,6 +705,91 @@ npm run sim         → exit 0  （18/18 项校验全部通过）
 而修法本身属风控引擎改动，按 `CONTRIBUTING.md` 需要开发窗口连同 `npm run sim` 一起做。
 所以探针的**内容**写进了 issue 回帖，形状可直接改成回归用例。
 
+---
+
+## 8. 第 3 轮下半场：首批外部 PR 的处理
+
+外部贡献者开始提 PR 了。本轮处理了 3 个（另 3 个新到，待下一轮）。
+
+### ⚠️ 一个必须先说清的环境事实：这三个 PR 的 CI 都是 `action_required`
+
+```
+CI | fix/check-links-skip-claude-dir  | pull_request | action_required
+CI | refactor/clean-pause-resume-debris | pull_request | action_required
+CI | ci/verify-docs-and-routes        | pull_request | action_required
+```
+
+`action_required` = GitHub 对**首次贡献者**的运行需要人工批准，**不是失败、也不是通过**。
+所以闸门①「CI 绿吗」在这三个 PR 上**读不出来** —— 页面上根本没有那四条结果。
+
+按 COLLABORATION.md 的精神（"CI 是必需的，因为本地把关证明不了别人的代码"），
+我的替代做法是：**把 PR 分支与最新 main 合并到临时 worktree，在本地跑一遍
+与 `ci.yml` 等价的全部步骤**（typecheck / lint / test / build / 密钥扫描 / 新接入的两步）。
+每个 PR 的结论都建立在这个替代验证上，并在回帖里写明"CI 未运行"。
+
+### PR #129 —— ✅ 已合并（squash `a802899`）
+
+`refactor(agent): 清掉 pause/resume 删除后遗留的悬空引用`
+
+**它回答了 #115/#116 的方向问题**（我上一轮标了 `needs-triage` 等开发窗口定夺）：
+main 上的 `2fb0881`「彻底剔除 pause/resume —— 全自动托管里暂停就是每轮的 skip」
+**已经做出了选择（方案 B：清除半成品）**，只是删除不完整 —— 类型字段、死方法、
+以及两处**与事实相反**的注释还留着。
+
+我核过：`2fb0881` 确实是 `HEAD` 的祖先，`prompt.ts` 已经删了 `paused`，
+但 `api.ts` 的 `agentPaused` / `resumeTrader`、`TraderPage.tsx` 那段
+「运维侧恢复端点保留」的注释、以及三个测试文件里的 `pauses` 死数组都还在。
+所以这个 PR 做的是**把已做出的决定收尾**，不是替人做决定。
+
+五道闸门：①本地全套替代验证 ✅（typecheck / 46+1395+133 / build / lint / sim 18/18）；
+②不碰 `risk/` `binance/` `autoTrader.ts` ✅；③纯类型与注释清理，PR 自己勾了"不涉及真实资金" ✅；
+④无站点信息与凭据 ✅；⑤提交信息**有长正文**（违反 §5.5）—— 按闸门⑤的例外条款，
+**用 squash 合并并由我写合规标题**，不为一行提交信息打回。
+
+顺带效果：`check:routes` 从 **exit 1 → 0**（`resumeTrader` 的悬空路由消除）。
+合并后 **#112 与 #115 自动关闭**。
+
+### PR #130 —— ✅ 已合并（squash `3bfca31`）
+
+`ci: 把文档链接与前后端接口一致性接进 CI` + `check-links.mjs` 改用 `git check-ignore`
+
+**这一条正是 issue #114 的实现**，且它顺手把 `.claude` 噪音用更通用的方式解决了。
+
+五道闸门：①本地全套替代验证 ✅；②不碰风控/下单 ✅；③改的是 `.github/**` + 脚本
+（`deployment` 路径），PR 勾了"不涉及真实资金" ✅；④干净 ✅；⑤标题合规 ✅。
+
+**合并前我实测了两件真正需要证明的事**（而不只是"跑过测试"）：
+1. **接进 CI 不会把 main 弄红**（这是 #114 当时唯一的顾虑）：
+   `check:links` / `check:routes` 在 main 上都是 **exit 0**；
+2. **新方案仍然抓得到真坏链**：往 `docs/` 写一条指向不存在文件的链接 → **exit 1** ✅；
+   同时有 `.claude/` + `.cursor/` 噪音时 → **exit 0** ✅。
+   即"忽略被 gitignore 的目录"与"仍然发现真坏链"两条同时成立。
+
+### PR #127 —— ❌ 以「被取代」关闭（不是退回）
+
+贡献者本人随后用 **#130** 对**同一个文件**给出了更通用的解法，且 #130 已先合入。
+两个 PR 都在治 `.claude` 噪音，但判据不同：
+
+| | #127 | #130（采用） |
+| --- | --- | --- |
+| 做法 | `SKIP_DIRS` 加死 `'.claude'` | `git check-ignore` 过滤**所有被 gitignore 的路径** |
+| 判据 | "它叫什么名字" | **"它进不进版本库"** |
+| 顺带 | 4 条无关的 `.gitignore` 项 | 把两步接进 CI（= #114） |
+
+实测确认 #130 **完全覆盖** #127 的诉求（有 `.claude` 噪音时 exit 0），
+而两个都合会让 `check-links.mjs` 同时带两套逻辑（`.claude` 既在 `SKIP_DIRS` 里
+又被 gitignore 过滤）—— 属冗余。
+
+**这个取舍问过用户**（它影响另一个人的在途工作，且两种答案都站得住），
+按用户选择：**先合 #130，再把 #127 作为被取代关闭**。
+关闭留言里写明了"你的诊断是对的、根因也一样"并附实测对比，
+避免让贡献者读成"你的活白干了"。
+
+那 4 条 `.gitignore` 新增项我核过**不会遮蔽任何现有文件**（仓库里没有
+`probe*.ts` / `.aqtest/` / `packages/server/src/tmpprobe/`），但与本 PR 声称的修复无关
+（CONTRIBUTING「一个 PR 只做一件逻辑上的事」），建议单独提 —— 我在留言里说了
+"这类本地探针确实需要一个归属，单独提我倾向收"。
+
 | Issue | 回帖要点 |
 | --- | --- |
 | 117 | 唯一 `risk.review()` 在 3831 行；回执路径 8122 行直调 `executeAdjust`；方向校验只在 `reviewAdjust`（用例 822-896 为证） |
