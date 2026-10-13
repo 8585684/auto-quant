@@ -33,10 +33,24 @@ import { usePolled } from '../lib/hooks';
 import { useRunOnce } from '../lib/actions';
 import type { StrategyRecord } from '@aq/shared';
 import { NAV_ITEMS } from './nav';
+import { StopConsequence } from './ConfirmStopTrader';
 import { Badge, Button, Dot, cn } from './ui';
 
 /** 选中一个需要确认的动作后，面板会切成这个状态。 */
-type Pending = { kind: 'start'; trader: TraderRow; dryRun: boolean } | { kind: 'run-once'; trader: TraderRow };
+type Pending =
+  | { kind: 'start'; trader: TraderRow; dryRun: boolean }
+  | { kind: 'run-once'; trader: TraderRow }
+  /*
+   * ⚠️ `stop` 也走这个 `pending` 流程（外部 issue #121）。
+   *
+   * 它此前**唯独**这个动作绕过 `pending`，直接在 `onSelect` 里 `void stopBot(trader)` ——
+   * 于是"回车即停"。而同一个面板里更轻的「立即执行一次周期」反而是有确认的，
+   * 这个不对称本身就是漏改的证据。
+   *
+   * 为什么必须确认：停止**不会平仓**，误停一台持有杠杆仓位的机器人 =
+   * 那些仓位从此没人管保护位。而命令面板是键盘驱动的，误触代价更高。
+   */
+  | { kind: 'stop'; trader: TraderRow };
 
 const ITEM_CLASS =
   'flex cursor-pointer select-none items-center gap-2.5 rounded-md px-2.5 py-2 text-base text-ink-mid ' +
@@ -237,6 +251,7 @@ export function CommandPalette({ open, onOpenChange }: { open: boolean; onOpenCh
                 onCancel={() => setPending(null)}
                 onConfirm={() => {
                   if (pending.kind === 'start') void startBot(pending.trader, pending.dryRun);
+                  else if (pending.kind === 'stop') void stopBot(pending.trader);
                   else void runCycle(pending.trader);
                 }}
               />
@@ -309,7 +324,7 @@ export function CommandPalette({ open, onOpenChange }: { open: boolean; onOpenCh
                           value={`停止 ${trader.name} stop ${trader.id}`}
                           disabled={busy}
                           className={ITEM_CLASS}
-                          onSelect={() => void stopBot(trader)}
+                          onSelect={() => setPending({ kind: 'stop', trader })}
                         >
                           <Square aria-hidden className="h-4 w-4 shrink-0 text-down" />
                           <span className="min-w-0 flex-1 truncate">停止「{trader.name}」</span>
@@ -420,7 +435,11 @@ function ConfirmStep({
     <div className="flex min-h-0 flex-1 flex-col">
       <header className="panel-head shrink-0">
         <h2 className="min-w-0 truncate text-md font-semibold text-ink-hi">
-          {pending.kind === 'start' ? `启动「${trader.name}」` : `立即执行一次周期「${trader.name}」`}
+          {pending.kind === 'start'
+            ? `启动「${trader.name}」`
+            : pending.kind === 'stop'
+              ? `停止「${trader.name}」`
+              : `立即执行一次周期「${trader.name}」`}
         </h2>
         <Button size="icon" variant="ghost" aria-label="关闭" onClick={onCancel}>
           <X aria-hidden className="h-4 w-4" />
@@ -428,7 +447,10 @@ function ConfirmStep({
       </header>
 
       <div className="min-h-0 flex-1 space-y-3 overflow-y-auto p-4">
-        {pending.kind === 'start' ? (
+        {pending.kind === 'stop' ? (
+          /* 后果文案与另外三个入口共用同一份（见 `ConfirmStopTrader.tsx`）。 */
+          <StopConsequence name={trader.name} />
+        ) : pending.kind === 'start' ? (
           <>
             <div className="grid grid-cols-1 items-start gap-2 sm:grid-cols-2">
               <button
@@ -482,17 +504,34 @@ function ConfirmStep({
           </p>
         )}
 
-        <p className="text-xs leading-relaxed text-ink-faint">
-          停止机器人不会自动平仓：已有仓位继续由交易所侧止损 / 止盈保护。
-        </p>
+        {/* stop 分支自己已经写了完整后果（`StopConsequence`），不必再重复一句。 */}
+        {pending.kind !== 'stop' && (
+          <p className="text-xs leading-relaxed text-ink-faint">
+            停止机器人不会自动平仓：已有仓位继续由交易所侧止损 / 止盈保护。
+          </p>
+        )}
       </div>
 
       <footer className="flex shrink-0 flex-wrap items-center justify-end gap-2 border-t border-base-800 px-4 py-2.5">
         <Button autoFocus onClick={onCancel}>
           取消
         </Button>
-        <Button variant={live ? 'warn' : 'primary'} busy={busy} onClick={onConfirm}>
-          {pending.kind === 'start' ? (pending.dryRun ? '以模拟模式启动' : '实盘启动 — 真实资金') : '立即执行'}
+        {/*
+          stop 用 danger（与另外三个入口一致），而不是 primary ——
+          这是**停止真实在跑的循环**，不是"继续"。
+        */}
+        <Button
+          variant={pending.kind === 'stop' ? 'danger' : live ? 'warn' : 'primary'}
+          busy={busy}
+          onClick={onConfirm}
+        >
+          {pending.kind === 'stop'
+            ? '确认停止'
+            : pending.kind === 'start'
+              ? pending.dryRun
+                ? '以模拟模式启动'
+                : '实盘启动 — 真实资金'
+              : '立即执行'}
         </Button>
       </footer>
     </div>

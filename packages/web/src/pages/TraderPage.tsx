@@ -35,6 +35,7 @@ import {
 } from '../components/equityCurve';
 import { CandlestickChart } from '../components/CandlestickChart';
 import { StartTraderModal } from '../components/TraderModals';
+import { ConfirmStopTrader } from '../components/ConfirmStopTrader';
 import { TraderConfigModal } from '../components/TraderConfigModal';
 import { TraderAccountStrip, type TraderAccountState } from '../components/BalanceCells';
 import {
@@ -229,6 +230,14 @@ export function TraderPage() {
 
   const [startOpen, setStartOpen] = useState(false);
   const [configOpen, setConfigOpen] = useState(false);
+  /**
+   * 「停止」是否已请求确认。
+   *
+   * ⚠️ 这个状态存在的理由（外部 issue #121）：停止**不会平仓**，
+   * 所以误停一台持有杠杆仓位的机器人 = 那些仓位从此没人管保护位。
+   * 此前这个按钮**单击即停**，而列表页同一个操作是有确认的。
+   */
+  const [stopConfirmOpen, setStopConfirmOpen] = useState(false);
   const [busy, setBusy] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
   const [tableTab, setTableTab] = useState<TraderTabId>('positions');
@@ -1770,7 +1779,7 @@ export function TraderPage() {
           */}
           <div className="ml-auto flex flex-wrap items-center gap-1.5">
             {trader.isRunning ? (
-              <Button variant="danger" busy={busy} onClick={() => void stop()}>
+              <Button variant="danger" busy={busy} onClick={() => setStopConfirmOpen(true)}>
                 <Square aria-hidden className="h-3.5 w-3.5" />
                 停止
               </Button>
@@ -2204,6 +2213,21 @@ export function TraderPage() {
       </div>
       </>
       )}
+
+      {/*
+        「停止」的二次确认 —— 与列表页 / 总览页 / 命令面板共用同一个组件，
+        所以四处说的是同一句话（见 `ConfirmStopTrader.tsx` 的说明）。
+      */}
+      <ConfirmStopTrader
+        trader={trader}
+        open={stopConfirmOpen}
+        busy={busy}
+        onCancel={() => setStopConfirmOpen(false)}
+        onConfirm={() => {
+          setStopConfirmOpen(false);
+          void stop();
+        }}
+      />
 
       <StartTraderModal
         trader={trader}

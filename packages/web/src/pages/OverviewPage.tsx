@@ -45,6 +45,7 @@ import { Button, Empty, ErrorNote, Panel, Spinner3 } from '../components/ui';
 import { Metric, MetricGroup, PageShell, SectionLabel } from '../components/shell';
 import { PageActions } from '../templates/lib/PageActions';
 import { NewTraderModal, StartTraderModal } from '../components/TraderModals';
+import { ConfirmStopTrader } from '../components/ConfirmStopTrader';
 import { EQUITY_RANGES, mergeEquityCurves, rangeSpanMs, type EquityRange } from '../components/equityCurve';
 import {
   EquitySkeleton,
@@ -113,6 +114,17 @@ export function OverviewPage() {
   const [newOpen, setNewOpen] = useState(false);
   const [startTarget, setStartTarget] = useState<TraderRow | null>(null);
   const [busyId, setBusyId] = useState<number | null>(null);
+  /**
+   * 已请求确认停止的机器人。
+   *
+   * ⚠️ 这个状态存在的理由（外部 issue #121）：总览页那个「停止」按钮原先
+   * **单击即停**，而停止**不会平仓** —— 误停一台持有杠杆仓位的机器人，
+   * 那些仓位就从此没人管保护位了。而同一个操作在列表页是有确认的。
+   *
+   * 顺带一提：那一格与「启动」按钮并排放着，一红一绿，
+   * 很容易被当成「启动 / 停止」开关误点 —— 所以确认在这里尤其必要。
+   */
+  const [stopTarget, setStopTarget] = useState<TraderRow | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [range, setRange] = useState<EquityRange>('7D');
   const [refreshing, setRefreshing] = useState(false);
@@ -601,7 +613,7 @@ export function OverviewPage() {
               recentTrades={recentTrades}
               busyId={busyId}
               navigate={navigate}
-              onStop={(trader) => void stop(trader)}
+              onStop={setStopTarget}
               onStart={setStartTarget}
               extraCount={traders.length - snapshotRows.length}
             />
@@ -700,6 +712,19 @@ export function OverviewPage() {
         onStarted={() => {
           void tradersQuery.reload();
           refreshSystem();
+        }}
+      />
+
+      {/* 与列表页 / 详情页 / 命令面板共用同一个确认组件，文案只有一份。 */}
+      <ConfirmStopTrader
+        trader={stopTarget}
+        open={stopTarget !== null}
+        busy={stopTarget !== null && busyId === stopTarget.id}
+        onCancel={() => setStopTarget(null)}
+        onConfirm={() => {
+          const target = stopTarget;
+          setStopTarget(null);
+          if (target) void stop(target);
         }}
       />
     </div>
