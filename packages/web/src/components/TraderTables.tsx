@@ -2000,7 +2000,30 @@ export function TradesTable({
                   <td className="td num text-right text-warn" title={pnlFormulaText(costs)}>
                     {fmtSigned(-trade.fee, 4)}
                     <div className="text-xs text-ink-faint">
-                      开 {fmtSigned(trade.entryFee, 4)} · 平 {fmtSigned(trade.exitFee, 4)}
+                      {/*
+                        ⚠️ **这一格只能有一种符号约定，否则操作员会怀疑账本本身。**
+
+                        此前主行取负（`-trade.fee` → 显示 `-0.0240`），而子行直接用原值
+                        （`entryFee` / `exitFee` 在库里是**正数存储**的）→ 显示成
+                        `+0.0118 · +0.0122`。同一个格子里**主行负数、子行正数**，
+                        看起来像"手续费对不上账"（外部 issue #122）。
+
+                        现在两个子行也取负，于是这一个格子统一成「**成本为负**」：
+                        它们彼此可加，且**相加正好等于上面那一行**：
+
+                            -0.0118 + -0.0122 = -0.0240   ← 与主行一致
+
+                        为什么选"成本为负"而不是反过来：主行那个数是最显眼的，
+                        而它显示的是"从余额里扣掉多少"；下面资金费那一行用的交易所口径
+                        也是"负数表示支付"。三个数统一到同一个方向上，
+                        这一格才读得出"毛 − 费 − 资 = 净"这条等式。
+
+                        ⚠️ 注意与 `PnlCosts`（`PnlBreakdown.tsx`）的区别：那边约定
+                        **成本为正**，用于展示"净 = 毛 − 成本"的减法等式；两者是不同
+                        的呈现，不要互相套用。改动这一格时**不要碰** `trades.insert()`
+                        里的任何算术 —— 落库口径本来是对的。
+                      */}
+                      开 {fmtSigned(-trade.entryFee, 4)} · 平 {fmtSigned(-trade.exitFee, 4)}
                     </div>
                     {trade.fundingFee !== 0 && (
                       <div className={`text-xs ${pnlColor(trade.fundingFee)}`} title="资金费：负数表示支付">
