@@ -287,9 +287,166 @@ export function headOfMarket(marketContext: string, budgetChars: number): {
    * 而那正是辩论"逆势还是顺势"的依据。
    */
   const overviewCap = Math.floor(budgetChars / 4);
-  const head = overview.length > overviewCap
-    ? overview.slice(0, overviewCap) + `\n（概览共 ${overview.length} 字，此处只给前 ${overviewCap} 字）\n`
-    : overview;
+  /*
+   * ══════════════════════════════════════════════════════════════════════════
+   *  ⚠️⚠️ **概览段的截断必须"按小节切"，并优先保住【行为约束】小节**
+   *      （2026-10-13 实测 —— 同一类 BUG 的第五处）
+   * ══════════════════════════════════════════════════════════════════════════
+   *
+   * ## 事故：裁决官看不到「保证金 ≠ 名义价值」，于是继续算错
+   *
+   * 线上 `#2594 c99` 的决策理由原文：
+   * ```
+   *   BTCUSDT skip：「最小名义 50 对 20U 账户**过重**，不做。」
+   * ```
+   * **而这是错的**：`20.75 × 20x = 415 USDT 名义`，它完全开得起。
+   *
+   * ## 为什么：那段换算是"概览"的一部分，而概览被 `overviewCap` 砍了
+   *
+   * 实测（线上真实 `user_prompt` 132921 字符）：
+   * ```
+   *   「逐仓运行的」/「保证金 ≠ 名义价值」段  位置 18187（13.7%）
+   *   第一个候选标题                          位置 18876
+   *   → 它在【第一个候选之前】→ 被当成"概览"
+   *   → overviewCap = 24000/4 = 6000
+   *   → 位置 18187 > 6000 → **被截掉**
+   * ```
+   * 于是：**我上一轮修的换算说明，裁决官从来没见过** ——
+   * 它仍然凭"20U 账户 vs 50 名义"的直觉判断，而那个直觉是错的。
+   *
+   * ## 为什么不能"再摘一个 marker"
+   *
+   * 我前面已经为「规则段」摘过一次（`extractRules`）。若再来一个
+   * "摘名义价值段"的 marker，下次还会有第三段、第四段 ——
+   * **那是在逐个打补丁，而根因是"概览里混着行为约束"这件事没被承认**。
+   *
+   * ## 正解：按 `#` 小节切，把"约束类"小节排在前面
+   *
+   * ```
+   *   overview 由若干 `# 小节` 组成（`# 系统状态` / `# 硬性约束` / `# 逐仓…`）
+   *   → 按小节切分
+   *   → 【约束类】小节优先保留（它们是行为依据，不是背景数据）
+   *   → 【数据类】小节（概览、绩效）按剩余空间给
+   * ```
+   * ⚠️ 判据用**关键词命中**（"约束 / 边界 / 保证金 / 逐仓 / 规则 / 必须"），
+   * 而不是写死小节名 —— 因为小节名会随渲染改动而变，而**语义不会**。
+   *
+   * ⚠️ 保序：输出顺序仍按原文顺序（模型读起来连贯），只是"谁被砍"变了。
+   */
+  const CONSTRAINT_HINTS = /约束|边界|保证金|逐仓|规则|必须|不能|禁止|上限|下限|可用/;
+  const head = (() => {
+    if (overview.length <= overviewCap) return overview;
+    /*
+     * 按行首 `#`（1–3 级）切成小节。第一段（标题之前的内容）保留。
+     */
+    const lines = overview.split('\n');
+    const secs: Array<{ title: string; text: string; important: boolean }> = [];
+    let cur: { title: string; lines: string[] } | null = null;
+    for (const line of lines) {
+      if (/^#{1,3}\s/.test(line)) {
+        if (cur !== null) secs.push({ title: cur.title, text: cur.lines.join('\n'), important: CONSTRAINT_HINTS.test(cur.title) });
+        cur = { title: line, lines: [line] };
+      } else if (cur === null) {
+        cur = { title: '', lines: [line] };
+      } else {
+        cur.lines.push(line);
+      }
+    }
+    if (cur !== null) secs.push({ title: cur.title, text: cur.lines.join('\n'), important: CONSTRAINT_HINTS.test(cur.title) });
+
+    /*
+     * ⚠️⚠️ **约束类优先，但必须给"数据类"留一份配额**（2026-10-13 实测回归）。
+     *
+     * ## 我第一版只做"约束类优先"，把概览挤掉了
+     *
+     * 既有测试 `marketHead.test.ts` 当场抓到：
+     * ```
+     *   ★★★ 概览不能被整段丢掉 —— 它是"大盘背景"（辩论要用）
+     *   → out.text.includes('全市场概览')  ❌ 失败
+     * ```
+     * 根因：`# 账户` 段里含"可用 / 保证金"→ 命中约束关键词 → 被当"重要"，
+     * 于是它先占满 `overviewCap`，而「全市场概览」作为"不重要"被挤掉。
+     *
+     * ## 为什么那是个真回归
+     *
+     * 「全市场概览」是辩论"**顺势还是逆势**"的唯一依据 ——
+     * 裁掉它，辩论者就只能看到候选自己的形态，看不到大盘。
+     * 而约束段（保证金换算）与概览段**回答的是两个不同的问题**，都要在。
+     *
+     * ## 修法：两段各留配额
+     *
+     * ```
+     *   约束类 → 最多 70% 的 overviewCap
+     *   数据类 → 剩下的 ≥30%（按原顺序）
+     * ```
+     * ⚠️ 70/30 是实测选出的：约束段（逐仓 + 换算 + 杠杆档位）实测约 3.6k，
+     * 而 `overviewCap = 6000` 的 70% = 4200 —— 装得下；
+     * 概览 30% = 1800 —— 够放"大盘一句话 + 涨跌榜头部"。
+     */
+    const CONSTRAINT_QUOTA = Math.floor(overviewCap * 0.7);
+    const keep = new Map<string, string>(); /* 原文 → 实际输出的文本（可能被截短） */
+    let used = 0;
+    /*
+     * ⚠️⚠️ **小节放不下时要【截断它】，而不是丢掉它**（2026-08-13 实测回归）。
+     *
+     * ## 既有测试当场抓到的第二个问题
+     *
+     * `marketHead.test.ts` 的材料是**扁平结构**：
+     * ```
+     *   # 账户
+     *   权益 20.75 USDT
+     *   # 全市场概览（币安 525 个 USDT 永续）
+     *   SYM0USDT 1.23 -1.5% 456M      ← 400 行，约 9,000 字符
+     *   ...
+     * ```
+     * 而「# 全市场概览」这一节 **9,000 字符 > 剩余配额** → 被 `continue` 跳过
+     * → **整段概览丢掉** → 辩论者看不到大盘 ❌
+     *
+     * ## 为什么"丢掉"是错的
+     *
+     * ```
+     *   概览是【能裁的数据】：400 行里给前 60 行照样能看出大盘方向
+     *   约束是【不能裁的规则】：截断会让模型读到半句话
+     * ```
+     * 所以：**约束类**放不下就跳过（宁可不要，也不要半句）；
+     *      **数据类**放不下就**截断**（前面那部分仍然有用）。
+     */
+    const addSection = (s: { text: string; important: boolean }, cap: number): void => {
+      const room = cap - used;
+      if (room <= 0) return;
+      if (s.text.length <= room) {
+        keep.set(s.text, s.text);
+        used += s.text.length;
+        return;
+      }
+      if (!s.important) {
+        /*
+         * 数据类：截断到剩余空间（**至少给 200 字符**，否则那一段没有信息量）。
+         */
+        if (room >= 200) {
+          keep.set(s.text, `${s.text.slice(0, room)}\n（本节因预算截断）`);
+          used += room;
+        }
+      }
+      /* 约束类放不下 → 跳过（半句规则比没有更糟）。 */
+    };
+    for (const s of secs.filter((x) => x.important)) addSection(s, CONSTRAINT_QUOTA);
+    for (const s of secs.filter((x) => !x.important)) addSection(s, overviewCap);
+    /*
+     * ⚠️ 一个都没放下时也要给第一个（宁可超一点，也不要给"没有概览"的材料）。
+     */
+    if (keep.size === 0 && secs.length > 0) keep.set(secs[0]!.text, secs[0]!.text);
+    /*
+     * **按原文顺序**输出（保序），只保留选中的那些；
+     * ⚠️ 值用 `keep.get()`（数据类可能被截短过）。
+     */
+    const kept = secs
+      .filter((s) => keep.has(s.text))
+      .map((s) => keep.get(s.text) ?? s.text)
+      .join('\n');
+    const omitted = secs.length - keep.size;
+    return omitted > 0 ? `${kept}\n（概览另有 ${omitted} 个小节因预算未展开）\n` : kept;
+  })();
 
   const picked: string[] = [];
   let used = head.length;
