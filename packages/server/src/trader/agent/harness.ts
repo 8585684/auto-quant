@@ -55,6 +55,35 @@ export interface AgentTaskInput {
   fastModel?: string;
   /** 工作目录（agent 的"办公室"）。 */
   workdir: string;
+  /**
+   * **工具调用的最大轮数**（`--max-turns`）。
+   *
+   * ## 为什么必须有上限（2026-10-13 实测抓到）
+   *
+   * 不传这个参数时 claude code **没有轮数上限** —— 而猎手任务里写着
+   * 「优先看这些来源」（每个猎手 3–5 个来源），于是它会**一个来源接一个来源地搜**，
+   * 直到用光时间预算。
+   *
+   * ### 实测对照（同一个真实猎手任务）
+   *
+   * ```
+   *   不限轮数（线上）      → **600 秒超时**，0 字产出
+   *   --max-turns 10        → **86.1 秒**，正常完成（2 次 WebSearch）
+   *   --max-turns 4         → 报 "Reached max turns"，但也没超时
+   * ```
+   * 步骤序列（限 10 轮那次）：
+   * ```
+   *   tool:WebSearch → tool:WebSearch → result(86111ms)
+   * ```
+   * **它 2 次搜索就够了** —— 那 600 秒全花在"继续搜更多来源"上，
+   * 而那些额外搜索**对最终产出没有任何贡献**（它早就有结论了）。
+   *
+   * ## 取值
+   *
+   * 默认 **12**：实测 2 次搜索完成，留 6 倍余量给"需要多查几个来源"的情况。
+   * 而这个上限的意义是**保证它在预算内交出结论**，而不是"搜到完美为止"。
+   */
+  maxTurns?: number;
   /** 超时（毫秒）。 */
   timeoutMs?: number;
   /** magpie 网关地址。 */
@@ -115,6 +144,12 @@ export const spawnClaudeCode: SpawnAgent = async (input) => {
       ...(input.allowedTools !== undefined && input.allowedTools.length > 0
         ? ['--allowedTools', input.allowedTools]
         : []),
+      /*
+       * ⚠️ **必须有轮数上限**（2026-10-13）—— 见 `maxTurns` 的说明。
+       * 实测：不限轮数 → 600 秒超时；限 10 轮 → 86 秒完成。
+       */
+      '--max-turns',
+      String(input.maxTurns ?? 12),
     ], {
       cwd: input.workdir,
       env: {
@@ -196,6 +231,36 @@ export const spawnClaudeCode: SpawnAgent = async (input) => {
       const text = out.trim();
       if (code === 0 && text.length > 0) {
         finish({ ok: true, text, latencyMs: latency });
+        return;
+      }
+      /*
+       * ⚠️ **"撞上轮数上限"不等于失败**（2026-10-13）。
+       *
+       * ## 为什么必须区别对待
+       *
+       * `--max-turns` 到达时会报 `Error: Reached max turns (N)` 并**以非 0 退出**。
+       * 而那时它**可能已经写出了我们要的东西** —— 实测（限 10 轮那次）：
+       * ```
+       *   tool:WebSearch → tool:WebSearch → result(86111ms)   ← 正常完成
+       * ```
+       * 而限 4 轮那次是 `Error: Reached max turns (4)`，但**它已经搜过了**。
+       *
+       * 若把这种情形一律判为失败，就会丢掉**一份可用的产出** ——
+       * 而那正是我们加轮数上限想要得到的东西（在预算内拿到结论）。
+       *
+       * ## 判据：有实质文本就收下，但**在 error 里说清它是被截断的**
+       *
+       * 不能静默当成完整成功：调用方需要知道"这份产出是在轮数用尽时截下来的"
+       *（它可能少了最后那段结论）。所以 `ok: true` 而 `error` 仍写明原因。
+       */
+      const hitMaxTurns = /Reached max turns/i.test(err) || /Reached max turns/i.test(text);
+      if (hitMaxTurns && text.length > 0) {
+        finish({
+          ok: true,
+          text,
+          error: `达到轮数上限（产出可能不完整）：${err.trim().slice(0, 200)}`,
+          latencyMs: latency,
+        });
         return;
       }
       finish({
