@@ -111,19 +111,123 @@ export interface DeskRoleOutput {
 
 /** 一次交易台会议的完整产出。 */
 /**
- * **辩论者拿到的市场材料上限**（字符）。
+ * **辩论者与裁决官拿到的市场材料上限**（字符）。
  *
  * 见 `debateMaterial` 的说明：原来给的是**全文**（实测约 15 万 token），
  * 而 bull 与 bear 是**串行**的 → 这一段的耗时是两份全文之和。
  *
- * 现在只给前 12000 字：足够核对事实（关键位、方向、结构），
- * 但不至于让辩论者重读一遍分析师已经消化过的材料。
+ * 现在只给一段：足够核对事实（关键位、方向、结构），
+ * 但不至于让下游重读一遍分析师已经消化过的材料。
  *
  * ⚠️ 这个值不是"越小越好"：辩论者需要能**核对**分析师的结论。
  * 完全去掉市场材料会让论证失去依据（那正是"分工"的反面 ——
  * 让下游盲信上游）。
+ *
+ * ── ⚠️⚠️ **不能简单 `slice(0, N)`**（2026-10-13 实测抓到的真 BUG）──────
+ *
+ * ## 事故：裁决官**一个候选都看不到**
+ *
+ * 原来写的是 `input.marketContext.slice(0, DEBATE_MARKET_CHARS)`。
+ * 而材料的结构是：
+ * ```
+ *   # 账户 → # 全市场概览（525 个标的，约 5 万字）→ # 候选标的（12 个，每个约 9 千字）
+ * ```
+ * 于是**前 12000 字符全部落在"全市场概览"里**。实测：
+ * ```
+ *   完整材料 130,420 字符
+ *   材料里的候选标题: 12 个
+ *   前 12,000 字符覆盖:  **0 个候选**
+ * ```
+ * **也就是说：裁决官与辩论者看到的材料里没有任何一个候选的指标序列** ——
+ * 而它们却要据此裁决"做不做"。难怪裁决官会说
+ * 「另 6 候选无指标序列」（其实它连一个都没看到）。
+ *
+ * ## 修法：按**段落**取，而不是按**前缀**取
+ *
+ * `marketContext` 的段落以 `### N. SYMBOL` 开头（`symbolSlices.ts` 的切分依据）。
+ * 所以"给一段候选材料"应当是"**从头几个候选段里取**"，
+ * 而不是"取材料的开头 N 个字符"。
+ *
+ * 见 `headOfMarket()`：它保留**概览的头部**（那段有用：大盘背景）
+ * 加上**前若干个候选的完整段**，总量控制在 `DEBATE_MARKET_CHARS` 附近。
  */
 const DEBATE_MARKET_CHARS = 12_000;
+
+/**
+ * **辩论者与裁决官拿到的市场材料预算**（字符）—— **压缩后**的材料。
+ *
+ * 见 `analystContext`：分析师拿到的是 `compactMarketContext` 的输出
+ *（每个候选从约 12k 压到约 3k）。实测：
+ * ```
+ *   6 个候选（压缩后） = 20,893 字符
+ *  12 个候选（压缩后） = 36,583 字符
+ * ```
+ * 24,000 能覆盖**前 6 个候选的完整序列** + 概览头部 + 容器开销。
+ *
+ * ⚠️ 与 `AQ_ANALYST_UNIVERSE` 的默认值（6）**同一个口径** ——
+ * 上游与下游看到同一批证据，才谈得上"核对"（那是"分工"的前提）。
+ */
+const DEBATE_MARKET_FOR_JUDGE_CHARS = 24_000;
+
+/**
+ * **取市场材料的"开头"** —— 但保证**包含候选段**（而不是只取前缀字符）。
+ *
+ * @param marketContext 完整市场材料
+ * @param budgetChars 目标字符预算
+ *
+ * 结构：`概览头部` + `前 N 个候选段`，总量不超过 `budgetChars` 的 1.6 倍
+ *（候选段是不可切的整体 —— 切一半会让模型看到"残缺的指标序列"，
+ * 那比不给更糟：它会基于半截数据下结论）。
+ */
+export function headOfMarket(marketContext: string, budgetChars: number): {
+  text: string;
+  candidatesShown: number;
+  totalCandidates: number;
+} {
+  /*
+   * 找候选段的起点：第一处 `### 1. `（或 `### <数字>. `）。
+   * ⚠️ 用行首锚定，避免命中正文里偶然出现的 `### 1.`。
+   */
+  const firstCand = /^###\s*\d+\.\s*\S/m.exec(marketContext);
+  if (firstCand === null) {
+    /* 没有候选段（例如持仓管理轮）→ 退回前缀（那是唯一可做的事实）。 */
+    return { text: marketContext.slice(0, budgetChars), candidatesShown: 0, totalCandidates: 0 };
+  }
+  const overviewEnd = firstCand.index;
+  const overview = marketContext.slice(0, overviewEnd);
+  const rest = marketContext.slice(overviewEnd);
+
+  /* 按 `### N. ` 切开候选段。 */
+  const parts = rest.split(/^(?=###\s*\d+\.\s*\S)/m);
+  const total = parts.length;
+  /*
+   * 预算分配：概览最多占 1/4（它只是背景），其余给候选段。
+   * ⚠️ 概览**必须保留** —— 它给出"大盘今天什么状态"，
+   * 而那正是辩论"逆势还是顺势"的依据。
+   */
+  const overviewCap = Math.floor(budgetChars / 4);
+  const head = overview.length > overviewCap
+    ? overview.slice(0, overviewCap) + `\n（概览共 ${overview.length} 字，此处只给前 ${overviewCap} 字）\n`
+    : overview;
+
+  const picked: string[] = [];
+  let used = head.length;
+  for (const p of parts) {
+    if (used + p.length > budgetChars) break;
+    picked.push(p);
+    used += p.length;
+  }
+  /*
+   * ⚠️ **一个候选都放不下时也要给第一个**（宁可超预算，也不要给"没有候选"的材料）——
+   * 那正是这个 BUG 的形态。 */
+  if (picked.length === 0 && parts.length > 0) picked.push(parts[0]!);
+
+  return {
+    text: [head, ...picked].join(''),
+    candidatesShown: picked.length,
+    totalCandidates: total,
+  };
+}
 
 /**
  * **分析师产出给辩论者的窗口**（字符）。
@@ -674,12 +778,48 @@ async function runTradingDeskInner(input: {
    * ⚠️ **仍然保留一段市场材料**（而不是完全去掉）：
    * 辩论者需要能**核对事实**（"分析师说的那个支撑位到底是多少"）。
    * 只是不必是全文 —— 见 `DEBATE_MARKET_CHARS`。
+   *
+   * ⚠️⚠️ **必须用 `headOfMarket()`，不能 `slice(0, N)`** ——
+   * 后者实测抓到"裁决官一个候选都看不到"（见 `headOfMarket` 的说明）。
    */
+  const marketHead = headOfMarket(input.marketContext, DEBATE_MARKET_CHARS);
+  /*
+   * ⚠️⚠️ **裁决官必须能看到候选的完整序列**（2026-10-13 实测后的第二版修正）。
+   *
+   * ## 第一版修对了方向、但预算配错了
+   *
+   * 第一版用 `headOfMarket()` 替代 `slice(0, N)` —— 方向对了（按段落取），
+   * 但实测发现：**一个【未压缩】的候选段就 11,993 字符**，而预算只有 12,000
+   * → 仍然只覆盖 **1 个**候选。
+   *
+   * 根因：**辩论者拿到的是【原文】，而分析师拿到的是【压缩后】的**
+   *（`compactMarketContext` 把每个候选从约 12k 压到约 3k）。
+   * 给下游原文等于让它们重读一遍上游已经消化过的东西 ——
+   * 那正是 `debateMaterial` 的注释里早就说过的"分工的反面"。
+   *
+   * ## 所以：给**压缩后**的材料（与分析师同一份）
+   *
+   * 实测：压缩后 12 个候选 = 36,583 字符，而 6 个候选 = 20,893 字符。
+   * 预算提到 **24,000** 就能覆盖**前 6 个候选的完整序列** +
+   * 概览头部（约 4,500）+ 分析师的产出摘要（每人 1,200 × 4）。
+   *
+   * ⚠️ **为什么是 6 个而不是 12 个**：那是与分析师**同一个裁剪口径**
+   *（`AQ_ANALYST_UNIVERSE`，实测 12 个候选会让模型"只想不说"）。
+   * 上游与下游看到**同一批证据**，才谈得上"核对"。
+   * 而下面那句"其余 N 个你看不到"会把边界**如实说清**
+   *（否则模型会以为"没数据"—— 而那正是裁决官上一轮的原话）。
+   */
+  const marketHeadForDebate = headOfMarket(analystContext, DEBATE_MARKET_FOR_JUDGE_CHARS);
   const debateMaterial = [
-    '## 市场（摘要 —— 完整材料已由分析师消化，下面是前段）',
-    input.marketContext.slice(0, DEBATE_MARKET_CHARS),
-    ...(input.marketContext.length > DEBATE_MARKET_CHARS
-      ? ['', `（市场材料共 ${input.marketContext.length} 字，此处只给前 ${DEBATE_MARKET_CHARS} 字 —— 需要细节请问分析师产出）`]
+    '## 市场（摘要 —— 与分析师看到的是同一份压缩材料）',
+    marketHeadForDebate.text,
+    ...(marketHeadForDebate.candidatesShown < marketHeadForDebate.totalCandidates
+      ? [
+          '',
+          `（候选共 ${marketHeadForDebate.totalCandidates} 个，此处给了**前 ${marketHeadForDebate.candidatesShown} 个的完整序列** ——` +
+            `其余 ${marketHeadForDebate.totalCandidates - marketHeadForDebate.candidatesShown} 个的指标序列**你没有**，` +
+            '所以**不要因为看不到它们就说它们"没有数据"**；需要细节请问分析师的产出）',
+        ]
       : []),
     '## 新闻与情绪',
     input.newsContext.length > 0 ? input.newsContext : '（本轮没有可用的新闻/情绪数据）',
