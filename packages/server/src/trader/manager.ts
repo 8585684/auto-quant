@@ -279,6 +279,21 @@ export interface StartResult {
   ok: boolean;
   error?: string;
   preflight: PreflightCheck[];
+  /**
+   * 这次结果是**操作员的「停止」叠在启动过程中**产生的，而不是启动自己失败。
+   *
+   * ⚠️ 必须区分这两者：`attemptStart()` 的两个取消分支已经自己把状态写成
+   * `stopped` 并返回失败，而外层 `startTraderAsync` 原来只看 `ok`，
+   * **无条件再写一次 `error`** —— 一次显式的停止就此变成"待恢复的故障"。
+   * 而 `resumePersisted()` 会恢复 `error`、刻意不恢复 `stopped`
+   * （后者是人的决定）。所以那次覆盖的代价是：**下一次部署/重启把刚被叫停的
+   * 机器人重新拉起并下单** —— 正是本文件反复声明绝不允许的那件事。
+   *
+   * 不能改用 `cancelledStarts.has(id)` 判断：那面旗子在 `startTrader` 的
+   * `finally` 里就被收掉了（语义是"进行中的启动被取消"），而这里的 `.then`
+   * 在它之后运行 —— 用旗子等于什么都没看见。
+   */
+  cancelled?: boolean;
 }
 
 /**
@@ -2948,7 +2963,7 @@ export class TraderManager {
           '启动过程中收到「停止」—— 已放弃本次启动，不会起交易循环。',
         );
         return {
-          result: { ok: false, error: '启动过程中被操作员取消。', preflight: checks },
+          result: { ok: false, error: '启动过程中被操作员取消。', preflight: checks, cancelled: true },
           permanent: true,
         };
       }
@@ -2980,7 +2995,7 @@ export class TraderManager {
           '启动完成后立刻收到「停止」—— 交易循环已停下。',
         );
         return {
-          result: { ok: false, error: '启动完成后被操作员取消。', preflight: checks },
+          result: { ok: false, error: '启动完成后被操作员取消。', preflight: checks, cancelled: true },
           permanent: true,
         };
       }
@@ -3137,6 +3152,22 @@ export class TraderManager {
         clearTimeout(startWatchdog);
         if (this.startGeneration.get(traderId) !== generation) return;
         if (result.ok) return;
+        /*
+         * ⚠️ **取消不是失败，不要再写 `error`。**
+         *
+         * 两个取消分支已经各自把状态写成 `stopped`（那是操作员的决定）。
+         * 这里再写一次 `error`，就把"被叫停"记成"待恢复的故障" ——
+         * 而 `resumePersisted()` 恢复 `{running, safe_mode, error}`，
+         * **刻意不恢复 `stopped`**。于是下一次部署/重启，
+         * 这台刚被叫停的机器人会被重新拉起并下单。
+         *
+         * 判据只能是 `result.cancelled`，不能是 `cancelledStarts.has(id)`：
+         * 那面旗子在 `startTrader` 的 finally 里已收掉，此时看它永远看不出来。
+         */
+        if (result.cancelled) {
+          log.info(`机器人 ${traderId} 的启动已被取消，状态保持 stopped（不记为 error）。`);
+          return;
+        }
         log.warn(`机器人 ${traderId} 启动失败：${result.error ?? '未知错误'}`);
         /* 失败必须落到 `error` —— 否则状态会停在 `starting` 上（见看门狗）。 */
         this.setTraderStatus(traderId, 'error', result.error ?? '启动失败');
