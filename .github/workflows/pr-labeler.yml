@@ -1,0 +1,107 @@
+# =============================================================================
+# PR 自动打标签
+#
+# 为什么需要它：`.github/release-drafter.yml` 的**唯一输入就是标签** ——
+# 它按 `enhancement` / `bug` / `perf` / `docs` / `dependencies` 分类生成发布说明，
+# 并按标签推导版本增量（minor / patch）。
+#
+# 全靠人手动选标签，几周之后就会和实际改动脱节，而**脱节的后果是静默的**：
+# 发布说明里会少一节、版本号会少进一位，但不会有任何报错。
+#
+# 两件事分开做：
+#   · 路径标签（`.github/labeler.yml`）回答"改了哪里" —— 用 actions/labeler
+#   · 类型标签（PR 标题前缀）回答"这是什么改动" —— 用下面的 shell 翻译
+#
+# ⚠️ 为什么类型标签自己写脚本、不引第三方 action：
+#   本项目要求 Conventional Commits，前缀本身就是类型，为一次字符串匹配
+#   再引一个包不划算（见 docs/AGENTS.md §4.3"默认答案是自己写那 30 行"）。
+#
+# ⚠️ 与 2026-09-25 封号事故的关系（AGENTS.md 的红线）：
+#   全部由 `on: pull_request_target` 触发，没有任何轮询或批量调用。
+# =============================================================================
+name: PR 标签
+
+on:
+  pull_request_target:
+    # ⚠️ 用 `pull_request_target` 而不是 `pull_request`：
+    # 来自 fork 的 PR 在 `pull_request` 下只拿到只读 token，标签打不上（会报
+    # "Resource not accessible by integration"）。
+    #
+    # ⚠️ 代价是它**带着写权限运行**，所以本文件绝不能执行 PR 里的任何代码 ——
+    # 不 checkout PR 分支、不 `npm install`、不跑 PR 的脚本。
+    # `actions/labeler` 会自己从 API 读 base 仓库的 `.github/labeler.yml`。
+    types: [opened, edited, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  label:
+    name: 打标签
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      # 路径标签。
+      # ⚠️ 刻意**不** checkout：README 写明配置不存在于 runner 时会经 API
+      # 读 base 仓库那份，而 checkout 会多出一份"PR 分支内容"的接触面。
+      - name: 按改动路径打标签
+        uses: actions/labeler@v6
+        with:
+          # 同步模式：改路径导致不再匹配时**移除**旧标签，避免越积越多。
+          # ⚠️ 它只同步**配置里出现过**的标签，用户手打的（如 needs-triage）不受影响。
+          sync-labels: true
+
+      # 类型标签：把 Conventional Commits 前缀翻译成 release-drafter 认识的标签。
+      #
+      # ⚠️ 映射表只列**已存在**的标签。`gh pr edit --add-label` 不会创建新标签 ——
+      # 打一个不存在的标签会直接报错。改这张表前先去
+      # https://github.com/<owner>/<repo>/labels 确认目标标签存在。
+      - name: 按标题前缀打类型标签
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          set -euo pipefail
+          echo "标题：$PR_TITLE"
+
+          type=""
+          if [[ "$PR_TITLE" =~ ^([a-z]+)(\([^\)]*\))?(!)?: ]]; then
+            type="${BASH_REMATCH[1]}"
+            breaking="${BASH_REMATCH[3]}"
+          fi
+
+          if [ -z "$type" ]; then
+            echo "::warning::标题不符合 Conventional Commits（应以 feat: / fix: / docs: 等开头），无法判定类型标签。见 CONTRIBUTING.md。"
+            exit 0
+          fi
+
+          # 前缀 → 标签（键与 `.github/release-drafter.yml` 的 categories 对应）。
+          case "$type" in
+            feat)  label="enhancement" ;;
+            fix)   label="bug" ;;
+            perf)  label="perf" ;;
+            docs)  label="docs" ;;
+            # chore / refactor / test / ci / build 不映射：
+            # release-drafter 的「🔧 其他」分类（无 labels 那条）会接住它们。
+            *)     label="" ;;
+          esac
+
+          if [ -n "$label" ]; then
+            echo "前缀 '$type' → 标签 '$label'"
+            gh pr edit "$PR_NUMBER" --add-label "$label"
+          else
+            echo "前缀 '$type' 无对应标签 —— 由发布说明的「🔧 其他」接住。"
+          fi
+
+          # 破坏性变更：Conventional Commits 的 `!` 标记。
+          # release-drafter 会把 `breaking` 排在发布说明最前面，
+          # 而 version-resolver 会据此把版本增量提到 minor。
+          if [ -n "${breaking:-}" ]; then
+            echo "检测到 '!' → 标签 'breaking'"
+            gh pr edit "$PR_NUMBER" --add-label "breaking"
+          fi
+
+          echo "完成。"

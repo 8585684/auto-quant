@@ -1,0 +1,133 @@
+# =============================================================================
+# 持续集成：类型检查 / Lint / 测试 / 构建
+#
+# 为什么这个文件现在才出现（2026-10-13）：
+#   2026-09-30 用户决定「GitHub 上那些自动化功能能不用的就不要用了」，
+#   于是 CI 连同 release-drafter / pr-labeler / main-guard 一起被删掉，
+#   质量把关回到本地（`npm run typecheck / lint / test`）。
+#
+#   现在的前提变了：**外部协作者（多个 AI 实例、另一个 GitHub 账号）会提 PR**。
+#   本地把关对"自己写的代码"够用，对"别人的代码"不够 —— 因为
+#   ① 我没有在他们机器上跑测试的能力；② PR 页面必须自己回答"这个能不能合"。
+#
+# ⚠️ 与那次封号事故的关系（AGENTS.md 的红线）：
+#   这次只做**必要的**自动化，且全部由 GitHub 自己触发（`on: pull_request`），
+#   没有任何脚本循环调用 `gh`。轮询、批量操作、自动合并一律不做 ——
+#   见文件末尾「刻意不做的事」。
+# =============================================================================
+name: CI
+
+on:
+  # PR 是本文件存在的主要理由：别人的改动必须在这里被验证。
+  pull_request:
+    branches: [main]
+  # main 也跑一次 —— 合入之后仍要知道它是绿的（发版前提，见 docs/RELEASING.md）。
+  push:
+    branches: [main]
+  # 允许手动重跑（标签补打后想刷新结果时用）。
+  workflow_dispatch:
+
+# 同一分支上新的推送取消旧的运行 —— 省额度，也让 PR 上的结果永远是最新那次的。
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: 类型检查 · Lint · 测试 · 构建
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      # Node 22 —— `node:sqlite` 需要 ≥22.5（见 package.json 的 engines）。
+      - name: 设置 Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      # `npm ci` 而不是 `npm install`：按 lockfile 精确安装，
+      # 让"PR 作者本地能过、CI 不能过"这种情况尽量只剩代码原因。
+      - name: 安装依赖
+        run: npm ci
+
+      - name: 类型检查
+        run: npm run typecheck
+
+      - name: Lint
+        run: npm run lint
+
+      # ⚠️ **这一步是整套 CI 的核心**。测试里包含风控引擎、账目算术、
+      # 订单路由、提示词渲染的断言 —— 那些是这个项目唯一能自动抓住
+      # "会让真钱出错"的地方。
+      - name: 测试
+        run: npm test
+
+      # 前端构建：类型检查过不代表能打包（Vite 的解析规则与 tsc 不同）。
+      - name: 构建前端
+        run: npm run build
+
+      # 密钥扫描：这个仓库会同步到 GitHub，而它处理的是真实交易所凭据。
+      # 用最简单的模式匹配，不引入新依赖（见 docs/AGENTS.md §4.3）。
+      - name: 扫描提交里是否混入凭据
+        run: |
+          set -euo pipefail
+
+          # ⚠️ 取"这次改动引入的行"要按事件分情况 —— `github.event.before`
+          # 只在 push 事件里有值；PR 事件里它是空的（会是全 0 或未定义），
+          # 直接用它会让扫描**静默失效**（对所有输入都 grep 不到东西）。
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE="origin/${{ github.base_ref }}"
+            git fetch --no-tags --depth=1 origin "${{ github.base_ref }}"
+          else
+            BASE="${{ github.event.before }}"
+            # 首次推送时 before 是全 0，那种情况下没有可比较的基线，
+            # 退回与父提交比（HEAD~1），仍能覆盖"这次推送引入了什么"。
+            if ! git cat-file -e "$BASE^{commit}" 2>/dev/null; then
+              BASE="HEAD~1"
+            fi
+          fi
+
+          git diff "$BASE...HEAD" | grep -E '^\+' > /tmp/added.txt || true
+          echo "待扫描的新增行数：$(wc -l < /tmp/added.txt)"
+
+          if grep -nEi '(api[_-]?secret|api[_-]?key|passphrase|private[_-]?key)[[:space:]]*[:=][[:space:]]*["'"'"'][A-Za-z0-9/+_-]{20,}' /tmp/added.txt; then
+            echo "::error::新增的行里看起来有凭据。请改用环境变量或 data/ 下的本地配置（见 docs/AGENTS.md §4.4）。"
+            exit 1
+          fi
+          echo "未发现明显的凭据字面量。"
+
+      - name: 小结
+        if: always()
+        run: |
+          {
+            echo "### CI 结果"
+            echo ""
+            echo "| 检查 | 说明 |"
+            echo "| --- | --- |"
+            echo "| 类型检查 | \`npm run typecheck\` |"
+            echo "| Lint | \`npm run lint\` |"
+            echo "| 测试 | \`npm test\`（含风控与账目算术） |"
+            echo "| 构建 | \`npm run build\` |"
+            echo "| 密钥扫描 | 新增行里是否有凭据字面量 |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+# =============================================================================
+# 刻意不做的事（每一条都有理由）
+# =============================================================================
+#
+# · **不做自动合并。** 这个项目下的是真实订单，`dependabot.yml` 里也写明了
+#   "不要开启 auto-merge"。合不合由人（我）看 CI 结果 + diff 决定。
+# · **不做 `gh` 轮询。** AGENTS.md 的红线：`gh pr checks` 之类绝不放进循环。
+#   本文件全部由 GitHub 事件触发，没有任何主动 API 调用。
+# · **不做 stale / welcome 之类的机器人。** 那是噪音，而噪音训练人忽略通知。
+# · **不做分支保护强阻断。** `main` 上直接推送仍然允许（我自己的迭代走 scp 部署，
+#   不经过 GitHub）。CI 失败会在 PR 页面显示，但不会挡住任何东西 ——
+#   理由与 CONTRIBUTING.md 里 `main-guard` 那条一样：
+#   把 main 长期弄成红色会训练人忽略红色。

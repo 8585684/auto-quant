@@ -39,33 +39,40 @@ npm test
 
 | 项目 | 状态 |
 |---|---|
-| CI（类型检查 / 测试 / 构建 / 密钥扫描） | ✅ 每次 push 与 PR 都跑 |
-| PR 标题规范校验（Conventional Commits） | ✅ 仅在 PR 上跑 |
+| CI（类型检查 / Lint / 测试 / 构建 / 密钥扫描） | ✅ 每次 PR 与 push main 都跑（`.github/workflows/ci.yml`）|
+| PR 自动打标签（路径 + 标题前缀） | ✅ 仅在 PR 上跑（`.github/workflows/pr-labeler.yml`）|
+| 发布说明草稿（release-drafter） | ✅ 合入 main 时增量重算（`.github/workflows/release-drafter.yml`）|
+| Docker 镜像 | ✅ push main 与 `v*` 标签时构建（`.github/workflows/docker-publish.yml`）|
 | CODEOWNERS | ✅ 指向真实账号，改动会自动请求 review |
 | Dependabot（npm + GitHub Actions，每周） | ✅ 已启用 |
 | Issue / PR 模板 | ✅ 已配置 |
-| 直接推送 main 的守卫 | ⚠️ 仅报告，不阻断（见下） |
+| `main` 分支保护 | ❌ **未启用**（见下）|
 
-### ⚠️ `main` 分支保护尚未启用
+> **为什么 CI 恢复于 2026-10-13**：之前（2026-09-30）因为维护者只有一个人、
+> 且担心 GitHub 自动化触发风控，把 CI 与发版自动化全部删掉，把关回到本地。
+> 现在有**外部协作者**（多台机器上的 AI 实例、另一个账号）提 PR ——
+> 本地把关证明不了别人的代码，所以 CI 是必需的。
+> 详见 [`docs/RELEASING.md`](docs/RELEASING.md) 开头那段。
 
-**本仓库已开源。** 分支保护（Branch protection）与规则集（Rulesets）在公开仓库上
-免费可用，因此可以真正在技术上阻止直接推送到 `main`。
+### ⚠️ `main` 分支保护尚未启用（这是**有意**的）
 
-当前替代方案是 `.github/workflows/main-guard.yml`：它**不阻断**推送，但会在每次
-直接推送到 `main` 时把偏离流程的事实和正确做法打印在 CI 日志里。
+直接推送到 `main` 仍然允许。理由：
 
-> 为什么不干脆让它失败：把 `main` 长期弄成红色会训练人忽略红色，
-> 比没有守卫更糟。团队协作规模上来后，把该工作流最后一行的 `exit 0` 改成
-> `exit 1` 即可变成硬性阻断。
+- 维护者自己的迭代走 `scripts/deploy.ps1`（scp/ssh），**不经过 GitHub**，
+  而现在 `docker-publish.yml` 会在每次 push main 时构建镜像 ——
+  若强制走 PR，自己的迭代会多出一轮"开 PR → 等 CI → 合并"的往返；
+- 把 `main` 长期弄成红色会训练人忽略红色，比没有保护更糟。
 
-**升级到 Pro 后，用下面的命令启用真正的技术强制**（这个动作每个仓库只需做一次）：
+**没有分支保护时，"`main` 是绿的"只能靠看 CI 结果，没有机制帮你拦。**
+所以发版前请确认 `main` 上最近一次 CI 是绿的（见 `docs/RELEASING.md`）。
+
+**要启用真正的技术强制**（公开仓库免费，每个仓库做一次）：
 
 ```bash
 gh api -X PUT repos/<owner>/<repo>/branches/main/protection \
   -H "Accept: application/vnd.github+json" \
   -f 'required_status_checks[strict]=true' \
-  -f 'required_status_checks[contexts][]=类型检查 / 测试 / 构建' \
-  -f 'required_status_checks[contexts][]=仓库卫生 / 密钥扫描' \
+  -f 'required_status_checks[contexts][]=类型检查 · Lint · 测试 · 构建' \
   -f 'required_pull_request_reviews[required_approving_review_count]=0' \
   -f 'required_pull_request_reviews[dismiss_stale_reviews]=true' \
   -f 'required_linear_history=true' \
@@ -74,13 +81,14 @@ gh api -X PUT repos/<owner>/<repo>/branches/main/protection \
   -f 'allow_deletions=false'
 ```
 
-启用后即可删除 `main-guard.yml`。
+> ⚠️ `contexts` 里的名字必须与 `ci.yml` 的 job `name` **逐字一致** ——
+> 写错了 GitHub 会静默地永远不满足那个检查。当前是
+> `类型检查 · Lint · 测试 · 构建`（见 `ci.yml` 的 `name:`）。
 
 ### 团队协作开始时要改的地方
 
 - `.github/CODEOWNERS` —— 加入每个成员的 GitHub handle（**GitHub 会静默忽略无法
   解析的所有者**，拼错了不会报错，只会导致 review 请求发不出去）
-- 把 `main-guard.yml` 的 `exit 0` 改成 `exit 1`
 - `required_approving_review_count` 从 `0` 改成 `1`（或更高）
 
 ---

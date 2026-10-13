@@ -3,20 +3,35 @@
 面向**维护者**。贡献流程见 [`../CONTRIBUTING.md`](../CONTRIBUTING.md)，
 部署细节见 [`DEPLOYMENT.md`](DEPLOYMENT.md) 与 [`../deploy/README.md`](../deploy/README.md)。
 
-> ⚠️ **2026-09-30：本手册描述的部分自动化已被移除，读之前先看这一段。**
+> ⚠️ **2026-10-13：自动化重新引入，读之前先看这一段。**
 >
-> 用户在这一天的决定是「GitHub 上那些自动化功能能不用的就不要用了，
-> 反正项目现在也就我自己在维护使用」。于是这些工作流被删掉：
-> `release-drafter.yml`、`pr-labeler.yml`、`stale.yml`、`welcome.yml`、
-> `main-guard.yml`、`ci.yml`（连同 `main` 的分支保护）。
+> **2026-09-30** 用户曾决定「GitHub 上那些自动化功能能不用的就不要用了，
+> 反正项目现在也就我自己在维护使用」，于是 `release-drafter.yml`、`pr-labeler.yml`、
+> `stale.yml`、`welcome.yml`、`main-guard.yml`、`ci.yml` 连同 `main` 的分支保护一起被删掉，
+> 质量把关回到本地（`npm run typecheck / lint / test`）。**那套东西在本地够用。**
 >
-> **仍然保留的是 `docker-publish.yml`** —— 它产出 `deploy/up.sh` 一键部署所拉取的镜像，
-> 删掉会让一键安装失效。它的触发条件已从"等 CI 成功"改成直接的 `push: branches: [main]`。
+> **2026-10-13 前提变了**：会有**外部协作者**（多台机器上的 AI 实例、另一个 GitHub 账号）
+> 来提 PR 与 Issue。本地把关对"自己写的代码"够用，对"别人的代码"不够 ——
+> 因为 ① 我没有在他们机器上跑测试的能力；② PR 页面必须自己回答"这个能不能合"。
 >
-> 所以下面提到"发布说明草稿自动生成""标签自动打""CI 里被跳过"的地方**都不再成立**：
-> 现在没有任何自动运行的东西。**质量把关在本地**：
-> `npm run typecheck / lint / test` + `npm run build`；需要外部环境的验证手工跑 `npm run sim`。
-> 本文保留原样，是为了记录那套流程**当时**的形状 —— 哪天要重新引入自动化时，它是起点。
+> 所以恢复了**三个**工作流，**全部由 GitHub 自己触发**，没有任何脚本轮询或批量调 API：
+>
+> | 工作流 | 触发 | 做什么 |
+> | --- | --- | --- |
+> | [`ci.yml`](../.github/workflows/ci.yml) | PR / push main | 类型检查 · Lint · 测试 · 构建 · 密钥扫描 |
+> | [`pr-labeler.yml`](../.github/workflows/pr-labeler.yml) | PR | 路径标签（`labeler.yml`）+ 类型标签（标题前缀）|
+> | [`release-drafter.yml`](../.github/workflows/release-drafter.yml) | push main | 增量维护发布说明草稿 |
+>
+> ⚠️ **与 2026-09-25 封号事故的关系**：那次是 agent 在几分钟里高频调用 `gh`（6 个 PR +
+> `gh pr checks` 放进循环）被判为滥用自动化。**这次一条都不碰**：不轮询、不批量、
+> 不自动合并、不开 stale 机器人。见 `AGENTS.md` 的红线。
+>
+> **没有恢复的**：`stale.yml`（噪音）、`welcome.yml`（噪音）、`main-guard.yml`
+> （它只在日志里打印，而 `ci.yml` 已经在 PR 上显示真实结果）、以及 `main` 的分支保护
+> （我自己的迭代走 scp/ssh 部署，不经过 GitHub，直接推 `main` 仍然允许）。
+>
+> **质量把关仍然是双份的**：CI 管"别人的 PR"，本地 `npm run typecheck / lint / test`
+> + `npm run build` 管"我自己的改动"。**没有部署的迭代等于没做完**（`docs/AGENTS.md` §4.6）。
 
 本项目**下真实订单**，所以一次发布会影响正在跑着的机器人。
 本手册的目的不是走流程，而是让"这次发布要改什么"在发布之前就被看见。
