@@ -80,6 +80,28 @@ export const ROLE_TIERS: Readonly<Record<string, ModelTier>> = {
   memory_curator: 'T2_mid',
   risk_officer: 'T2_mid',
 
+  /*
+   * **按币并行的侦查员**（2026-10-14 新增）。
+   *
+   * ## 为什么它是 T3 而不是 T2（用户需求 ① 的直接落地）
+   *
+   * 用户对分工的原话：「高智能的模型做什么，低智能的做哪些体力活」。
+   * 逐币深看（一个标的的完整序列 → 方向/强度/关键位/失效条件）正是
+   * "高智能"的那类活 —— 它的产出**直接进裁决材料**。
+   *
+   * ## 实测依据（为什么从 T2 提上来）
+   *
+   * 挂在 `market_analyst`（T2/flash 档）下跑的四轮：
+   * ```
+   *   成功 1/20 → 2/20 → 4/20 → 5/20（失败全是"没有找到 JSON 对象"）
+   * ```
+   * flash 档的**格式服从性**是天花板：同一批模型在 `<team>` 标签里
+   * 能稳定输出 JSON 数组，裸输出/`<digest>` 标签就写散文。
+   * T3（`team-judge` 组的最强模型）对输出契约的服从性显著更好 ——
+   * `judge` 用"先输出 JSON 数组"的措辞稳定工作了 100+ 轮。
+   */
+  symbol_scout: 'T3_deep',
+
   /* --- 体力活：打标、摘要、抽取（T1）--- */
   newscaster: 'T1_fast',
   sentiment: 'T1_fast',
@@ -131,6 +153,20 @@ export const ROLE_GROUP_LADDERS: Readonly<Record<string, readonly string[]>> = {
    * ⚠️ 后面挂了 `team-grunt` 作为**兜底** —— 见下面 `T1_LADDER` 的说明。
    */
   market_analyst: ['group/team-analyst', 'group/team-grunt'],
+  /*
+   * ── 按币并行的侦查员：要【最强 + 最听话】（2026-10-14 新增）──────────────
+   *
+   * ## 为什么绑 `team-judge`
+   *
+   * 1. 它是"最强模型"组 —— 逐币深看是高智能活（用户需求 ①）。
+   * 2. `judge` 在这个组里用"先输出 JSON 数组"稳定跑了 100+ 轮 ——
+   *    **输出契约服从性**已被验证，而那正是 flash 档的死穴
+   *    （按币并行挂 flash 下四轮：1→2→4→5 / 20，失败全是格式）。
+   *
+   * ⚠️ 兜底挂 `team-analyst`（不是 team-grunt）：
+   *    scout 失败的代价是"裁决官少一份逐币深看"，宁可稍慢也别没产出。
+   */
+  symbol_scout: ['group/team-judge', 'group/team-analyst'],
   /*
    * ── 体力活：要快 + 免费。**必须有兜底** ──────────────────────────────
    *

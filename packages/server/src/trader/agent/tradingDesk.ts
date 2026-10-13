@@ -1584,8 +1584,20 @@ async function runTradingDeskInner(input: {
         tasks,
         ask: async (task) => {
           const out = await safeAsk(input.ask, {
-            role: 'market_analyst',
-            tier: 'T2_mid',
+            /*
+             * ⚠️ **专属角色 `symbol_scout`（T3/team-judge），不是 `market_analyst`**
+             *（2026-10-14，四轮线上实测后提档）。
+             *
+             * 挂在 `market_analyst`（T2/flash）下的四轮成功率：
+             * ```
+             *   1/20 → 2/20 → 4/20 → 5/20（失败全是"没有找到 JSON 对象"）
+             * ```
+             * flash 档的**格式服从性**是天花板；T3（team-judge 组）的
+             * 输出契约服从性已被 `judge` 验证了 100+ 轮。
+             * 逐币深看正是用户需求 ① 里"高智能模型做"的那类活。
+             */
+            role: 'symbol_scout',
+            tier: 'T3_deep',
             context: task.context,
             /*
              * ⚠️⚠️ **必须逐字段写清输出契约**（2026-10-13 线上实测抓到的接线 BUG）。

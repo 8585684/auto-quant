@@ -209,6 +209,22 @@ export const FIRM_ROLES: readonly FirmRole[] = [
     status: 'staffed',
   },
   {
+    id: 'symbol_scout',
+    label: '标的侦查员',
+    duty: '逐币深看：一个标的的完整序列 → 方向/强度/关键位/失效条件（按币并行）',
+    department: '研究',
+    tier: 'T3_deep',
+    /*
+     * ⚠️ **2026-10-14 接线（AQ_PER_SYMBOL=on 时启用）** —— 用户需求 ② 的直接落地：
+     * 「并行 20 个子代理，同步进行一人分析一个，分析完了以后汇总」。
+     *
+     * 挂在 flash 档下的四轮成功率 1→2→4→5 / 20（失败全是格式），
+     * 提到 T3（team-judge 组）是因为逐币深看是"高智能模型做"的那类活
+     *（用户需求 ① 的分工原则）。
+     */
+    status: 'staffed',
+  },
+  {
     id: 'onchain_analyst',
     label: '链上分析',
     duty: '链上资金流、交易所净流入流出',

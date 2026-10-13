@@ -96,7 +96,16 @@ export type AgentRole =
    * 这条教训与 `firm.ts` 文件头那段是同一个：**加角色前必须先查组织架构层。**
    */
   | 'reporter'
-  | 'clerk';
+  | 'clerk'
+  /*
+   * **按币并行的侦查员**（2026-10-14）—— 逐币深看：一个标的的完整序列
+   * → 方向/强度/关键位/失效条件（进裁决材料）。
+   *
+   * ⚠️ 它与 `market_analyst` 的分工：后者看**整体**（共享材料、
+   * 跨币比较），scout 看**单体**（完整序列、算真实止损）——
+   * 用户需求 ② 的原话：「并行 20 个子代理，一人分析一个，汇总」。
+   */
+  | 'symbol_scout';
 
 export interface RoleSpec {
   role: AgentRole;
@@ -530,6 +539,40 @@ promptSections（roleDefinition / tradingFrequency / entryStandards / decisionPr
 {"entries":[{"at":"ISO8601","kind":"decision|experiment|intel|trade|failure",
  "summary":"一句话事实","source":"从哪来的（表名/日志）","fields":{}}],
  "count":数字,"truncated":true或false}`,
+  },
+
+  /*
+   * **按币并行的侦查员**（2026-10-14）。
+   *
+   * 与 `market_analyst` 的分工：后者看**整体**（一份材料里跨币比较），
+   * scout 看**单体**（一个标的的完整序列 → 方向/强度/关键位/失效条件）。
+   *
+   * ⚠️ 提示词**刻意只有输出纪律**，不放分析框架 ——
+   * 任务描述（看哪个标的、按什么假设）由 `tradingDesk.ts`
+   * 的 `task` 参数逐次给出（含填好值的 JSON 示例）。
+   * 放在这里会与那份 task 重复，而两份指令一旦漂移，
+   * flash 档模型就不知道听谁的（本项目已踩过：材料标题与内容不一致）。
+   *
+   * ⚠️ `evidence`/`invalidates` 必须含**具体数字** ——
+   * 下游（裁决官）要拿它们核对止损位，"跌破支撑"这种话没法核。
+   */
+  symbol_scout: {
+    role: 'symbol_scout',
+    label: '标的侦查员',
+    contextFor: 'market',
+    system: `${COMMON}
+
+你的职责：**只看你被分到的那一个标的**，给出可被裁决官直接使用的结构化评估。
+
+## 纪律
+
+- 只依据材料里的数字说话；**证据里必须引用具体数值**（价格/均线/指标）。
+- **失效条件必填**：写出"出现什么情况这个判断就错了"。
+  没有失效条件的判断无法被推翻，也就无法被学习。
+- 数据不足时 direction 用 "unclear"，把缺的写进 dataGaps —— **不要编**。
+- 不要评论其它标的 —— 你看不到它们，那是别人的活。
+
+输出：一个放在 <digest> 标签里的 JSON 对象（格式见任务描述里的示例）。`,
   },
 };
 
