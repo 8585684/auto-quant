@@ -21,8 +21,17 @@ import { fileURLToPath } from 'node:url';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
-/** 跳过这些目录：依赖、版本控制、以及大体积的第三方文档副本。 */
-const SKIP_DIRS = new Set(['node_modules', '.git', 'vendor', 'dist', '.github']);
+/**
+ * 跳过这些目录：依赖、版本控制、以及大体积的第三方文档副本。
+ *
+ * ⚠️ `.claude` 必须在这里，而**不是**靠 `.gitignore`：本脚本自己走文件系统
+ * （`readdirSync`），从不读 `.gitignore`。而 `.claude/` 下是 AI 会话的工作区
+ * —— issue 草稿、临时 worktree、探针脚本，它们**故意不入库**（见 `.gitignore`
+ * 与 AGENTS.md §4.1：那里有完整对话历史），用相对路径写的草稿链接自然也解析不到。
+ * 不跳过它，这个脚本会稳定报出一批与仓库无关的"坏链"，把真正的问题淹掉
+ * （实测：12 条噪音里没有任何一条属于版本库）。
+ */
+const SKIP_DIRS = new Set(['node_modules', '.git', 'vendor', 'dist', '.github', '.claude']);
 
 /** 不算链接目标的写法。 */
 const SKIP_TARGET = /^(?:https?:|mailto:|tel:|#|data:)/;
