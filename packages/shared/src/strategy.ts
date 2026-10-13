@@ -220,6 +220,40 @@ export const RiskControlConfigSchema = z.object({
    */
   riskPerTradePercent: z.number().min(0.1).max(20).default(2),
 
+  /**
+   * **用"自身保证金"替代"权益百分比"作为单笔上限**（2026-10-13 用户要求）。
+   *
+   * ## 用户的原话
+   *
+   * > 「**不要限制单笔上限**（由于系统【逐仓】运行，所以一笔交易最多亏损保证金，
+   * >  所以用户会自己控制，不需要系统限制最大止损金额），
+   * >  改成**以自身保证金为限制**」
+   *
+   * ## 为什么这个改动是对的（逐仓的数学）
+   *
+   * 在**逐仓**下，一笔交易的**最大亏损就是它自己的保证金** ——
+   * 强平不会动到别的仓位的钱（这正是 `marginMode: 'isolated'` 的含义）。
+   * 所以：
+   * ```
+   *   旧口径：单笔亏损 ≤ 权益 2%    → 一个【人为的】比例
+   *   新口径：单笔最多亏掉它的保证金 → 一个【物理的】事实
+   * ```
+   * 旧口径在**小账户**上会算出一个荒谬的窄止损带（实测：权益 20.75 × 2%
+   * 在最小名义 50 上只能给 **0.83%**，而实际需要 2–4%）→ **40+ 轮零决策**。
+   *
+   * ## 打开时会发生什么
+   *
+   * ```
+   *   · 不再用 `riskPerTradePercent` 反推止损带上限（提示词那一段会换掉）
+   *   · `minRiskRewardRatio` 仍然**保留**（用户明确说："盈亏比和胜率的要求可以保留"）
+   *   · 模型**自己决定每笔划多少保证金**（用户选的就是这个）
+   * ```
+   *
+   * ⚠️ **默认 `false`** —— 既有机器人（尤其实盘 `#10`）的行为**逐字节不变**。
+   * 打开必须是一次显式选择。
+   */
+  marginBasedLimit: z.boolean().default(false),
+
   /** Force an exchange-side stop loss on every entry. Strongly recommended. */
   requireStopLoss: z.boolean().default(true),
   /** Force an exchange-side take profit on every entry. */
