@@ -277,10 +277,67 @@ export const spawnClaudeCode: SpawnAgent = async (input) => {
 };
 
 /**
- * 跑一次 agent 任务。
+ * **判断一次失败是不是"网关侧不可用"**（2026-10-13）。
+ *
+ * ## 为什么需要它（实测事故）
+ *
+ * ```
+ *   ok=false 4s
+ *   text: "Failed to authenticate. API Error: 403 OpenCode Zen Free:
+ *          OpenCode's free tier can only be used from within OpenCode."
+ * ```
+ * **4 秒**就失败了 —— 而正常一次猎手要 200–500 秒。
+ * 而线上日志里 4 个猎手**同时**以这个理由失败：
+ * ```
+ *   [调研] 4 个来源中 **4 个未产出**
+ *         每个都是：harness 退出码 1 · [claude-code:unrecognized_model]
+ * ```
+ * 根因：`team-news` 组的 **6 个候选全部是 `opencode-zen-free/*` /
+ * `our-free-model/*`**，而它们**都返回同一个 403** ——
+ * 而 **magpie 的组路由【不降级】**（实测：直接调 `group/team-news`
+ * 得到的是那个 403，而不是"试下一个候选"）。
+ *
+ * ## 为什么要识别它
+ *
+ * 这个失败是**可重试的**（换一组模型、或等限流恢复）——
+ * 而"任务本身失败"（模型说"我查不到"）是不可重试的。
+ * 把两者混在一起，会让"换一组模型就能解决"的问题**静默变成"没有新闻"**。
+ *
+ * ⚠️ 判据必须**只看网关侧的错误**（认证/限流/额度），
+ * 不能把"模型自己输出了一句含 Error 的话"也算进来 ——
+ * 那会触发无意义的重试。
+ */
+export function isGatewayUnavailable(text: string): boolean {
+  return (
+    /Failed to authenticate/i.test(text) ||
+    /permission_error/i.test(text) ||
+    /\b403\b/.test(text) ||
+    /can only be used from within/i.test(text) ||
+    /rate.?limit/i.test(text) ||
+    /\b429\b/.test(text) ||
+    /insufficient|quota|credit/i.test(text)
+  );
+}
+
+/**
+ * **跑一次 agent 任务**。
  *
  * 调用方（角色）只需要给"任务是什么、能用什么工具、用哪档模型"，
  * **不需要知道底下是 claude code 还是别的 harness**。
+ *
+ * ## 网关侧失败会重试一次（2026-10-13 加）
+ *
+ * 见 `isGatewayUnavailable()`：组里候选全坏时 magpie **不降级**，
+ * 于是整个组瞬间失败。而那种失败往往是**暂时的**
+ *（限流恢复、magpie 换了一批候选）—— 所以值得再试一次。
+ *
+ * ⚠️ **只重试一次**，且**只在"网关侧失败"时**：
+ * ```
+ *   网关侧失败（403/429/额度）→ 重试 1 次（间隔 3 秒）
+ *   其它失败（模型没查到、轮数用尽、超时）→ 不重试
+ * ```
+ * 理由：重试有成本（每个 claude 进程 150–250MB，而服务器只有 2 核），
+ * 而"模型说查不到"重试一遍还是查不到。
  */
 export async function runAgentTask(
   input: AgentTaskInput,
@@ -289,5 +346,35 @@ export async function runAgentTask(
   if (input.task.trim().length === 0) {
     return { ok: false, text: '', error: '任务为空 —— 没给这个 agent 任何活干', latencyMs: 0 };
   }
-  return await spawnAgent(input);
+  const first = await spawnAgent(input);
+  if (first.ok) return first;
+  /*
+   * ⚠️ **只重试"网关侧失败"**（见 `isGatewayUnavailable`）——
+   * 而且只看 `error` 与 `text` 里的**网关错误**，不把"模型自己提到 403"算进来。
+   *
+   * ⚠️ 而"任务为空"那条不该走到这里（上面已经返回）。
+   * ⚠️ **超时也不重试**：一次超时已经花掉了整个 `timeoutMs`
+   *（实测 600 秒），再试一次等于让这一轮再等 10 分钟 ——
+   * 而"没有新闻"比"决策等 20 分钟"好得多（调研在后台，但仍是资源）。
+   */
+  const gatewayIssue =
+    isGatewayUnavailable(first.error ?? '') ||
+    (first.text.length > 0 && isGatewayUnavailable(first.text));
+  if (!gatewayIssue) return first;
+
+  /* 间隔 3 秒：给 magpie 一点时间（换候选 / 限流窗口过去）。 */
+  await new Promise((r) => setTimeout(r, 3_000));
+  const second = await spawnAgent(input);
+  /*
+   * 第二次失败时**把两次的原因都带上** —— 否则排查时只看到"还是失败"，
+   * 而不知道第一次与第二次是不是同一个原因（那决定了该改什么）。
+   */
+  if (!second.ok) {
+    return {
+      ...second,
+      error: `重试后仍失败（第 1 次：${(first.error ?? '').slice(0, 150)}｜第 2 次：${(second.error ?? '').slice(0, 150)}）`,
+      latencyMs: first.latencyMs + second.latencyMs,
+    };
+  }
+  return { ...second, latencyMs: first.latencyMs + second.latencyMs };
 }
