@@ -27,16 +27,127 @@ import { closeReasonLabel, marginPercentToPricePercent, type StrategyConfig } fr
 import type { ReviewTradeFacts } from '../autoTrader.js';
 
 import { createLogger } from '../../logger.js';
-import { agentMemory } from '../../store/agentStore.js';
+import { agentMemory, agentRuns } from '../../store/agentStore.js';
 import { decisions as decisionStore } from '../../store/repositories.js';
 import { traders } from '../../store/repositories.js';
 import type { LoopModel } from './loop.js';
 import { hasAgentConfig, readAgentConfig } from './config.js';
 import { markStrategyReview, markWoken, makeAgentPorts } from './ports.js';
-import { reviewClosedTrade, runStrategyReview, settlePending } from './orchestrator.js';
+import {
+  reviewClosedTrade,
+  runHealthCheck,
+  runStrategyReview,
+  settlePending,
+} from './orchestrator.js';
 import { DEFAULT_WAKE_POLICY, type WakePolicy } from './wake.js';
 
 const log = createLogger('trader:agent');
+
+/* -------------------------------------------------------------------------- */
+/*  体检事实的构造                                                              */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * 把 `agent_runs` 的行**变成工程师能读懂的事实**。
+ *
+ * ## 为什么必须在这里"算好"再给模型
+ *
+ * 用户要求"不要让我来发现问题"，而这个角色的成败**几乎全在喂给它的数据**上。
+ * 把 30 行原始 JSON 丢给它，它会去**猜**哪一行是异常；而算好之后，
+ * "同一个失败出现 N 次"是**摆在那里的数字**。
+ *
+ * ## ⚠️ 刻意给出的四类判据
+ *
+ * ```
+ *   ① 失败率        —— ok/degraded/failed 各几次（"静默失败"的第一判据）
+ *   ② 重复的失败原因 —— 相同 detail 出现 N 次（区分"系统性"与"一次抖动"）
+ *   ③ 耗时分布      —— 最大/中位（"某个角色比基线慢很多倍"）
+ *   ④ 步数分布      —— 撞上限的次数（"达到步数上限"是产出不完整的前兆）
+ * ```
+ *
+ * ⚠️ **`detail` 要按"归一化后的形状"聚合，不能按原文字符串**：
+ * 每次失败的消息里带着**不同的数字与符号**（`#2554`、`97.3s`），
+ * 按原文分组会让"同一类失败"看起来像 30 种不同的问题 ——
+ * 而那正是这个角色要抓的东西。所以先**抹掉数字**再分组。
+ */
+export function buildHealthFacts(
+  runs: readonly {
+    outcome: string | null;
+    detail: string | null;
+    latencyMs: number | null;
+    steps: number | null;
+  }[],
+  traderId: number,
+): string {
+  const total = runs.length;
+  const byOutcome = new Map<string, number>();
+  for (const r of runs) {
+    const k = r.outcome ?? 'unknown';
+    byOutcome.set(k, (byOutcome.get(k) ?? 0) + 1);
+  }
+
+  /*
+   * 归一化：抹掉数字与引号里的具体值 —— 见函数注释里那段说明。
+   */
+  const normalize = (s: string): string =>
+    s
+      .replace(/\d+(\.\d+)?/g, 'N')
+      .replace(/[‘’'"][^‘’'"]{0,30}[‘’'"]/g, 'X')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, 90);
+
+  const byReason = new Map<string, { count: number; sample: string }>();
+  for (const r of runs) {
+    if (!r.detail || r.outcome === 'ok') continue;
+    const key = normalize(r.detail);
+    const cur = byReason.get(key);
+    if (cur) cur.count += 1;
+    else byReason.set(key, { count: 1, sample: r.detail.slice(0, 160) });
+  }
+
+  const lat = runs
+    .map((r) => r.latencyMs ?? 0)
+    .filter((x) => x > 0)
+    .sort((a, b) => a - b);
+  const median = lat.length > 0 ? (lat[Math.floor(lat.length / 2)] ?? 0) : 0;
+  const max = lat.length > 0 ? (lat[lat.length - 1] ?? 0) : 0;
+  const steps = runs.map((r) => r.steps ?? 0);
+  const maxSteps = steps.length > 0 ? Math.max(...steps) : 0;
+
+  const lines: string[] = [];
+  lines.push(`机器人 #${traderId} 最近 ${total} 次智能体运行的统计（数据来源：agent_runs 表）`);
+  lines.push('');
+  lines.push('## ① 结果分布（失败率就是"静默失败"的第一判据）');
+  for (const [k, v] of [...byOutcome].sort((a, b) => b[1] - a[1])) {
+    lines.push(`  ${k}: ${v} 次（${((v / total) * 100).toFixed(0)}%）`);
+  }
+  lines.push('');
+  lines.push('## ② 重复出现的失败原因（同一个原因 N 次 = 系统性问题；1 次 = 可能只是抖动）');
+  if (byReason.size === 0) {
+    lines.push('  （这段时间没有失败）');
+  } else {
+    const sorted = [...byReason].sort((a, b) => b[1].count - a[1].count);
+    for (const [shape, v] of sorted.slice(0, 8)) {
+      lines.push(`  ${v.count} 次 · 形状「${shape}」`);
+      lines.push(`        原文样例：${v.sample}`);
+    }
+  }
+  lines.push('');
+  lines.push('## ③ 耗时（某个角色比基线慢很多倍 = 可能已经坏了）');
+  lines.push(
+    `  中位 ${median}ms · 最大 ${max}ms${median > 0 ? ` · 最大是中位的 ${(max / median).toFixed(1)} 倍` : ''}`,
+  );
+  lines.push('');
+  lines.push('## ④ 步数（撞上限 = 产出可能不完整）');
+  lines.push(`  最大步数 ${maxSteps}`);
+  lines.push('');
+  lines.push('## ⚠️ 你【没有】的上下文（如实写在 notChecked 里）');
+  lines.push('  · 服务器日志文本（你只能看到这张表的统计，看不到原始日志）');
+  lines.push('  · 模型网关/provider 的状态与额度');
+  lines.push('  · 调研猎手与交易决策链路的逐条结果');
+  return lines.join('\n');
+}
 
 export interface AgentRuntimeDeps {
   traderId: number;
@@ -407,7 +518,6 @@ export class AgentRuntime {
       log.debug(`机器人 #${this.deps.traderId} 本轮未审视：${outcome.skippedBecause}`);
       return;
     }
-
     /*
      * ⚠️ 顺序要紧：**先落"醒过"的时间，再打权益基线**。
      *
@@ -421,5 +531,74 @@ export class AgentRuntime {
       `机器人 #${this.deps.traderId} 完成策略审视（触发 ${outcome.trigger} / ${outcome.intensity}）：` +
         `${outcome.loop?.outcome}，${outcome.loop?.steps.length ?? 0} 步`,
     );
+
+    /*
+     * ⚠️ **不 `await` 体检** —— 它是附加动作，不该把交易周期撑长。
+     * 与 `runReview` 里那条纪律一致（见文件头 §2）。
+     */
+    void this.runHealthCheck();
+  }
+
+  /**
+   * **系统体检**（工程师角色）—— 周期性指出"哪里在坏"。
+   *
+   * ## 为什么需要它（用户需求 ⑤ 点名要有"维护系统的程序员"）
+   *
+   * 用户的判断：
+   * > 「这次更新你得搞智能体团队**持续观察、测试**…**不要老让我来测试和发现问题**」
+   *
+   * 而实测证明**系统会以"看不出异常"的方式坏掉**（本项目已抓到三次）：
+   * ```
+   *   调研 4 个猎手全部 4 秒失败 → 看起来像"那边没有新闻"
+   *   策略师全部 outcome=failed  → 看起来像"策略师在跑"
+   *   决策数组被输出预算截断     → 看起来像"模型决定观望"
+   * ```
+   * 三种都**没有任何东西报错**。
+   *
+   * ## 数据来源：`agent_runs`（每次审视一行轨迹）
+   *
+   * 它里面有 `outcome`（ok/degraded/failed）与 `latency_ms` ——
+   * **这正是"失败率"与"耗时异常"的原始数据**。
+   * 让工程师自己去看日志文本是没用的（它拿不到服务器日志），
+   * 但把这张表的结构化摘要给它，它就能回答"哪个角色在系统性失败"。
+   *
+   * ## ⚠️ 它只能报告，不能修（`roles.ts` 里那条刻意的边界）
+   *
+   * 一个能自己改代码的智能体在交易系统里是**不可审计的**。
+   * 它的价值在于把"看不出异常的失败"变成"一条写清楚的告警"。
+   */
+  private async runHealthCheck(): Promise<void> {
+    try {
+      /* 最近 30 次运行 —— 足够看出"系统性失败"而不是"一次抖动"。 */
+      const runs = agentRuns.recent(this.deps.traderId, 30);
+      if (runs.length === 0) return;
+
+      const facts = buildHealthFacts(runs, this.deps.traderId);
+      const r = await runHealthCheck({
+        model: this.deps.model,
+        facts,
+      });
+
+      if (r.ok) {
+        /*
+         * ⚠️ 用 `warn` 而不是 `info`：这条日志的唯一价值就是**被人看见**。
+         * `degraded` / `broken` 必须与正常的 `healthy` 在日志里区分开。
+         */
+        const line = `机器人 #${this.deps.traderId} 系统体检：${r.summary}`;
+        if (r.health === 'healthy') log.info(line);
+        else log.warn(line);
+        for (const f of r.findings.slice(0, 3)) {
+          const o = f as Record<string, unknown>;
+          if (typeof o.what === 'string') {
+            log.warn(`  体检发现：${o.what}（证据：${String(o.evidence ?? '').slice(0, 120)}）`);
+          }
+        }
+      } else {
+        /* 体检失败不抛穿 —— 它是附加能力（见文件头 §1）。 */
+        log.debug(`机器人 #${this.deps.traderId} 体检未完成：${r.error ?? '未知'}`);
+      }
+    } catch (error) {
+      log.debug(`机器人 #${this.deps.traderId} 体检失败（不影响交易）：${(error as Error).message}`);
+    }
   }
 }
