@@ -2903,9 +2903,88 @@ export class TraderManager {
         },
       });
 
+      /*
+       * ══════════════════════════════════════════════════════════════════════
+       *  ⚠️⚠️ **启动飞行中点「停止」必须真的生效**（外部 issue #143，真实资金）
+       * ══════════════════════════════════════════════════════════════════════
+       *
+       * ## 原来这里没有任何取消检查
+       *
+       * `attemptStart()` 的窗口是**几秒到几十秒**（建连接、校时、`exchangeInfo`、
+       * 模型探测、拉持仓对账）。操作员在这个窗口里点「停止」时：
+       *
+       * ```
+       *   stopTrader()                   ← 第一句 cancelledStarts.add(traderId)
+       *     this.running.get(traderId)   ← undefined（实例还没被写进去）
+       *     → 走 else：只写一个 'stopped' 状态就返回
+       *   …
+       *   attemptStart() 仍在 await 中
+       *     this.running.set(...)        ← 照常把实例放进去
+       *     await autoTrader.start()     ← 照常起循环，**用真钱开始下单**
+       * ```
+       *
+       * 结果是**界面显示已停止、而机器人真的开单** —— 比"按钮反应慢"严重得多，
+       * 它给出的是**已停止的假象**。而 `startTrader` 的 `finally` 还会
+       * `cancelledStarts.delete()`，连这条停止意图的痕迹都不留。
+       *
+       * ## 两道守卫，位置各有用意
+       *
+       *   · **第一道（下面，`running.set` 之前）**：取消已经发生就别把实例放进
+       *     `running` —— 否则 `statusOf()` 会读到一个从没启动过的"运行中"实例。
+       *   · **第二道（`autoTrader.start()` 之后）**：启动本身也要等（首轮周期、
+       *     用户数据流），期间操作员仍可能点停止 —— 那就立刻把它停掉。
+       *
+       * `permanent: true` 很关键：`startTrader` 的重试判据是
+       * `!outcome.permanent && !cancelledStarts.has(id) && …`，若这里返回 false，
+       * "停止"会被重试机制重新拉起来 —— 等于**停止请求被系统否决**。
+       */
+      if (this.cancelledStarts.has(traderId) || this.stopping) {
+        dropConnections(this.connections, traderId);
+        this.setTraderStatus(traderId, 'stopped', null);
+        runtimeLogs.write(
+          traderId,
+          'info',
+          'manager',
+          '启动过程中收到「停止」—— 已放弃本次启动，不会起交易循环。',
+        );
+        return {
+          result: { ok: false, error: '启动过程中被操作员取消。', preflight: checks },
+          permanent: true,
+        };
+      }
+
       this.running.set(traderId, autoTrader);
       this.startedAt.set(traderId, Date.now());
       await autoTrader.start();
+
+      /*
+       * 第二道：`start()` 本身也要花时间（首轮周期可能已经在下单路上）。
+       * 期间收到的停止要立刻兑现 —— 否则同样是"界面已停、实际在跑"。
+       *
+       * ⚠️ **`persist` 必须传 `true`**（默认值）：这是**操作员点的停止**，
+       * 不是进程关闭。`stop(reason, false)` 那个分支的文档写明它专给进程关闭用 ——
+       * 因为 `resumePersisted()` 只恢复 `running` / `safe_mode` / `error`，
+       * **刻意不恢复 `stopped`**（那被当作人的决定）。传 `false` 会把操作员的
+       * 停止意图丢掉，下一次部署或重启就把这台机器人又拉起来。
+       */
+      if (this.cancelledStarts.has(traderId) || this.stopping) {
+        await autoTrader.stop('操作员在启动过程中请求停止', true);
+        this.running.delete(traderId);
+        this.startedAt.delete(traderId);
+        dropConnections(this.connections, traderId);
+        this.setTraderStatus(traderId, 'stopped', null);
+        runtimeLogs.write(
+          traderId,
+          'info',
+          'manager',
+          '启动完成后立刻收到「停止」—— 交易循环已停下。',
+        );
+        return {
+          result: { ok: false, error: '启动完成后被操作员取消。', preflight: checks },
+          permanent: true,
+        };
+      }
+
       // Attached after the trader is live, so a stream failure can never prevent
       // the trading loop from starting.
       await this.startUserStream(traderId, connection);
