@@ -50,6 +50,22 @@ import {
   planDispatch,
   type AnalystCandidate,
 } from './dispatch.js';
+/*
+ * ── 两处 import 都是**汇报员**接线的需要（2026-10-13）────────────────────
+ *
+ * `extractFirstJsonArray`：汇报员要报"这一轮有几条决策、动作怎么分布"，
+ * 而那个数字**必须与风控官审的、最终执行的是同一份** ——
+ * 所以用执行层同一个抽取器，而不是自己写个正则数 `"action"`。
+ * ⚠️ 这看起来是"下层反向依赖上层适配器"：`deskOutput.ts` 是
+ * `DeskOutcome → <decision>` 的翻译层。但它从 `tradingDesk` 只 `import type`
+ * （见该文件第 34 行），**类型导入在运行时被完全擦除** —— 所以没有循环依赖，
+ * 而那个抽取器是**纯函数**，不牵扯任何适配逻辑。
+ *
+ * `ROLES`：汇报员的提示词在 `roles.ts` 里**已经写好了**（那是本次接线的起点）。
+ * 在这里再写一段措辞会让"写好的那份"永远到不了模型手里，而且两份会各自漂移。
+ */
+import { extractFirstJsonArray } from './deskOutput.js';
+import { ROLES } from './roles.js';
 
 /**
  * **分析师的静态定义**（2026-10-13 提取为常量）。
@@ -564,6 +580,33 @@ export interface DeskOutcome {
   truncatedByBudget: boolean;
   /** 一句话摘要（给日志与界面用）。 */
   summary: string;
+  /*
+   * ══════════════════════════════════════════════════════════════════════════
+   *  ⭐ **汇报员的产出**（2026-10-13 接线 —— 用户需求 ⑤ 点名的"汇报工作的"）
+   * ══════════════════════════════════════════════════════════════════════════
+   *
+   * ## 为什么是**可选**字段，而不是必填的 `string`
+   *
+   * 因为它是**附加动作**（见 `runTradingDeskInner` 里 ④ 那一段）：
+   * 汇报员没跑（预算不足）或跑失败时，这一轮**仍然是完整的一轮** ——
+   * 决策、风控、执行全都没少任何东西。
+   * 若把它写成必填，那就得在失败时编一个 `''` 或 `'（无汇报）'` 填进去，
+   * 而**调用方无法区分"它说没事"与"它根本没跑"** ——
+   * 那正是本仓库反复强调的"看不出异常的失败"。
+   *
+   * ## 三个取值，语义各不相同（调用方必须能分辨）
+   *
+   * ```
+   *   string  —— 它跑了，这是它的产出（原始文本，含它自己的 JSON 结构）
+   *   null    —— 它跑了但**失败了**（超时/网关抖动/空内容）
+   *   undefined —— 它**根本没被调用**（预算不足）
+   * ```
+   *
+   * ⚠️ 这里的 `undefined` 与 `null` 的区别是刻意的，不是疏忽 ——
+   * 与 `verdict` 的 `null`（"没跑或失败"）不同，因为汇报员的**"没跑"本身
+   * 就是一条值得看的信息**：它意味着"这一轮的预算连一次附加调用都放不下"。
+   */
+  report?: string | null;
 }
 
 /** 一次"问某个角色"的函数（由调用方注入真实实现，便于测试）。 */
@@ -582,7 +625,7 @@ export const DESK_LIMITS = {
    * 一次会议最多几次模型调用。
    *
    * 组成：**总管(1)** + 4 个分析师并行(4) + Bull(1) + Bear(1) + **Judge(1)** = 8，
-   * 留余量 → **9**。
+   * 第 9 次给**汇报员**（2026-10-13 接线）→ **9**。
    *
    * ⚠️ **`maxCalls` 必须 ≥ 1(总管) + 分析员数 + 2×辩论轮数 + 1（裁决）**，
    * 否则裁决会被饿死 —— 这是实测踩到的：
@@ -596,6 +639,34 @@ export const DESK_LIMITS = {
    *
    * 所以下面有 `assertBudgetConsistent()` 在启动时就把这个不变量验一遍 ——
    * **让配置错误在启动那一刻暴露，而不是在跑了几十轮之后表现为"总是没有裁决"。**
+   *
+   * ── ⚠️ **第 9 次从"余量"变成了"汇报员"**（2026-10-13 接线后必读）────────
+   *
+   * ## 为什么没有再把 `maxCalls` 提到 10
+   *
+   * 因为**汇报员在编排里排在最后**（见 `runTradingDeskInner` 的 ④）：
+   * ```
+   *   裁决官的 canAsk() 检查 → 裁决 → 汇报员的 canAsk() 检查
+   * ```
+   * 于是"预算不够"被牺牲的**永远是汇报员**，而裁决官**结构上不可能**被它挤掉 ——
+   * 这个保证来自**顺序**，不是来自算术。
+   *
+   * ## 为什么不把汇报员写进 `assertBudgetConsistent` 的不变量
+   *
+   * 那条不变量的语义是「**保证任何负载下裁决都跑得到**」—— 它守的是**决策链**。
+   * 而汇报员是**附加动作**（用户明确要求"失败不能影响决策"）：
+   * 把它写进不变量就等于宣布"预算永远必须容得下汇报"，
+   * 那与"预算不足时**不调用**它"这条要求直接矛盾。
+   *
+   * 所以现在的账是：
+   * ```
+   *   不变量（必须永远成立）：1 总管 + 4 分析师 + 2×辩论 + 1 裁决 = 8
+   *   默认配置 9 的第 9 次 = 汇报员（它可有可无，且排在最后）
+   *   配置紧到 8 时（`{maxCalls: 8, maxDebateRounds: 1}`，自洽）
+   *     → 裁决照常跑，**汇报员被跳过并记一条 onStep**
+   * ```
+   * ⚠️ 代价是**默认配置不再有"余量"**：将来若有人再加一次**必需的**调用，
+   * 被挤掉的会是汇报员（那是设计意图），而**裁决仍由不变量保护**。
    */
   maxCalls: 9,
   /**
@@ -664,6 +735,158 @@ export function assertBudgetConsistent(
         `但 maxCalls=${limits.maxCalls} —— 裁决会被饿死，整轮将没有结论。`,
     );
   }
+}
+
+/**
+ * **从市场材料里摘出「账户状态」那一段**（2026-10-13，汇报员接线需要）。
+ *
+ * ## 为什么是"摘一段"而不是"把材料给它"
+ *
+ * 汇报员要回答的第一个问题就是「账户现在什么状态」。而账户信息**只存在于
+ * `marketContext` 里**（`routedModel` 给 `positionContext` 传的是空串）——
+ * 那份材料实测 **130,420 字符**。
+ *
+ * ```
+ *   ✗ 把 marketContext 整个给它   → 为了 40 字的账户行读 13 万字符
+ *   ✓ 只摘 `# 账户` 那一段        → 约 200 字符，且是它唯一需要的
+ * ```
+ * 这正是 `headOfMarket` 那段注释里说的同一件事：**材料要按"谁需要什么"给，
+ * 而不是"有什么就给什么"**。
+ *
+ * ## 拿不到时**必须说"拿不到"**，不能返回空串
+ *
+ * 汇报员的提示词里写着「不许替你判断不了的事下结论」「数据不足就明说」。
+ * 若这里返回 `''`，模型看到的是"账户那一栏是空的" ——
+ * 它要么跳过第一个问题（于是操作员以为账户没问题），要么凭别的线索编一个。
+ * 所以返回一句**明确的事实**：「这一轮的材料里没有账户段」。
+ *
+ * ⚠️ 判据用 `^# 账户`（行首锚定）——与 `headOfMarket` 找候选段同一纪律：
+ * 正文里偶然出现的 `# 账户` 不该被当成小节标题。
+ *
+ * @param marketContext 完整市场材料
+ * @param maxChars 摘出来的上限（**必须有上限**：材料是外部输入，长度不可控）
+ */
+export function accountSnapshot(marketContext: string, maxChars = 600): string {
+  const NOT_FOUND = '（这一轮的材料里没有账户段 —— 这一项数据不足，不要推测）';
+  const head = /^# 账户[^\n]*$/m.exec(marketContext);
+  if (head === null) return NOT_FOUND;
+  const from = head.index;
+  /*
+   * 到**下一个一级小节**为止（账户段的正文里不会有 `# ` 开头的行）。
+   * 找不到下一个标题时就取到材料末尾，再由 `maxChars` 收口。
+   */
+  const rest = marketContext.slice(from + head[0].length);
+  const next = /^# /m.exec(rest);
+  const body = next === null ? rest : rest.slice(0, next.index);
+  const text = `${head[0]}${body}`.trim();
+  if (text.length === 0) return NOT_FOUND;
+  /*
+   * ⚠️ 截断时**明说被截断** —— 与 `headOfMarket` 的「本节因预算截断」同一条纪律：
+   * 一份被悄悄砍掉的材料会让模型以为"账户信息就这么多"。
+   */
+  return text.length <= maxChars ? text : `${text.slice(0, maxChars)}\n（账户段因长度上限截断）`;
+}
+
+/**
+ * **汇报员这一轮要看的"事实"**（2026-10-13）。
+ *
+ * 刻意只有计数与状态，**没有一行市场数据** —— 见 `renderReportMaterial`。
+ */
+export interface ReportFacts {
+  /** 账户段（来自 `accountSnapshot`）。 */
+  account: string;
+  analyses: ReadonlyArray<{ role: string; ok: boolean; error?: string }>;
+  bull: { ok: boolean; error?: string } | null;
+  bear: { ok: boolean; error?: string } | null;
+  verdict: { ok: boolean; error?: string } | null;
+  /** 从裁决里抽出来的决策数组（`null` = 没抽到）。 */
+  decisions: unknown[] | null;
+  callsUsed: number;
+  maxCalls: number;
+  truncatedByBudget: boolean;
+}
+
+/**
+ * **把"这一轮的事实"渲染成汇报员的材料**。
+ *
+ * ## 为什么必须是纯函数
+ *
+ * 因为它的**唯一职责是"不把大材料放进去"**，而那条性质只能靠"材料有多长"
+ * 来验证。做成纯函数，测试就能直接断言"喂它 13 万字符的市场材料，
+ * 产出的材料仍然只有几百字符" —— 而如果它藏在 `runTradingDeskInner` 里，
+ * 就只能起一整个会议去间接观察。
+ *
+ * ## 为什么给"动作分布"而不是把决策数组原样贴进去
+ *
+ * 汇报员的任务是**压缩与排序**（它的提示词原话：「你的价值是压缩与排序」）。
+ * 12 条决策的完整 JSON 约 1,500 字符，而操作员真正要的是
+ * 「12 条，全是 skip」这一句话。把数组贴进去等于**让它把刚压缩过的东西
+ * 再压缩一遍**，还多花 token。
+ *
+ * ⚠️ **但"抽不到数组"这件事必须如实写出来**：那是 `deskOutput` 里
+ * `no-block` / `bad-json` 两个不同的失败，而它们会让整轮变成"不行动"。
+ * 汇报员若看不到这一点，就会把它讲成"团队决定观望" ——
+ * 那正是本项目反复记录的"看不出异常的失败"。
+ */
+export function renderReportMaterial(f: ReportFacts): string {
+  const okOf = (r: { ok: boolean; error?: string } | null): string =>
+    r === null ? '没有跑' : r.ok ? '成功' : `失败（${r.error ?? '未知原因'}）`;
+
+  const failedAnalysts = f.analyses.filter((a) => !a.ok);
+  const lines: string[] = [
+    '## 账户（来自本轮材料）',
+    f.account,
+    '',
+    '## 团队各角色结果',
+    `- 分析师：${f.analyses.filter((a) => a.ok).length}/${f.analyses.length} 成功` +
+      /*
+       * ⚠️ **失败原因必须带上**（不只是角色名）—— 汇报员的提示词要求
+       * 「若某个角色失败了，就说"它失败了"，而不是"信息有限"」。
+       * 只给一个角色名，它能写的只有"某角色失败了"；给了原因，
+       * 它才能写出"技术面分析超时未返回"这种**操作员能据此行动**的话。
+       */
+      (failedAnalysts.length > 0
+        ? `；失败：${failedAnalysts.map((a) => `${a.role}（${a.error ?? '未知原因'}）`).join('、')}`
+        : ''),
+    `- 做多论证：${okOf(f.bull)}`,
+    `- 做空/不行动论证：${okOf(f.bear)}`,
+    `- 裁决：${okOf(f.verdict)}`,
+    '',
+    '## 这一轮的决策',
+  ];
+
+  if (f.decisions === null) {
+    /*
+     * ⚠️ 与 `deskOutput.extractFirstJsonArray` 的两种失败对齐：这里只知道
+     * "抽不到合法数组"，而那意味着**本轮不会有任何动作**（执行层会按"不行动"处理）。
+     */
+    lines.push(
+      '- ⚠️ **裁决里没有可解析的决策数组**（模型可能只写了散文，或数组被输出预算截断）。',
+      '  这一轮按"不行动"处理 —— 请如实汇报这件事，不要替一个系统故障编一个正常的理由。',
+    );
+  } else {
+    const counts = new Map<string, number>();
+    for (const d of f.decisions) {
+      const action =
+        typeof d === 'object' && d !== null && 'action' in d
+          ? String((d as { action: unknown }).action)
+          : '（无 action 字段）';
+      counts.set(action, (counts.get(action) ?? 0) + 1);
+    }
+    const dist =
+      counts.size === 0
+        ? '（空数组）'
+        : [...counts.entries()].map(([a, n]) => `${a} ${n} 条`).join('、');
+    lines.push(`- 共 ${f.decisions.length} 条：${dist}`);
+  }
+
+  lines.push(
+    '',
+    '## 预算',
+    `- 模型调用 ${f.callsUsed}/${f.maxCalls}` +
+      (f.truncatedByBudget ? '（**本轮因预算/轮次上限提前收尾**）' : ''),
+  );
+  return lines.join('\n');
 }
 
 /**
@@ -1562,16 +1785,122 @@ async function runTradingDeskInner(input: {
    * `deskOutput.ts` 的 `<risk>` 块如实呈现（它在 `risk === null` 时写明原因）。
    */
 
+  /*
+   * ══════════════════════════════════════════════════════════════════════════
+   *  ⭐ ④ **汇报员：把这一轮讲成人话**（2026-10-13 接线）
+   * ══════════════════════════════════════════════════════════════════════════
+   *
+   * ## 为什么要有这一步（用户需求 ⑤ 的原话）
+   *
+   * > 「有主管、分析账户的，有调查新闻的、有监控社区的、有查市场情绪的、
+   * >  **有维护系统的程序员、有汇报工作的、有文员**、有交易员、有风控员等等
+   * >  一切专业交易所量化机构有的我们都要有」
+   *
+   * 而实测缺口是：交易循环里的**每个角色都在做判断，没有人把事情讲清楚**。
+   * 操作员看到的是 8 个角色的原始产出（每个 1000+ 字推理），
+   * 而他真正想知道的只有三件事：账户什么状态 / 团队做了什么、为什么 /
+   * 有没有需要他介入的事。
+   *
+   * ## 位置：**裁决之后**，且**排在最后**
+   *
+   * 它要汇报的是**这一轮的结论**，所以在裁决之后；它不参与任何决策，
+   * 所以排在最后。这两条合起来给出一个结构性保证：
+   * ```
+   *   汇报员的 canAsk() 检查发生在【裁决之后】
+   *   → 预算不够时，被牺牲的永远是汇报员，裁决官【不可能】被它挤掉
+   * ```
+   * ⚠️ 这个顺序**就是**那条不变量，而不是靠算数保证 —— 见 `DESK_LIMITS.maxCalls`
+   * 里关于"余量给谁"的说明。
+   *
+   * ## ⚠️ 为什么在 `tradingDesk` 里、而风控官在 `routedModel` 里
+   *
+   * 风控官的位置**必须在裁决之后、渲染之前**（那样它的否决才改得动决策）——
+   * 所以它在 `routedModel.askRiskOfficer()` 里。而汇报员**不改任何决策**，
+   * 它只需要"这一轮的事实"，而那些事实在这里全都有（各角色 ok/error、
+   * 裁决的决策数组、账户段、预算用量）。
+   *
+   * 也就是说：汇报员在链路上的位置是"裁决之后、风控官之前"，
+   * 而**这个差别对它是无所谓的** —— 它汇报的是团队做了什么，
+   * 而风控官是否削减仓位是执行层的事（那一层有自己的 `<risk>` 审计块）。
+   * 反过来，若为了"排在风控之后"而把它挪到 `routedModel`，
+   * 它就得拿到 `DeskOutcome` + 风控结论两份东西 —— 那是**跨层的耦合**，
+   * 而它并不需要那个信息。
+   *
+   * ## 失败不抛穿：**照 `safeAsk` 的纪律来**
+   *
+   * 与其它角色同一条路径（`safeAsk` 把异常与超时都转成 `ok: false`），
+   * 所以这里不需要自己写 try/catch —— 自己写一个语义不同的版本，
+   * 正是 `analystResults` 那段注释记录过的 BUG（角色级超时对它不生效）。
+   *
+   * ## 材料：**这一轮的事实，不是市场材料**
+   *
+   * 见 `renderReportMaterial`：只有计数、状态、账户段（约几百字符）。
+   * 把 13 万字符的市场材料塞给一个"写 5 行摘要"的角色，
+   * 既烧钱又会让它去复述它本该压缩的东西。
+   */
+  let report: string | null | undefined;
+  if (canAsk()) {
+    callsUsed += 1;
+    /*
+     * ⚠️ 决策数组用**执行层同一个抽取器** —— 汇报员说"12 条，全是 skip"
+     * 必须与最终真正执行的是同一份，否则它对操作员撒了谎。
+     */
+    const decisions = verdict?.ok === true ? (extractFirstJsonArray(verdict.raw).decisions ?? null) : null;
+    note('reporter', 'report', '汇总本轮结果，写成人话');
+    const out = await safeAsk(input.ask, {
+      role: 'reporter',
+      /* firm.ts 里汇报员就是这个档 —— 与 `TIER_BY_ROLE` 一致。 */
+      tier: 'T1_fast',
+      context: renderReportMaterial({
+        account: accountSnapshot(input.marketContext),
+        analyses,
+        bull,
+        bear,
+        verdict,
+        decisions,
+        callsUsed,
+        maxCalls: limits.maxCalls,
+        truncatedByBudget,
+      }),
+      /*
+       * ⚠️ 提示词用 `roles.ts` 里**已经写好的那一份**（含"5 行以内"、
+       * "不许美化"、"不许替判断不了的事下结论"三条纪律）。
+       * 在这里另写一段会让写好的那份永远到不了模型手里，而且两份会各自漂移。
+       */
+      task: ROLES.reporter.system,
+    });
+    report = out.ok ? out.raw : null;
+    note(
+      'reporter',
+      'report',
+      out.ok ? `完成（${out.latencyMs}ms）` : `失败：${out.error ?? '未知'}`,
+    );
+  } else {
+    /*
+     * ⚠️ **不设 `truncatedByBudget`**（这是一个刻意的取舍）。
+     *
+     * 那个标志的含义是"**结论**是在受限条件下得出的"（`deskOutput.ts`
+     * 据此渲染「本轮因预算/轮次上限提前收尾」）。而汇报员被跳过时，
+     * 结论本身是完整的 —— 决策、辩论、裁决一个都没少。
+     *
+     * 把它置位会制造一个**假告警**，而假告警的代价在本项目里是明账：
+     * 一个总在响的告警等于没有告警。所以"汇报员没跑"由 `report === undefined`
+     * 与这条 `onStep` 如实表达。
+     */
+    note('reporter', 'report', '预算不足 —— 跳过汇报（它是附加动作，不挤占裁决）');
+  }
+
   const okCount = analyses.filter((a) => a.ok).length;
   const summary = [
     `分析师 ${okCount}/${analyses.length} 成功`,
     bull?.ok ? '做多论证已出' : '做多论证缺失',
     bear?.ok ? '做空论证已出' : '做空论证缺失',
     verdict?.ok ? '已裁决' : '未裁决',
+    report !== undefined && report !== null ? '已汇报' : '未汇报',
     `调用 ${callsUsed}/${limits.maxCalls}`,
   ].join(' · ');
 
-  return { analyses, bull, bear, verdict, callsUsed, truncatedByBudget, summary };
+  return { analyses, bull, bear, verdict, callsUsed, truncatedByBudget, summary, report };
 }
 
 /** 包一层：把抛错也变成 `DeskRoleOutput`（团队编排不该因为一个角色挂了整轮失败）。 */
