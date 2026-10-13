@@ -30,8 +30,7 @@ function makeDeps(overrides: Partial<AgentToolDeps> = {}) {
   const calls: Array<{ tool: string; args: unknown }> = [];
   const saved: Array<{ reason: string; patch: unknown; clamps: unknown }> = [];
   const rejected: Array<{ reason: string; patch: unknown; rejected: unknown }> = [];
-  const pauses: string[] = [];
-  /** `resume_trading` 的调用记录（与 `pauses` 成对）。 */
+  /** `set_cycle_interval` 的调用记录 —— 用例要能看到 AI 改周期这件事。 */
   const cycleIntervals: number[] = [];
   let current = config();
 

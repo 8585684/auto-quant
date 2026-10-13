@@ -110,8 +110,8 @@ export interface StrategyReviewOutcome {
  * ## 这是按"必读清单"倒推的，不是拍脑袋
  *
  * 策略师的纪律要求它**先读** `get_experiments` 与 `get_lessons`，再读绩效 / 权益曲线 /
- * 最近决策 / 当前参数 —— **6 次只读调用**，之后还要 `set_params`（或 `pause_trading`）
- * 与 `finish`，合计 **8 步**。原来 `single` 档给的就是 8：**一步余量都没有。**
+ * 最近决策 / 当前参数 —— **6 次只读调用**，之后还要 `set_params` 与 `finish`，
+ * 合计 **8 步**。原来 `single` 档给的就是 8：**一步余量都没有。**
  *
  * ## 实测的代价
  *
