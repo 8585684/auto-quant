@@ -477,8 +477,47 @@ function symbolsFromPrompt(prompt: string): string[] {
   /* 去重并限制数量 —— 搜索结果要进提示词，太多会把上下文吃满。 */
   return [...new Set(matches)].slice(0, 3);
 }
+/**
+ * **工具循环的提示词标记** —— 用来区分"这次调用是谁发的"。
+ *
+ * ## 为什么需要它（2026-10-13 实测）
+ *
+ * 团队模型挂在机器人的**模型出口**上，所以它也会收到
+ * `agent/loop.ts` 的工具循环调用。而那些调用只认工具调用 JSON ——
+ * 拿团队会议的文本必然解析失败（实测 `#11` 的 `agent_runs` 全部 failed）。
+ *
+ * 接口层分不出来（`LoopModel` 与 `DecisionModel` 都是 `complete(system, user)`），
+ * 但工具循环的 system 里有**它自己独有的协议说明**（`loop.ts` 的 `PROTOCOL`）。
+ * 所以判据是那段文本。
+ *
+ * ⚠️ **必须与 `loop.ts` 的 `PROTOCOL` 保持同步。**
+ * `toolLoopRouting.test.ts` 里有一条断言钉住这两处的字面量 ——
+ * 若哪天有人改了 `loop.ts` 里的措辞而没改这里，那条测试会失败
+ *（否则症状会回到"策略师全部失败、而界面上看不出来"）。
+ */
+export const TOOL_LOOP_MARKER = '你每一轮只能输出**一个 JSON 对象**';
+
 export function createTeamDecisionModel(options: {
   router: ModelRouter;
+  /**
+   * **当调用来自工具循环时的兜底模型**（2026-10-13 加）。
+   *
+   * ## 为什么必须有一个兜底
+   *
+   * 这个团队模型挂在机器人的**模型出口**上（`manager.ts` 的
+   * `DecisionModel.complete`）—— 所以它**也会收到工具循环的调用**
+   *（策略师、绩效分析、复盘员…见 `complete()` 里那段长注释）。
+   *
+   * 而那些调用**只认工具调用 JSON**（`{"tool":"…","args":{…}}`），
+   * 拿团队会议的 `<decision>` 文本必然解析失败 —— 实测 `#11` 的
+   * `agent_runs` **全部 `outcome=failed`**、`agent_experiments` **0 条**。
+   *
+   * 所以那些调用必须转给**单模型**。
+   *
+   * ⚠️ **不传时**：转给 `router` 里配的**第一个 T2 档模型**
+   *（`createRoutedDecisionModel` 用的也是它），并记一条 warn 日志 ——
+   * 让"这里被用到了"在日志里可见，而不是静默。 */
+  singleModel?: DecisionModel;
   /** 交易循环给的系统提示词（含输出格式要求）。团队角色提示词会叠加在它之上。 */
   /** 每一步的回调（可观测性：让界面看得见团队在做什么）。 */
   onStep?: (step: { role: string; phase: string; note: string }) => void;
@@ -513,7 +552,7 @@ export function createTeamDecisionModel(options: {
   research?: (symbols: readonly string[]) => Promise<string | { text: string; keys: string[] }>;
 
 }): DecisionModel {
-  const { router, onStep, baseMaxTokens, limits, research } = options;
+  const { router, onStep, baseMaxTokens, limits, research, singleModel } = options;
 
   /** 把一个角色的问题交给路由器。 */
   const ask: AskRole = async ({ role, tier, context, task }): Promise<DeskRoleOutput> => {
@@ -615,6 +654,105 @@ export function createTeamDecisionModel(options: {
   return {
     complete: async (systemPrompt, userPrompt) => {
       const started = Date.now();
+      /*
+       * ══════════════════════════════════════════════════════════════════════
+       *  ⚠️⚠️ **只接管"交易决策"那一次调用，不是所有调用**
+       * ══════════════════════════════════════════════════════════════════════
+       *
+       * ## 事故：策略师每一轮都在跑一整个团队会议（2026-10-13 实测抓到）
+       *
+       * `ai_team` 的这个路由模型被挂在机器人的**模型出口**上
+       *（`manager.ts` 的 `DecisionModel.complete`），所以**任何**调用都会进来 ——
+       * 包括 `agent/loop.ts` 的**工具循环**（策略师、绩效分析、复盘员…）。
+       *
+       * 而工具循环解析的是**工具调用 JSON**：
+       * ```
+       *   {"thought":"…","tool":"get_experiments","args":{…}}
+       * ```
+       * 于是实测（`agent_runs` 的 detail 字段，原文）：
+       * ```
+       *   模型连续两轮没有输出可解析的工具调用：
+       *   无法从回复里解析出 JSON 对象（前 120 字符：<decision>
+       *   []
+       *   </decision>
+       *
+       *   <risk>
+       *   ⚠️ 本轮**未经风控官审阅**…
+       *   <team>
+       *   交易台：分析师 2/2 成功 · 做多论证已出）
+       * ```
+       * **`#11` 的 agent_runs 全部 `outcome=failed`**，而每一轮耗时 **324–870 秒**：
+       * ```
+       *   #712 idle panel steps=6 449s failed
+       *   #709 idle single steps=4 352s failed
+       *   #707 idle single steps=7 666s failed
+       *   ...
+       *   agent_experiments = **0 条**
+       * ```
+       * 也就是说：**策略师每走一步，系统就召集 8 个角色开一次会**
+       *（那正是 5–15 分钟的来历），然后把会议纪要喂给一个
+       * "只认工具调用 JSON"的解析器 → 必然失败 → 再重试一次 → 还是失败。
+       *
+       * ## 修法：靠**提示词特征**判断这次是谁在调用
+       *
+       * 接口层分不出来（两者都是 `complete(system, user)`）——
+       * 但**工具循环的 system 里有它自己独有的协议说明**（`loop.ts` 的 `PROTOCOL`）。
+       * 所以判据是那段文本。
+       *
+       * ⚠️ **为什么用文本特征而不是加一个参数**：`LoopModel` 与 `DecisionModel`
+       * 是**同一个形状**（`loop.ts` 的注释明确说"同一个形状，所以真实客户端可以
+       * 直接传进来"）—— 加参数会破坏那个通用性，而它是刻意的设计
+       *（"换厂商不用改代码"）。文本特征虽然不优雅，但**不需要改任何接口**。
+       *
+       * ⚠️ 而这段文本**必须与 `loop.ts` 保持同步** —— 所以 `toolLoop.test.ts`
+       * 里有一条断言钉住这两处的字面量（见那个测试文件的说明）。
+       */
+      const isToolLoopCall = systemPrompt.includes(TOOL_LOOP_MARKER);
+      if (isToolLoopCall) {
+        /*
+         * 工具循环 —— **走普通单模型**（它自己有一套工具协议，
+         * 不需要也不该由一个 8 人团队来回答"下一步调哪个工具"）。
+         *
+         * ⚠️ 这里**必须返回一个可用的结果**，不能抛错 ——
+         * 抛错会让策略师那一轮直接失败（而现在它至少能正常工作）。
+         *
+         * ⚠️ 而且**必须记一条日志**：`onStep` 让"这次调用被转给了单模型"
+         * 在界面上可见。否则将来排查"策略师为什么不调参"时，
+         * 会看到一个谜（团队模型明明在，工具循环却拿到了普通回答）。
+         */
+        onStep?.({
+          role: 'supervisor',
+          phase: 'route',
+          note: '工具循环调用 → 转给单模型（团队会议只回答交易决策）',
+        });
+        if (singleModel !== undefined) {
+          return singleModel.complete(systemPrompt, userPrompt);
+        }
+        /*
+         * 没有注入单模型 → 用路由器直接调**一个**模型
+         *（`T2_mid` 档：那是"处理型"角色的档位，工具循环需要的是听话+快）。
+         *
+         * ⚠️ 用 `router.callByTier` 而不是自己拼 HTTP —— 路由器的
+         * 重试/降级/健康检查逻辑就在那里，绕过它等于把那些保护丢掉。
+         */
+        const res = await router.callByTier(
+          'T2_mid',
+          [
+            { role: 'system', content: systemPrompt },
+            { role: 'user', content: userPrompt },
+          ],
+          { baseMaxTokens },
+        );
+        return {
+          text: res.text,
+          latencyMs: res.latencyMs ?? 0,
+          usage: {
+            promptTokens: res.usage?.promptTokens ?? null,
+            completionTokens: res.usage?.completionTokens ?? null,
+          },
+        };
+      }
+
       /*
        * 交易循环给的 `systemPrompt`（规则与输出格式）**并入市场材料** ——
        * 见上面第二段边界说明：不能丢掉它，否则团队不知道要输出什么格式。
