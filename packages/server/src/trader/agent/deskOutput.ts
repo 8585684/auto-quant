@@ -212,7 +212,30 @@ export function renderDeskOutcome(
   }
   if (outcome.bull) lines.push(`- bull（${outcome.bull.modelId}）：${outcome.bull.ok ? outcome.bull.raw.slice(0, 400) : '失败'}`);
   if (outcome.bear) lines.push(`- bear（${outcome.bear.modelId}）：${outcome.bear.ok ? outcome.bear.raw.slice(0, 400) : '失败'}`);
-  if (verdict) lines.push(`- judge（${verdict.modelId}）：${verdict.ok ? verdict.raw.slice(0, 800) : `失败 —— ${verdict.error ?? '未知'}`}`);
+  /*
+   * ⚠️ **裁决官要留完整**（2026-10-13 修）。
+   *
+   * ## 原来截到 800 字，而那个长度**不够看出它的结论**
+   *
+   * 实测：裁决官的输出通常在 **1,500–3,000 字**（它要写：结论、置信度、
+   * 关键依据、**不同意哪一方**、最大不确定性、失效条件）。
+   * 截到 800 字的结果是**审计块里看不到它的 JSON 数组** ——
+   * 而那个数组正是"本轮到底做了什么"的唯一凭证。
+   *
+   * ## 后果（我自己踩的）
+   *
+   * 我据此**误判**过一次：看到 800 字里没有 JSON，就断定
+   * "裁决官从未输出 JSON 数组" —— 而核实后发现**它输出了**，
+   * 只是数组是 `[]`（`deskOutput.ts` 的 `extracted.status === 'ok'`，
+   * 所以那条"没找到 JSON 数组"的告警**没有出现**）。
+   *
+   * **一个为了省几百字而做的截断，制造了一个假结论。**
+   *
+   * 现在给 4,000 字（实测最长约 3,000）—— 完整保留它的推理与数组。
+   * 分析师的 300 字**保持不变**：他们是并行产出、量大，
+   * 而且他们的结论已经在辩论材料里被完整引用过。
+   */
+  if (verdict) lines.push(`- judge（${verdict.modelId}）：${verdict.ok ? verdict.raw.slice(0, 4_000) : `失败 —— ${verdict.error ?? '未知'}`}`);
   lines.push('</team>');
 
   return lines.join('\n');
