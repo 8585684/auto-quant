@@ -94,3 +94,39 @@ test('★★ 决策周期里那条结清路径仍然保留（两个节奏都要�
     '★ 平仓后立刻结清那条路径也必须保留',
   );
 });
+
+test('★★★ 自检循环必须【启动时立即跑一次】（`setInterval` 要等一整个间隔）', () => {
+  /*
+   * ⚠️ 实测（2026-10-14）：部署后 14 分钟查，`#11` 的 `NEW` 从 36 涨到 **40**，
+   * 而结清日志一条都没有 —— 因为 `setInterval` 还没触发第一次。
+   *
+   * 而"启动时"恰好是最该跑一次的时刻：
+   * ```
+   *   · 重启前可能留下一批未结清的委托行（进程被杀时正跑到一半）
+   *   · 重启本身就是"决策周期中断"的最大来源
+   * ```
+   */
+  /*
+   * ⚠️ 判据必须用**唯一的锚点**：`timer.unref()` 之后那句。
+   *
+   * ⚠️⚠️ 而且不能靠"函数体正则"提取 —— 我第一版写 `/startSelfCheckLoop[\s\S]*?\n  \}/`
+   * 只匹配到 **25 个字符**（方法体第一个 `\n  }` 就收尾了），于是它永远找不到
+   * `timer.unref()`。**一个错的提取方式会让判据永远失败**（或者更糟：永远通过）。
+   * 这里改成"在全文里从 `startSelfCheckLoop` 的位置往后取一段"。
+   */
+  const start = MANAGER.indexOf('startSelfCheckLoop');
+  assert.ok(start > 0, '★ 应当能找到自检循环的注册处');
+  /*
+   * ⚠️ 窗口必须够大：`startSelfCheckLoop` 与 `timer.unref()` 之间隔着我写的
+   * 一大段注释（1500+ 字符），3000 字符的窗口**不够**。
+   * 判据失败的原因会是"找不到 unref"，而真因是窗口太小 ——
+   * 那正是"一个错的提取方式让判据永远失败"的又一次实例。
+   */
+  const body = MANAGER.slice(start, start + 6000);
+  const unrefAt = body.indexOf('timer.unref()');
+  assert.ok(unrefAt > 0, '★ 应当能找到 timer.unref()');
+  assert.ok(
+    /void this\.runSelfCheckSweep\(\)/.test(body.slice(unrefAt)),
+    '★ 必须在注册定时器之后【立即】触发一次 sweep（否则要等一整个间隔）',
+  );
+});
