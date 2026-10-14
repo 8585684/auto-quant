@@ -150,6 +150,71 @@ export class ApiError extends Error {
   }
 }
 
+/**
+ * 服务端用来区分「**本次请求的口令填错了**」与「**你的会话结束了**」的机器可读码。
+ *
+ * ## 为什么需要它（外部 issue #148）
+ *
+ * 两件完全不同的事都用 401 表达：
+ *
+ * ```
+ * auth.ts:169/174/178   需要登录 / 令牌过期 / 凭据变更   → 401   ← "会话结束了"
+ * server.ts:872         改密码时"当前密码不正确"         → 401   ← "这次口令填错了"
+ * ```
+ *
+ * 401 在 HTTP 语义上两者都沾边（都是"未通过认证"），所以**前端不能只靠状态码区分**。
+ * 而前端原来的行为是"401 就登出" —— 于是在设置页把当前密码输错一次，
+ * 就被清掉 token 踢到登录页。
+ *
+ * ## 为什么把判据放在服务端
+ *
+ * 另一个候选方案是"前端给 `request()` 加 `skipUnauthorized`，调用点带上"。
+ * 那需要**每个**可能填错口令的调用点都记得带 —— 将来新增的调用点会漏
+ *（本仓库吃过多次"两处各写一份、改动只覆盖一处"的亏）。
+ *
+ * 放在服务端则让前端只需"认码"：新增调用点自动正确，因为服务端会一直带着它。
+ */
+export const INVALID_CURRENT_PASSWORD = 'invalid_current_password';
+
+/**
+ * 这次 401 是"口令填错"而不是"会话失效"吗？
+ *
+ * ⚠️ **只认精确的码，不做模糊匹配。** 按错误文案里有没有"密码"两个字去猜会很危险：
+ * 会话失效的提示里也可能出现"密码"字样（例如"凭据已变更，请重新登录"），
+ * 那会让**真正需要登出**的情形被漏掉 —— 页面卡在一个永远失败的循环里。
+ */
+export function isInvalidCurrentPassword(payload: unknown): boolean {
+  if (!payload || typeof payload !== 'object') return false;
+  return (payload as { code?: unknown }).code === INVALID_CURRENT_PASSWORD;
+}
+
+/**
+ * 这次失败是否应当触发登出（清 token + 跳登录页）。
+ *
+ * ## 为什么抽成函数
+ *
+ * 缺陷就发生在原来那一行 `if (response.status === 401 && !anonymous) onUnauthorized?.()` 上。
+ * 抽出来之后"该不该登出"这件事**可以被单测** ——
+ * 而本仓库 web 侧没有 jsdom/RTL，`request()` 本身（依赖 `fetch` + `localStorage`）测不了。
+ *
+ * @param status     HTTP 状态码
+ * @param payload    已解析的响应体（可能是 `undefined` / 字符串）
+ * @param anonymous  这个请求是否匿名发出（登录接口自己回 401 时**不能**触发登出 ——
+ *                   否则"登录失败"会表现成"被登出"）
+ */
+export function shouldSignOut(status: number, payload: unknown, anonymous = false): boolean {
+  if (status !== 401) return false;
+  if (anonymous) return false;
+  /* 口令填错不是会话问题 —— 留在原地把错误显示在表单上。 */
+  if (isInvalidCurrentPassword(payload)) return false;
+  /*
+   * 其余 401 一律按"会话失效"处理（**包括没有响应体的情况**）——
+   * 保守方向必须偏向"登出"：令牌真的失效时若还留在页面上，
+   * 每个请求都会失败，用户看不到任何可行动的提示。
+   */
+  return true;
+}
+
 /** Fired when the server rejects our token, so the shell can bounce to /login. */
 let onUnauthorized: (() => void) | null = null;
 export function setUnauthorizedHandler(fn: (() => void) | null): void {
@@ -226,7 +291,12 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
   if (refreshed && !anonymous) setToken(refreshed);
 
   if (!response.ok) {
-    if (response.status === 401 && !anonymous) onUnauthorized?.();
+    /*
+     * ⚠️ **不能只看状态码**（外部 issue #148）：`shouldSignOut()` 会排除
+     * "当前密码填错"这种**本次请求**的 401 —— 否则在设置页输错一次密码就被登出。
+     * 判据与理由都写在那个函数上。
+     */
+    if (shouldSignOut(response.status, payload, anonymous)) onUnauthorized?.();
     const message =
       (payload && typeof payload === 'object' && 'error' in payload
         ? String((payload as { error: unknown }).error)

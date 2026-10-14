@@ -869,7 +869,22 @@ export async function buildServer(deps: ApiDependencies): Promise<FastifyInstanc
     if (!full || !verifyPassword(body.currentPassword, full.passwordHash)) {
       accountThrottle.recordFailure(accountKeys);
       accountIpThrottle.recordFailure(accountIpKeys);
-      return reply.code(401).send({ error: '当前密码不正确。' });
+      /*
+       * ⚠️ **必须带机器可读码**（外部 issue #148）。
+       *
+       * 401 在这里的意思是"**本次请求的口令填错了**"，与 `auth.ts` 里那三个
+       * 401（需要登录 / 令牌过期 / 凭据变更 = "**会话结束了**"）是**完全不同的事**。
+       *
+       * 而前端原来只按状态码判断 → 见到 401 就清 token 跳登录页 →
+       * **在设置页把当前密码输错一次就被登出**。
+       *
+       * 加这个码之后前端能区分两者（判据见 `packages/web/src/lib/api.ts`
+       * 的 `shouldSignOut()`）。**不要改状态码**：401 对外语义是对的
+       * （确实未通过认证），改成 400 会把"认证失败"与"参数错误"混在一起。
+       */
+      return reply
+        .code(401)
+        .send({ error: '当前密码不正确。', code: 'invalid_current_password' });
     }
     accountThrottle.recordSuccess(accountKeys);
     accountIpThrottle.recordSuccess(accountIpKeys);
