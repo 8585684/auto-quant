@@ -1537,3 +1537,112 @@ npm run check:routes→ 0
 npm run sim         → 18/18
 Docker 镜像 (v0.1.2)→ success
 ```
+
+---
+
+## 16. 第 10 轮：v0.1.3 发版 + 4 个 issue 修复（含两个"唯一")
+
+本轮继续处理上一轮留复核中**修法明确、可验证**的条目。优先级按后果排序。
+
+### 一、#136 —— ✅ 唯一已证实会花掉真钱（`1405291`）
+
+`tickSize < 1e-6` 时 `stepDecimals` 返回 0。根因链：
+
+```
+symbols.ts:97    tickSize: Number(tickSize)          ← "0.0000001" → 1e-7
+symbols.ts:220   stepDecimals(String(info.tickSize)) ← String(1e-7) = "1e-7"
+symbols.ts:15    stepDecimals 只认小数点              ← "1e-7" 没有小数点 → 0
+```
+
+**关键在"Number → String 往返"**：JS 对 `< 1e-6` 的量用科学计数法。
+后果：`1000PEPEUSDT` 保护单因"触发价 0"被拒 → 止损挂不上 →
+按 §2.6 立即市价平仓 → 每次白付一次开+平的手续费。
+
+**修法选择**：作者给了两个方案，我选了**改 `stepDecimals`**（而非"保留原始字符串"）——
+本函数的契约就是"从 step 字符串读精度"，`"1e-7"` 是合法输入，
+读不出精度是这个函数的缺陷。方案二要动 `SymbolInfo`（`binance/` 与 `risk/` 共用类型）。
+
+**端到端实测**（`1000PEPEUSDT`，修复前全是 0）：
+
+```
+0.0061234 → priceDecimals=7  limit=0.0061234  trigger=0.0061234
+    1.5e-7 → priceDecimals=7  limit=2e-7       trigger=2e-7   ← 正确取到 tick 倍数
+```
+
+⚠️ **修正了 issue 的「24 个合约」**：实测当下是 22（USDT 永续）/ 32（全部 927 合约），
+且合约集会漂移 —— 记为"约 20–30 个，随上架变化"。
+
+### 二、#161 —— ✅ 唯一有账目侧后果（`3b1d886`）
+
+`foreign_key_check` 在 `finally`（即 `COMMIT` **之后**）执行 → 违规时 `user_version`
+已提交 → 下次启动 `migration.version <= current` **跳过该迁移** → 悬空引用被静默固化。
+受影响的子表是持仓/成交/订单/决策 = **账本**。
+
+**"第一次失败是响的，危险的是重试"** —— 这是本仓库最忌讳的"第一次报警、第二次静默"形态。
+
+**修法可行性先实测**：`PRAGMA foreign_key_check` 在事务内**能看到**未提交的违规 ✅
+（若看不到，则"移进事务"这个修法会永远通过 —— 那是错的）。所以：
+校验移进 `try`、放在 `user_version` 之后 `COMMIT` 之前，违规时 `throw` 走**已有的 ROLLBACK**。
+
+⚠️ **一处做不到的诚实说明**：第 1 条断言是**源码结构断言**，不是运行时验证。
+要驱动"v12 之后校验失败"需在 `traders` 重建后恰好留下悬空引用，
+而 v12 的 SQL 是固定的、没有注入点。为一个"两行顺序调整"把 `migrate()` 改成可注入，
+会让服务启动路径的核心函数变复杂。所以运行时那一半由既有 `migration.test.ts`
+（真实 v12、断言子表一条没少）+ 新增的 SQLite 行为用例合起来覆盖。
+
+### 三、#147 —— ✅ 静默停机（`1fefde7`）
+
+`resumable = {running, safe_mode, error}` 漏了 `starting`。而 `starting` **会落库**
+（`manager.ts:3095`，同步写），那之后还要建连接/校时/exchangeInfo/探测模型（几秒到几十秒）。
+进程死在窗口里 → `stopAll()` 只遍历 `this.running`（这台还没进去）→ DB 留成 `starting`。
+
+**issue 作者的两条限定我都采纳，其中一条让结论更重**：
+① "永久隐身"略重 —— 界面会覆写成「已停止」，**看起来像有人手动停的**（比显示异常更难发现）；
+② 只在秒级窗口发生（非高频），但一次部署可能只影响一台。
+
+**"为什么可以安全地加"**：`starting` 只可能因进程死亡残留（看门狗在进程活着时必把它推到
+running/error —— 核对了 `startTraderAsync` 的 `.then`/`.catch` 两条出口都会写状态）。
+与 `stopped`（人的决定）有本质区别，所以**不能一起放宽** —— 加了反向守卫钉住。
+
+### 四、#154 —— ✅ NaN 崩溃（`2c80796`）
+
+`Number(env ?? 4)` 挡不住 `"abc"` → NaN → `Math.max(1, NaN)` **仍是 NaN**（NaN 传染）
+→ 0 个工人 → 稀疏数组 → `deskOutput.ts:275` 解引用崩溃 → **每轮失败** → 进 `safe_mode`。
+
+**两层都修**（按 §4.5"不要把校验加在错误的层"的正面应用）：
+- 调用方给语义正确的默认值 **4**；
+- 公用件 `mapConcurrent` 保守降到 **1**（它不该猜业务语义）。
+
+⚠️ **我第一版改错了并自己发现**：把 `Infinity` 也降到 1 —— 那会改变既有语义
+（`Infinity` 在工人池模型里是"每元素一个工人"，合法的"不限并发"）。
+收窄成"只挡 NaN"，并加用例钉住 `Infinity` 的行为。
+
+**一条方法论**：新增的第 3 条守卫（"NaN 兜底后仍必须限流"）在修复前**也通过**，
+所以我**实测了它是否真有防护力** —— 把兜底值改成 `Infinity` 再跑，它精确失败。
+**一个在修复前通过的守卫必须验证它在"错误修法"下会红，否则只是装饰。**
+
+### 五、发版 v0.1.3
+
+```
+① main 全绿      typecheck / test(47+1464+177) / build / lint /
+                check:links / check:routes / sim 18/18 → 全 0
+② notices 一致   183 依赖全宽松许可，git diff 空
+③ tag v0.1.3     Docker 镜像构建 success
+④ 发布 release   isDraft=false
+```
+
+⚠️ **实盘冒烟测试未执行**（触及 `binance/symbols.ts` 的价格取整、`db/` 迁移、`trader/` 启动恢复）。
+已在发布说明里写明**由部署方在能操作真实资金的窗口补做**。
+
+### 六、本轮验证
+
+```
+npm run typecheck   → 0
+npm test            → 47 + 1464 + 177，0 fail
+npm run build       → 0
+npm run lint        → 0
+npm run check:links → 0
+npm run check:routes→ 0
+npm run sim         → 18/18
+Docker 镜像 (v0.1.3)→ success
+```
