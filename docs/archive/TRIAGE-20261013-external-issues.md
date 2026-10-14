@@ -1986,3 +1986,80 @@ npm run check:routes→ 0
 npm run sim         → 18/18
 Docker 镜像 (v0.1.7)→ success
 ```
+
+---
+
+## 21. 第 15 轮：合并 PR #181（#135）+ v0.1.8 发版
+
+### 一、PR #181 —— ✅ 合并（`b4ff03e`）
+
+`fix(llm): 响应体读取失败要有错误分类`，作者 Vanta，**引用了我在第 12 轮给的核实评论**。
+Closes #135。
+
+**我做的验证（不只是看 CI）**：
+
+1. **独立复现它声称的"回退到 main 后 4 条全红"** —— 实测 `0/4 pass`，
+   与描述完全一致。这是**真正的行为复现**，不是"import 不存在"式的假失败
+   （我在别的 PR 上见过那种，所以这一步必做）。
+2. 合并前后各跑一遍全套（在**带独立 `node_modules` 的 worktree** 里）：
+   `typecheck 0 / test 47+1487+211 / build / lint / check:links / check:routes / sim 18/18`。
+3. **核实作者"不与重试预算冲突"的论断**：`client.ts:457` 的
+   `canRetry = retryable && attempt < this.maxRetries` **硬封顶** —— 成立。
+
+**一个非阻塞观察（我提出但没当阻塞项）**：非 2xx 读体失败时传
+`classifyHttpError(provider, status, null, '')`，body 与 rawText 都空 →
+`kindForStatus` 的 `QUOTA_MARKERS` 检查失效 → **429 + 配额耗尽会被判成可重试的限流**，
+而 `errors.ts:67` 自己写着 "retrying a quota exhaustion is pure waste"。
+
+⚠️ **我确认这不是 PR 引入的**：流式的 `response.text().catch(() => '')` 在 **main 上已存在**，
+同样会丢配额标记。作者只是为了一致性在非流式路径上用了同一模式 —— 合理取舍。
+所以**没有为它返工**，只作为"将来可收口的一小步"提出。
+
+### 二、发版前的红线检查（发现 main 上有风控改动）
+
+`v0.1.7..HEAD` 里有一条**另一个智能体的** `437388c fix(risk): 风控官表态只看结论行`。
+按红线我必须看一眼它是否绕过风控。
+
+**结论：这是正确的风控修复，不是绕过。**
+
+- 它修的是线上实测的 bug：40 轮里 **17 轮（43%）** 的 `<risk>` 块自相矛盾
+  （前缀"否决"、理由"批准"，订单没发出）；
+- 根因是 `reason` 取第一行、而 `approve`/`reject` 扫**全文** ——
+  风控官在论证里引用"若跌破 X 则否决"这类**条件句**，被全文正则读成"它否决了"；
+- 修法把表态范围收窄为"结论行优先、全文兜底"，
+  **保留"双真时否决优先"** —— 安全方向不变。
+
+⚠️ 但我在发布说明里**如实写明**：修复后**批准率会上升**（那 43% 被误拦的轮次恢复正常）。
+这是操作员应当知道的行为变化，即使它是修正。
+
+### 三、发版 v0.1.8
+
+```
+① main 全绿      typecheck / test(47+1487+211) / build / lint /
+                check:links / check:routes / sim 18/18 → 全 0
+② notices 一致   183 依赖全宽松许可，git diff 空
+③ tag v0.1.8     Docker 镜像构建 success
+④ 发布 release   isDraft=false
+```
+
+⚠️ 本次**触及下单路径**（`riskOfficer.ts` 的表态解析），所以 §4 的实盘冒烟**本项适用**
+—— 已写明"未执行、留部署方"，而不是笼统说未做。
+
+### 四、本轮验证
+
+```
+npm run typecheck   → 0
+npm test            → 47 + 1487 + 211，0 fail
+npm run build       → 0
+npm run lint        → 0
+npm run check:links → 0
+npm run check:routes→ 0
+npm run sim         → 18/18
+Docker 镜像 (v0.1.8)→ success
+```
+
+### 五、剩余
+
+- **PR #180** —— `CHANGES_REQUESTED`（我上一轮提的注释相反 + `'EUR'` 误杀两点）
+- **PR #170** —— `CHANGES_REQUESTED`（NAT64 分支误伤）
+- **16 个 issue** —— 累计关闭 21 个（#135 由 #181 关闭）
