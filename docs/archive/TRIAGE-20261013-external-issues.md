@@ -2063,3 +2063,77 @@ Docker 镜像 (v0.1.8)→ success
 - **PR #180** —— `CHANGES_REQUESTED`（我上一轮提的注释相反 + `'EUR'` 误杀两点）
 - **PR #170** —— `CHANGES_REQUESTED`（NAT64 分支误伤）
 - **16 个 issue** —— 累计关闭 21 个（#135 由 #181 关闭）
+
+---
+
+## 22. 第 16 轮：v0.1.9 发版 + #182（不生效的护栏）
+
+### 一、#182 —— `minOpenInterestUsd` 从不参与筛选（`f2084d8`）
+
+**缺陷**：被 `screenUniverse` 接收、被 `screenOpenInterestGrowth` 转发、
+还被 `autoTrader.ts:2969` 写进给操作员的门槛提示 —— 而 `service.ts` 里
+`grep` 只有 3 处（447 声明、620 声明、630 转发），**没有一处读取它做过滤**。
+
+**issue 作者点出的"最讽刺的一点"是这条的核心**：
+唯一真正需要它的地方（OI 增长榜）**恰好也没有它**，而那个函数
+**自己已经在读 `sumOpenInterest`** —— 数据就在手里。
+
+因为 `growth = (last-first)/first`，**分母极小时是噪声**。
+我把这一点做成了可执行用例：同一份 +1000 USDT 绝对增长，
+分母 100 时 +1000%、分母 5000 万时 +0.002%。
+
+**修法分两件事**：
+
+1. **在 OI 增长榜真正应用**（把 `last` 带出来再过滤）；
+2. **从 `screenUniverse` 移除该参数** —— 持仓量不在 `BinanceTicker24h` 里
+   （要另调 `openInterestHist`，每币一次请求），所以它在那一层**无法生效**。
+
+⚠️ 第 2 步的价值在移除时立刻显现：**typecheck 精确指出了那两处无效传递**
+（`coins.ts:145`、`:203`）。编译器帮我们找出了所有"以为传了就生效"的地方 ——
+这正是"删掉摆设参数"比"留个注释说它不生效"更好的理由。
+
+**附带效果**：`autoTrader.ts` 那句"可能是门槛把全部候选滤掉了"的提示
+**从"拿无效参数解释"变成"真的成立"**，所以那句话没有改。
+这是本条 issue 一个值得记的侧面：修好实现之后，原本不成立的解释自己就成立了。
+
+### 二、发版前的红线检查
+
+`v0.1.8..HEAD` 里有一条另一个智能体的 `213477c fix(team): 裁决官的止损必须写对方向`。
+按红线看一眼：**只改 `tradingDesk.ts`（提示词），未触及 `risk/engine.ts`**，
+且方向是**收紧**（让裁决官写对止损方向）而非放松。红线安全。
+
+### 三、发版 v0.1.9
+
+```
+① main 全绿      typecheck / test(47+1493+212) / build / lint /
+                check:links / check:routes / sim 18/18 → 全 0
+② notices 一致   183 依赖全宽松许可，git diff 空
+③ tag v0.1.9     Docker 镜像构建 success
+④ 发布 release   isDraft=false
+```
+
+⚠️ 本次**触及选币路径**（OI 增长榜），所以 §4 实盘冒烟**本项适用** ——
+已写明"未执行、留部署方"，并额外说明"`sim` 的确定性夹具不覆盖 OI 增长榜"，
+所以"门槛在真实行情下会滤掉多少"没有实测数据。
+
+⚠️ 发布说明里写明**选币结果会变化**（门槛现在真的生效了）——
+这是修正而不是变更，但操作员应当知道。
+
+### 四、本轮验证
+
+```
+npm run typecheck   → 0
+npm test            → 47 + 1493 + 212，0 fail
+npm run build       → 0
+npm run lint        → 0
+npm run check:links → 0
+npm run check:routes→ 0
+npm run sim         → 18/18
+Docker 镜像 (v0.1.9)→ success
+```
+
+### 五、剩余
+
+- **PR #180** —— `CHANGES_REQUESTED`（注释与实现相反 + `'EUR'` 误杀）
+- **PR #170** —— `CHANGES_REQUESTED`（NAT64 分支误伤）
+- **16 个 issue** —— 累计关闭 22 个；新增 #182 已在本轮修完，#183（quill `:has(> svg)`）待处理
