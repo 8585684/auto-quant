@@ -3967,13 +3967,44 @@ export const tradeEvents = {
     return this.countSince(traderId, 'entry', new Date(Date.now() - 3_600_000).toISOString());
   },
 
+  /**
+   * 本周期已经开了几仓 —— 用「该轮决策落库的时刻」当起点数之后的开仓事件。
+   *
+   * ## ⚠️ 列名是 `timestamp`，不是 `created_at`（外部 issue #151）
+   *
+   * 这里原来查 `SELECT created_at FROM decision_records`，而
+   * **`decision_records` 的时间列叫 `timestamp`**（`db/schema.ts:188`）——
+   * `created_at` 在那一张表上**不存在**，于是这个方法一被调用就抛
+   * `no such column: created_at`。
+   *
+   * 成因是照抄了相邻的 `lastExit()`：那个方法查的是 **`trade_events`** 表，
+   * 而**那张表确实有 `created_at`**（`schema.ts:227`）。改了表名、没改列名。
+   *
+   * ## 它为什么至今没爆：没有调用点
+   *
+   * 全仓 grep 只有本方法的定义 —— 其余的 `entriesThisCycle` 命中全是
+   * `RiskEnvironment` 的**同名字段**（`engine.ts` / `autoTrader.ts:3849` 里那个
+   * `entriesThisCycle: 0` 是风控环境的局部计数，与本方法无关）。
+   * 所以它是一颗**没人踩到的哑弹**。
+   *
+   * ⚠️ 这类"死方法里查了不存在的列"值得修而不是删：它的**语义是有效的**
+   *（按 `cycle_number` 定位那一轮的起始时刻、再数之后的开仓事件），
+   * 而 `risk/engine.ts` 的 `maxEntriesPerCycle` 判据正需要这类信息 ——
+   * 现在那个值由调用点从一个变量 0 开始累加（见 `engine.ts:558-569` 的说明）。
+   * 一旦有人把本院方法接上，就是线上 500。
+   *
+   * 同族的既有缺陷：`trades.feesOf()` 曾查不存在的 `exit_fee` 列（已修）。
+   *
+   * 查不到该轮次时**回落到"最近一分钟"**这个保守窗口，而不是抛 ——
+   * 调用方可能在一轮决策刚落库、或对账补录的时序下问一次。
+   */
   entriesThisCycle(traderId: number, cycleNumber: number): number {
-    const row = getDb().get<{ created_at: string }>(
-      'SELECT created_at FROM decision_records WHERE trader_id = ? AND cycle_number = ? LIMIT 1',
+    const row = getDb().get<{ timestamp: string }>(
+      'SELECT timestamp FROM decision_records WHERE trader_id = ? AND cycle_number = ? LIMIT 1',
       traderId,
       cycleNumber,
     );
-    const since = row?.created_at ?? new Date(Date.now() - 60_000).toISOString();
+    const since = row?.timestamp ?? new Date(Date.now() - 60_000).toISOString();
     return this.countSince(traderId, 'entry', since);
   },
 };

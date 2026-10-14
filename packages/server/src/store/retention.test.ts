@@ -583,3 +583,72 @@ test('★ feesOf() 必须派生 exitFee —— `exit_fee` 不是数据库列', (
   /* 不存在的 id：返回零值，而不是抛。 */
   assert.deepEqual(tradeStore.feesOf(-1), { entryFee: 0, exitFee: 0 });
 });
+
+test('★★★ tradeEvents.entriesThisCycle 必须查 timestamp —— decision_records 没有 created_at 列', () => {
+  /*
+   * ## 这个测试防的是什么（外部 issue #151）
+   *
+   * `tradeEvents.entriesThisCycle()` 查的是：
+   *
+   *     SELECT created_at FROM decision_records WHERE trader_id = ? AND cycle_number = ?
+   *
+   * 而 `decision_records` 的时间列叫 **`timestamp`**（`db/schema.ts:188`）——
+   * **`created_at` 在那一张表上不存在**，于是这个方法一被调用就抛
+   * `no such column: created_at`（实测）。
+   *
+   * ## 它为什么至今没爆：没有调用点
+   *
+   * 全仓 grep `entriesThisCycle` 的命中**全是 `RiskEnvironment` 的同名字段**
+   *（`engine.ts` / `autoTrader.ts:3849` 里那个 `entriesThisCycle: 0` 是**风控环境**的字段，
+   *  与这个仓储方法同名但无关）。所以它是一颗**没人踩到的哑弹** ——
+   * 与本仓库修过的 `feesOf()`（查不存在的 `exit_fee` 列）是同一族：
+   * **死方法里查了一个不存在的列**。
+   *
+   * 这类缺陷值得单独测试的理由：它的"死"是**偶然**的（只是恰好没人调），
+   * 而不是设计使然 —— 一旦有人接上它（例如真的要做"本周期已开几仓"的统计），
+   * 就是线上 500。
+   *
+   * ## 为什么现在要修而不是删
+   *
+   * 它的**语义是有效的**（按 `cycle_number` 找到那一轮的起始时刻，再数之后的开仓事件），
+   * 而 `risk/engine.ts` 的 `maxEntriesPerCycle` 判据正需要这类信息
+   *（目前 `env.entriesThisCycle` 是由调用点传 0 开始的局部计数）。
+   * 所以修列名比删方法更贴近意图。
+   */
+  traderId = seedTrader();
+
+  /* 造一轮决策记录 + 之后的开仓事件 —— 正是这个方法要数的东西。 */
+  const cycleNumber = 42;
+  decisions.log({
+    traderId,
+    cycleNumber,
+    systemPrompt: 'S',
+    userPrompt: 'U',
+    cotTrace: '',
+    decisions: [],
+    rawResponse: '',
+    executionLog: [],
+    candidateSymbols: [],
+    success: true,
+    error: null,
+    aiLatencyMs: 1,
+    promptTokens: null,
+    completionTokens: null,
+  });
+  tradeEvents.record(traderId, 'BTCUSDT', 'entry');
+
+  /* 决定性断言：不得抛 no such column: created_at。 */
+  assert.doesNotThrow(
+    () => tradeEvents.entriesThisCycle(traderId, cycleNumber),
+    '★★★ 不得再抛 no such column: created_at —— decision_records 的时间列是 timestamp',
+  );
+
+  const count = tradeEvents.entriesThisCycle(traderId, cycleNumber);
+  assert.equal(count, 1, '那一轮之后记了 1 条开仓事件，就该数到 1');
+
+  /* 不存在的轮次不应抛：查不到行时回落到"最近一分钟"这个保守窗口。 */
+  assert.doesNotThrow(
+    () => tradeEvents.entriesThisCycle(traderId, 9999),
+    '查不到该轮次时也不能抛 —— 它回落到一个保守的默认窗口',
+  );
+});
