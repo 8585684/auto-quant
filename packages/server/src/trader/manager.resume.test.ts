@@ -147,3 +147,75 @@ test('操作员主动停掉的机器人【不】被恢复 —— 那次停手是
 
   assert.deepEqual(attempted, [], '★ `stopped` 是人做的决定，开机不该把它翻过来');
 });
+
+/* -------------------------------------------------------------------------- */
+/*  启动飞行中点「停止」：不能被 .then 覆盖成 error                               */
+/* -------------------------------------------------------------------------- */
+
+/*
+ * ## 缺陷形状（2026-10-14 审查）
+ *
+ * `attemptStart()` 的两个取消分支自己把状态写成 `stopped`（那是操作员的决定），
+ * 并返回 `{ ok:false, cancelled:true }`。但 `startTraderAsync` 的 `.then`
+ * 原来只看 `ok`：
+ *
+ * ```ts
+ * if (result.ok) return;
+ * this.setTraderStatus(traderId, 'error', result.error ?? '启动失败');   // ← 无条件覆盖
+ * ```
+ *
+ * 于是「停止 → 停止 → **error**」。而 `resumePersisted()` 的可恢复集合是
+ * `{ running, safe_mode, error }` —— **刻意不恢复 `stopped`**（那是人的决定）。
+ * 覆盖的代价：**下一次部署/重启把刚被叫停的机器人重新拉起并下单。**
+ * 这正是 `d938926` 那次修复（取消守卫 + 永久标志）漏掉的 `.then` 尾巴。
+ *
+ * ⚠️ 修复不能改用 `cancelledStarts.has(id)`：那面旗子在 `startTrader` 的
+ * `finally` 里就收掉了，而 `.then` 在它之后运行 —— 等于什么都没看见。
+ * 所以判据必须由 `startTrader` 自己通过 `result.cancelled` 传出来。
+ */
+test('★★ 启动被操作员取消时，状态保持 stopped —— 不被 .then 覆盖成 error', async () => {
+  const id = seedTrader('cancel-during-start');
+  const manager = new TraderManager(new Vault(Buffer.alloc(32, 7)));
+
+  manager.startTrader = (async (traderId: number) => {
+    /* 模拟 attemptStart 的取消分支：先把状态写成 stopped，再返回带 cancelled 的失败。 */
+    traders.setStatus(traderId, 'stopped', null);
+    return {
+      ok: false,
+      error: '启动过程中被操作员取消。',
+      preflight: [],
+      cancelled: true,
+    };
+  }) as unknown as TraderManager['startTrader'];
+
+  manager.startTraderAsync(id, false);
+
+  /* .then 是 fire-and-forget：等微任务队列排空再断言。 */
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  assert.equal(
+    traders.get(id)?.status,
+    'stopped',
+    '★★ 一次显式的操作员停止被 .then 覆盖成 error 了 —— 而 error 会被下次开机恢复，等于停手作废',
+  );
+});
+
+test('★ 真正的启动失败（非取消）仍要落 error —— 修复不能把看门狗语义一起删掉', async () => {
+  const id = seedTrader('real-start-failure');
+  const manager = new TraderManager(new Vault(Buffer.alloc(32, 7)));
+
+  manager.startTrader = (async () => ({
+    ok: false,
+    error: '交易所不可达',
+    preflight: [],
+  })) as unknown as TraderManager['startTrader'];
+
+  manager.startTraderAsync(id, false);
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  assert.equal(
+    traders.get(id)?.status,
+    'error',
+    '真正的失败必须落 error（否则状态停在 starting，操作员看不见也重试不了）',
+  );
+});
