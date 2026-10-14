@@ -61,7 +61,26 @@ export class Db {
        * 没有任何作用，而 `DROP TABLE traders` 会顺着 `ON DELETE CASCADE`
        * 把持仓、成交、订单、决策记录**全部删掉**。
        *
-       * 顺序也不能换：关外键 → BEGIN → 迁移 → COMMIT → 校验 → 开外键。
+       * 顺序：关外键 → BEGIN → 迁移 → **校验** → COMMIT → 开外键。
+       *
+       * ## ⚠️ 校验必须在 COMMIT **之前**（外部 issue #161）
+       *
+       * 原来校验写在 `finally` 里 —— 也就是 `COMMIT` **之后**。那时
+       * `user_version = N` 已经提交，于是：
+       *
+       *   · 第一次失败**是响的**（这里抛错，`initDb` 失败，服务起不来，人会看见）；
+       *   · 但**下一次启动**会因 `migration.version <= current`（第 55 行）
+       *     **跳过**这个迁移 —— 而它留下的悬空引用被静默固化。
+       *     `ON DELETE CASCADE` 的子表（持仓/成交/订单/决策 = **账本**）
+       *     会在后续操作里以难读的方式出错。
+       *
+       * 也就是"第一次报警、第二次静默" —— 本仓库最忌讳的形态。
+       *
+       * 移进事务内之后，违规时 `throw` 会走**已有的 `ROLLBACK` 分支**，
+       * `user_version` 一并回滚，下次启动会**重新尝试**该迁移。
+       *
+       * 修法的前提是"`PRAGMA foreign_key_check` 在事务内能看到未提交的违规" ——
+       * 这一点由 `db/migrationOrder.test.ts` 用真实 SQLite 行为钉住。
        */
       if (migration.detachForeignKeys) this.db.exec('PRAGMA foreign_keys = OFF');
       this.db.exec('BEGIN');
@@ -70,6 +89,23 @@ export class Db {
         // PRAGMA does not accept bound parameters, hence the interpolation of a
         // value that comes from our own frozen migration list.
         this.db.exec(`PRAGMA user_version = ${migration.version}`);
+
+        /*
+         * 重建之后必须确认没有留下悬空引用 —— 关着外键做的改动不会被自动检查，
+         * 而一张引用了不存在的行的表会在很久以后以别的方式炸出来。
+         *
+         * **必须在 COMMIT 之前**：违规时 `throw` 走 ROLLBACK，
+         * `user_version` 一起回滚，于是下次启动会重试这个迁移。
+         */
+        if (migration.detachForeignKeys) {
+          const violations = this.db.prepare('PRAGMA foreign_key_check').all();
+          if (violations.length > 0) {
+            throw new Error(
+              `迁移 v${migration.version}（${migration.name}）之后外键校验不通过：${violations.length} 处悬空引用`,
+            );
+          }
+        }
+
         this.db.exec('COMMIT');
       } catch (error) {
         this.db.exec('ROLLBACK');
@@ -77,19 +113,8 @@ export class Db {
           `Migration ${migration.version} (${migration.name}) failed: ${(error as Error).message}`,
         );
       } finally {
-        if (migration.detachForeignKeys) {
-          /*
-           * 重建之后必须确认没有留下悬空引用 —— 关着外键做的改动不会被自动检查，
-           * 而一张引用了不存在的行的表会在很久以后以别的方式炸出来。
-           */
-          const violations = this.db.prepare('PRAGMA foreign_key_check').all();
-          this.db.exec('PRAGMA foreign_keys = ON');
-          if (violations.length > 0) {
-            throw new Error(
-              `迁移 v${migration.version}（${migration.name}）之后外键校验不通过：${violations.length} 处悬空引用`,
-            );
-          }
-        }
+        /* 无论成败都要把外键开回来 —— 否则后续所有写操作都失去保护。 */
+        if (migration.detachForeignKeys) this.db.exec('PRAGMA foreign_keys = ON');
       }
     }
   }
