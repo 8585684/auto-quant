@@ -65,6 +65,27 @@ export interface AgentPatchResult {
    * 而实际上只有 B 生效，下一轮它基于一个错误前提继续推理。
    */
   rejected: string | null;
+  /**
+   * 被 `pickKnown` 丢弃的字段路径（配置里不存在这些键）。
+   *
+   * ## 为什么必须有这个通道（外部 issue #152）
+   *
+   * 丢弃本身是**对的安全行为**（不该让模型往配置里塞东西），但**静默**丢弃不是：
+   * 全部字段都不存在时，调用方会报 `applied: true` + `note: '补丁已生效。'`，
+   * 而配置一个字段都没变。
+   *
+   * 而本文件的注释自己定义过这是最坏的一类失败：
+   *
+   * > 那个修复被静默丢掉。**这是最坏的一类失败：它告诉模型成功了。**
+   *
+   * 后果间接涉及钱：模型以为风控参数改了而实际没改，会基于错误前提继续推理，
+   * 而且**不会重试**（它以为自己成功了）。
+   *
+   * ⚠️ 与 `rejected` 的分工：`rejected` 是"整份不生效"，`dropped` 是
+   * "这几项没生效、其余生效了"。两者可以同时为空（一切正常）。
+   * 整体被拒时 `dropped` 为空数组 —— `rejected` 已经说明了全部。
+   */
+  dropped: string[];
 }
 
 /* -------------------------------------------------------------------------- */
@@ -194,8 +215,27 @@ function expandDottedKeys(patch: Record<string, unknown>): Record<string, unknow
   return out;
 }
 
-/** 只取 `source` 里在 `target` 中也存在的键，并递归进去。 */
-function pickKnown(target: unknown, source: unknown): unknown {
+/**
+ * 只取 `source` 里在 `target` 中也存在的键，并递归进去。
+ *
+ * ## ⚠️ 被丢弃的键要**收集起来**，不能静默丢（外部 issue #152）
+ *
+ * 原实现直接 `continue` —— 丢弃是静默的，而 `AgentPatchResult` 也没有
+ * "哪些字段被丢了"这个通道。于是**全部字段都不存在**时，调用方仍然报
+ * `applied: true`、`note: '补丁已生效。'`，而配置一个字段都没变。
+ *
+ * `patch.ts` 的注释自己定义过这是最坏的一类失败：
+ *
+ * > 它正确地诊断出了死锁、给出了正确的修复、然后那个修复被静默丢掉。
+ * > **这是最坏的一类失败：它告诉模型成功了。**
+ *
+ * 后果是**间接涉及钱**：模型以为风控参数改了而实际没改，会基于错误前提继续推理 ——
+ * 而且它不会重试（它以为自己成功了）。
+ *
+ * @param dropped 收集被丢弃字段的**点号路径**（如 `riskControl.不存在的字段`）。
+ *   由调用方传入并累积，所以路径是完整可读的。
+ */
+function pickKnown(target: unknown, source: unknown, dropped: string[] = [], prefix = ''): unknown {
   if (
     typeof target !== 'object' ||
     target === null ||
@@ -208,8 +248,17 @@ function pickKnown(target: unknown, source: unknown): unknown {
   }
   const out: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(source as Record<string, unknown>)) {
-    if (!(key in (target as Record<string, unknown>))) continue;
-    out[key] = pickKnown((target as Record<string, unknown>)[key], value);
+    const path = prefix ? `${prefix}.${key}` : key;
+    if (!(key in (target as Record<string, unknown>))) {
+      /*
+       * 记下来再丢。**仍然丢** —— 这是安全边界（展开只解决"写法"，
+       * 不该让模型往配置里塞东西，见 `dottedPatch.test.ts:72`）。
+       * 变的只是"不再静默"。
+       */
+      dropped.push(path);
+      continue;
+    }
+    out[key] = pickKnown((target as Record<string, unknown>)[key], value, dropped, path);
   }
   return out;
 }
@@ -293,6 +342,8 @@ export function applyAgentPatch(current: StrategyConfig, patch: unknown): AgentP
       config: current,
       clamps: [],
       rejected: `补丁必须是一个对象，收到的是 ${Array.isArray(patch) ? 'array' : typeof patch}。`,
+      /* 形状都不对，谈不上"哪些字段被丢弃"。 */
+      dropped: [],
     };
   }
 
@@ -334,7 +385,12 @@ export function applyAgentPatch(current: StrategyConfig, patch: unknown): AgentP
   //    ⚠️ 展开发生在 `pickKnown` **之前**，所以未知字段**仍然**会被丢弃
   //    （安全性不变）。
   const normalized = expandDottedKeys(patch as Record<string, unknown>);
-  const known = pickKnown(current, normalized) as Record<string, unknown>;
+  /*
+   * ⚠️ `dropped` 收集**被 `pickKnown` 丢掉的字段路径**（外部 issue #152）——
+   * 丢弃是对的安全行为，静默不是。见 `AgentPatchResult.dropped` 的说明。
+   */
+  const dropped: string[] = [];
+  const known = pickKnown(current, normalized, dropped) as Record<string, unknown>;
 
   // 2. 结构性不变量。必须在 zod 之前 —— 即使 schema 允许它被改成 false，
   //    这里也要把它按住。
@@ -365,8 +421,13 @@ export function applyAgentPatch(current: StrategyConfig, patch: unknown): AgentP
       config: current,
       clamps,
       rejected: `配置校验失败：${where} —— ${first?.message ?? '未知原因'}。本轮补丁整体不生效。`,
+      /*
+       * 整体被拒时不必再列丢弃项 —— `rejected` 已经说明"一个字段都没改"。
+       * 两个通道同时有内容会让调用方的措辞变得含糊。
+       */
+      dropped: [],
     };
   }
 
-  return { config: parsed.data as StrategyConfig, clamps, rejected: null };
+  return { config: parsed.data as StrategyConfig, clamps, rejected: null, dropped };
 }

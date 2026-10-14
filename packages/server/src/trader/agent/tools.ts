@@ -614,11 +614,30 @@ export async function dispatchTool(
           // 钳制必须回喂：AI 以为自己改成了、而实际被守卫改掉的话，
           // 下一轮它会基于一个错误前提继续推理。
           clamps: patch.clamps,
+          /*
+           * ⚠️ **被丢弃的字段也必须回喂**（外部 issue #152）。
+           *
+           * `pickKnown` 会丢掉配置里不存在的键 —— 那是**对的安全行为**，
+           * 但**静默**丢弃不是：全部字段都不存在时，原来这里仍然报
+           * `applied: true` + `note: '补丁已生效。'`，而配置一个字段都没变。
+           *
+           * 而 `patch.ts` 的注释自己定义过这是最坏的一类失败：
+           * 「那个修复被静默丢掉。**这是最坏的一类失败：它告诉模型成功了。**」
+           *
+           * 后果间接涉及钱：模型以为风控参数改了而实际没改，会基于错误前提继续推理，
+           * 而且**不会重试**（它以为自己成功了）。
+           */
+          dropped: patch.dropped,
           note:
             patch.rejected === null
-              ? patch.clamps.length > 0
-                ? '补丁已生效，但有几项被结构性守卫改动（见 clamps）—— 请按 clamps 里的实际值理解现在的参数。'
-                : '补丁已生效。'
+              ? patch.dropped.length > 0
+                ? `补丁已生效，但有 ${patch.dropped.length} 个字段在配置里不存在、已被丢弃` +
+                  `（${patch.dropped.join('、')}）—— 这些参数**没有**被改动，` +
+                  '请核对字段名后重试。' +
+                  (patch.clamps.length > 0 ? '另有几项被结构性守卫改动（见 clamps）。' : '')
+                : patch.clamps.length > 0
+                  ? '补丁已生效，但有几项被结构性守卫改动（见 clamps）—— 请按 clamps 里的实际值理解现在的参数。'
+                  : '补丁已生效。'
               : '补丁被整体拒绝，一个字段都没改。',
         },
         patch,
