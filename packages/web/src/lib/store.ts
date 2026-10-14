@@ -545,14 +545,46 @@ export const useEvents = create<EventState>((set, get) => ({
          */
         case 'cycle_step':
           if (next.liveCycle && next.liveCycle.cycleNumber === event.cycleNumber) {
-            next.liveCycle.steps = [...next.liveCycle.steps, {
-              at: event.at,
-              level: event.level,
-              message: event.message,
-              /* 团队模式会带角色与阶段；其他模式是 `undefined`（界面据此判断）。 */
-              ...(event.role !== undefined ? { role: event.role } : {}),
-              ...(event.phase !== undefined ? { phase: event.phase } : {}),
-            }].slice(-MAX_CYCLE_STEPS);
+            /*
+             * ⚠️ **必须替换 `liveCycle` 的引用，不能原地改**（外部 issue #157）。
+             *
+             * 原来写的是 `next.liveCycle.steps = [...]` —— 换了数组、**没换 `liveCycle`**。
+             * 而 `next` 本身是浅拷贝（上面的 `{ ...current }`），所以 `liveCycle`
+             * 的引用与改动前**完全相同**。
+             *
+             * zustand 用 `Object.is` 比较**选择器的返回值**，而 `useLiveCycle` 的选择器是：
+             *
+             * ```ts
+             * useEvents((state) => state.byTrader[traderId]?.liveCycle)   // 见文件末尾
+             * ```
+             *
+             * 引用不变 → 判定相等 → **不通知订阅者**。
+             *
+             * ## 影响面（issue 报的"静默不重渲染"目前看不到，但它是潜伏缺陷）
+             *
+             * `TraderPage` 订阅的是整个 `byTrader[traderId]`，而那个对象每次都被替换，
+             * 所以步骤**照样刷新**。可是一旦有人给 `DecisionFeed` 加 `memo`、
+             * 或改成只订阅 `useLiveCycle`（都是正常重构），**立刻变成真故障**。
+             *
+             * ## 更本质的代价：它破坏"历史快照不可变"
+             *
+             * 原地改会让**改动前拿到的引用也看到新数据** —— 任何依赖"我拿到的是那一刻的状态"
+             * 的代码（`useMemo` 依赖比较、将来的 diff/undo）都会拿到错的东西。
+             *
+             * 对照：同一个函数里的 `case 'cycle_start'` 用的就是
+             * `next.liveCycle = { ... }` —— **替换引用**。两者必须一致。
+             */
+            next.liveCycle = {
+              ...next.liveCycle,
+              steps: [...next.liveCycle.steps, {
+                at: event.at,
+                level: event.level,
+                message: event.message,
+                /* 团队模式会带角色与阶段；其他模式是 `undefined`（界面据此判断）。 */
+                ...(event.role !== undefined ? { role: event.role } : {}),
+                ...(event.phase !== undefined ? { phase: event.phase } : {}),
+              }].slice(-MAX_CYCLE_STEPS),
+            };
           }
           break;
         case 'trader_status':
