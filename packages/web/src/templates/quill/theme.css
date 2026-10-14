@@ -114,9 +114,18 @@ html.aq-quill {
   /* 第四级：指标卡副标题、单位、端点、计数。对面板底 5.2:1。 */
   --aq-ink-faint: #94949f;
   --aq-ink-faint-rgb: 148 148 159;
-  /* 迁移期别名 = ink-mid。 */
-  --aq-ink-soft: #b4b4bd;
-  --aq-ink-soft-rgb: 180 180 189;
+  /*
+   * ⚠️ **这里原来有一份 `--aq-ink-soft: #b4b4bd`（= ink-mid 的手工副本）。
+   * 已删除 —— 别名只在 `index.css` 的 `:root` 里定义一次。**
+   *
+   * 手工副本的问题不是"多两行"，而是**它必须被每个主题记得同步**：
+   * console 就漏了（`theme.css` 里 0 命中），于是它在浅色下继承了
+   * `:root` 的 classic 深色紫灰，对比度 1.71（外部 issue #176 / #177）。
+   *
+   * 现在 `--aq-ink-soft: var(--aq-ink-mid)` 定义在 `:root`，
+   * 本主题只要覆盖 `--aq-ink-mid`，别名就自动跟随 —— 不可能再漏。
+   * 由 `lib/inkAlias.test.ts` 钉住"别名只能定义一次"。
+   */
 
   /* --- 交易语义色 ---
    *
@@ -242,8 +251,7 @@ html.aq-quill[data-skin='light'] {
   --aq-ink-lo-rgb: 92 92 101;
   --aq-ink-faint: #67676f;
   --aq-ink-faint-rgb: 103 103 111;
-  --aq-ink-soft: #4b4b53;
-  --aq-ink-soft-rgb: 75 75 83;
+  /* `--aq-ink-soft` 见深色块那段说明：别名只在 `index.css` 的 `:root` 定义一次。 */
 
   /* 语义色：浅色下是**饱和深色**（给文字用）。色相同样锁在币安那一套上，
      只压明度 —— 第一版 `#0f9d63` 在白卡片上只有 3.6:1。 */

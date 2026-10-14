@@ -84,9 +84,21 @@
      * 所以这里**不新造第五级**，而是把它指向 `ink-mid`（那 13 处想表达的
      * 就是"次要信息"）。等上游把那批调用点改掉之后，这个别名可以删掉 ——
      * 与 `fontSize['2xs']` 是同一个做法（见 `tailwind.config.js`）。
+     *
+     * ⚠️ **必须是 `var()` 别名，不能是复制的字面值**（外部 issue #176 / #177）。
+     *
+     * 这里原来是 `--aq-ink-soft: #b0aec0` —— 一份**手工副本**。于是每个主题
+     * 都得记得再复制一遍，而 **console 的 `theme.css` 一处都没写**
+     *（`grep aq-ink-soft` 命中 0）。它于是继承 `:root` 的 **classic 深色紫灰**，
+     * 落到 console **浅色**的浅底上对比度实测 **1.71**（`#b0aec0` on `#e0e5ea`），
+     * 是整个 UI 里最差的一处 —— 13 处 `text-ink-soft` 在 console 浅色下全错。
+     *
+     * 改成 `var()` 之后，**别名自动跟随任何主题对 `ink-mid` 的覆盖**，
+     * 不需要（也不允许）各主题再手工同步。`inkAlias.test.ts` 钉住这两条：
+     * 它是别名、且只有这一处定义。
      */
-    --aq-ink-soft: #b0aec0;
-    --aq-ink-soft-rgb: 176 174 192;
+    --aq-ink-soft: var(--aq-ink-mid);
+    --aq-ink-soft-rgb: var(--aq-ink-mid-rgb);
 
     /* 交易语义色。 */
     --aq-up: #0ecb81;
