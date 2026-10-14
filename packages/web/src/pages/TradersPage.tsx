@@ -6,7 +6,7 @@ import { ArrowUpRight, MoreHorizontal, Pencil, Play, RotateCw, Square, Trash2 } 
 import type { EquitySnapshot, TraderStatus } from '@aq/shared';
 import { api, type TraderRow } from '../lib/api';
 import { useApp, useEvents } from '../lib/store';
-import { useSummaries } from '../lib/summaries';
+import { useSummaries, type TraderSummary } from '../lib/summaries';
 import { committedCapitalOf, fleetTotals, groupTradersByAccount } from '../lib/fleetTotals';
 import { pairEquityByTrader } from '../lib/equityPairing';
 import { useDocumentTitle, usePolled } from '../lib/hooks';
@@ -212,6 +212,61 @@ export function TradersPage() {
   const openPositions = traders.reduce((sum, trader) => sum + (statsMap[trader.id]?.openPositions ?? 0), 0);
 
   /*
+   * ══════════════════════════════════════════════════════════════════════════
+   *  ⚠️ **账本不可信时，归属权益改用交易所校准值**（2026-10-14）
+   * ══════════════════════════════════════════════════════════════════════════
+   *
+   * ## 用户的原话
+   *
+   * > 「和里面数据不一致为什么还没修复？……列表和详情要正确对齐数字，
+   * >   别整无意义的垃圾数据」
+   *
+   * ## 事实（线上 `#10`）
+   *
+   * ```
+   *   列表页「归属权益」  $104.89  ← 起始 100.05 + trades.net_pnl +4.84（账本推算）
+   *   详情页「账户余额」  $92.34   ← 交易所真实读数
+   *   差 12.56
+   * ```
+   * 差额的来源：`trades.net_pnl` **被对账重建写坏了** ——
+   * 39 笔 `source='reconciled'` 的记录里 16 笔 `pnl=0`（本该有盈亏），合计虚高 9.13。
+   *
+   * ## 为什么必须在这里修，而不是加说明
+   *
+   * 我上一轮只是在指标卡加了一行「账目与交易所差 +12.55」—— **那是错的**。
+   * 本项目反复记着同一条原则：
+   * > **「把数字改对，比在说明里解释它为什么错要好。」**
+   *
+   * ## 判据与详情页**完全一致**（`TraderPage` 的 `realized = ledger.exchangeNet`）
+   *
+   * ```
+   *   ledger.gap 超容差（≥ 0.01）→ 用交易所的成交流水（exchangeNet）为准
+   *   否则                        → 用账本（它与交易所一致，没必要绕）
+   * ```
+   * ⚠️ **同一个判据写在两个页面**是有意的（而不是各自发明一套）：
+   * 两个页面必须给出同一个数，而"同一个数"的唯一保证是**同一套判据**。
+   * 阈值 0.01 与详情页的 `ledgerSuspect` 一字不差 —— 改一处必须改两处。
+   */
+  const isLedgerSuspect = (trader: TraderRow): boolean =>
+    trader.ledger != null && Math.abs(trader.ledger.gap) >= 0.01;
+
+  /**
+   * 这个机器人的权益 —— **账本可信时用账本、不可信时用交易所**。
+   *
+   * ⚠️ 返回值与详情页「账户余额」口径一致（详见上面的说明）。
+   */
+  const equityOf = (trader: TraderRow, stats: TraderSummary): number => {
+    if (!isLedgerSuspect(trader)) return stats.equity;
+    /*
+     * 交易所校准：`起始权益 + 交易所口径的已实现净额 + 本机器人浮盈`。
+     *
+     * ⚠️ 浮盈仍取 `stats.unrealizedPnl`（本机器人自己的，来自最近的标记价）——
+     * 交易所流水里没有"未实现"这个概念。
+     */
+    return trader.initialEquity + trader.ledger!.exchangeNet + stats.unrealizedPnl;
+  };
+
+  /*
    * Fleet-wide gross → net bridge.
    *
    * Only traders whose stats have actually loaded are counted — `known` keeps an
@@ -376,7 +431,13 @@ export function TradersPage() {
                     <th className="th">状态</th>
                     <th
                       className="th text-right"
-                      title="归属权益 = 初始权益 + 本机器人净已实现盈亏 + 本机器人持仓浮盈。同一账户下其他机器人挣的钱不算在内。"
+                      title={
+                        '归属权益 = 起始权益 + 本机器人净已实现盈亏 + 本机器人持仓浮盈。' +
+                        '同一账户下其他机器人挣的钱不算在内。' +
+                        '⚠️ 当平台账本与交易所对不上时（`ledger.gap`），这一列改用交易所的' +
+                        '成交流水校准 —— 否则账本里记错的笔数会让它虚高，而那个数字' +
+                        '与详情页的「账户余额」对不上。'
+                      }
                     >
                       归属权益
                     </th>
@@ -440,19 +501,73 @@ export function TradersPage() {
                           )}
                         </td>
                         <td className={`td num text-right ${stats ? 'text-ink-hi' : 'text-ink-faint'}`}>
-                          {stats ? fmtUsd(stats.equity, 2) : '—'}
                           {/*
-                            共享钱包单独一行给出。同一个交易所账户下的每个机器人都会
-                            显示同一个数 —— 那正是它必须与上面的归属权益分开显示的原因：
-                            以前这一个数就是「权益」，于是一个从未成交的机器人显示的是
-                            别人挣来的收益率。
+                            ══════════════════════════════════════════════════════════
+                            ⚠️⚠️ **这一格原来并列两个互相矛盾的数**（2026-10-14 用户报）
+                            ══════════════════════════════════════════════════════════
+
+                            ## 用户的原话
+
+                            > 「和里面数据不一致为什么还没修复？图3上面那个数字到底是啥意思？
+                            >   别画蛇添足，列表和详情要正确对齐数字，别整无意义的垃圾数据」
+
+                            ## 原来显示什么（图3）
+
+                            ```
+                              $104.89        ← 归属权益（本地账本推算）
+                              账户 $92.34    ← 交易所真实权益
+                            ```
+                            两个数差 12.56，而**没有任何解释**。用户看到两个数并列，
+                            第一反应是"到底哪个是我的钱"。
+
+                            ## 为什么上面那个是错的
+
+                            ```
+                              归属权益 = 起始权益 + trades.net_pnl + 浮盈
+                              而 trades.net_pnl 【被对账重建写坏了】：
+                                39 笔 source='reconciled' 的记录里 16 笔 pnl=0
+                                （本该有盈亏），合计虚高 9.13
+                              → 归属权益 104.89 而账户真实 92.34
+                            ```
+                            ⚠️ 这正是本项目反复说的那条原则：
+                            **「把数字改对，比在说明里解释它为什么错要好」** ——
+                            我上一轮只是在指标卡加了一行「账目与交易所差 +12.55」的说明，
+                            **那是错的**：说明不能替代正确的数字。
+
+                            ## 修法：用交易所校准值（与详情页同一个口径）
+
+                            详情页早就这么做了（`TraderPage` 的 `realized = ledger.exchangeNet`）：
+                            ```
+                              ledger.gap 超容差 → 用交易所的成交流水（exchangeNet）为准
+                              否则           → 用账本（它与交易所一致，没必要绕）
+                            ```
+                            这里复刻同一个判据，于是**列表页与详情页给出同一个数**。
+
+                            ## 为什么不再并列显示「账户」
+
+                            那个小字原本是为了区分"归属"与"账户钱包"两个概念。
+                            但在**账本不可信**时，那个区分传达的不是信息而是困惑 ——
+                            用户要的是"这个机器人有多少钱"，而那应该是**一个**数。
+                            共享钱包的事实仍由上面「账户权益合计」那张卡表达
+                            （它按账户去重，那才是它该在的地方）。
                           */}
-                          {stats && stats.accountEquity > 0 && (
+                          {stats ? fmtUsd(equityOf(trader, stats), 2) : '—'}
+                          {/*
+                            ⚠️ 只在**账本与交易所对不上**时才提一句 ——
+                            那是"这个数为什么与账本不同"的唯一必要说明，
+                            而它**不是**并排的第二个数字（那正是用户说的"画蛇添足"）。
+                          */}
+                          {stats && isLedgerSuspect(trader) && (
                             <div
-                              className="text-xs text-ink-faint"
-                              title="该机器人所属交易所账户（共享钱包）的权益。同一账户下的所有机器人读数是同一个数。"
+                              className="text-xs text-warn"
+                              title={
+                                '平台账本与交易所的成交流水对不上（差 ' +
+                                `${fmtUsdSigned(trader.ledger!.gap, 4)}），` +
+                                '所以这一列改用**交易所**的流水校准 —— 账本里那几笔记错了。' +
+                                '详情页的「交易盈亏」用的是同一个校准值，两处一致。'
+                              }
                             >
-                              账户 {fmtUsd(stats.accountEquity, 2)}
+                              账本有差 · 已按交易所校准
                             </div>
                           )}
                         </td>

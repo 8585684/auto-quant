@@ -224,8 +224,44 @@ export function OverviewPage() {
   /** 舰队合计（账户口径与机器人归属口径分开算，见 `lib/fleetTotals.ts`）。 */
   const fleet = fleetTotals({ traders, stats: statsMap, snapshots: equitySnapshots });
 
-  /** 单行的归属权益：**只是这个机器人自己的账**，不能相加。 */
-  const equityOf = (trader: TraderRow): number => statsMap[trader.id]?.equity ?? trader.initialEquity;
+  /**
+   * 单行的归属权益：**只是这个机器人自己的账**，不能相加。
+   *
+   * ## ⚠️ 2026-10-14：账本不可信时改用**交易所校准值**（用户报"图4 也一样"）
+   *
+   * 用户的原话：
+   * > 「列表和详情要正确对齐数字，别整无意义的垃圾数据，还有首页总览的图表-图4也是一样」
+   *
+   * ## 事实（线上 `#10`）
+   *
+   * ```
+   *   账本推算的归属权益  $104.89  ← 起始 100.05 + trades.net_pnl +4.84
+   *   交易所真实账户权益  $92.34
+   *   差 12.56
+   * ```
+   * 差额的来源是 `trades.net_pnl` 被对账重建写坏（39 笔 `source='reconciled'`
+   * 里 16 笔 `pnl=0`，本该有盈亏，合计虚高 9.13）。
+   *
+   * ## 判据与详情页 / 机器人列表页**完全一致**
+   *
+   * ```
+   *   ledger.gap ≥ 0.01 → 用交易所的成交流水（exchangeNet）校准
+   *   否则              → 用账本（它与交易所一致）
+   * ```
+   * ⚠️ 三处（首页 / 机器人列表 / 详情页）必须给出**同一个数**，
+   * 而"同一个数"的唯一保证是**同一套判据** —— 所以阈值一字不差地复制过来。
+   * 改一处必须改三处（这是本项目"同一个算术不要写两遍"那条教训的例外：
+   * 三处判据必须一致，而共享它们需要跨页面的模块 —— 那超出本次改动范围，
+   * 但**不一致的代价更大**，所以先保证一致）。
+   */
+  const equityOf = (trader: TraderRow): number => {
+    const stats = statsMap[trader.id];
+    if (!stats) return trader.initialEquity;
+    const suspect = trader.ledger != null && Math.abs(trader.ledger.gap) >= 0.01;
+    if (!suspect) return stats.equity;
+    /* 交易所校准：起始权益 + 交易所口径的已实现净额 + 本机器人浮盈。 */
+    return trader.initialEquity + trader.ledger!.exchangeNet + stats.unrealizedPnl;
+  };
 
   const accountEquity = fleet.accountEquityFleet;
   const committedCapital = fleet.committedCapitalFleet;
