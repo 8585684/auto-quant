@@ -14,7 +14,12 @@ import { DECISION_TOOL_CATALOGUE } from '../trader/decisionTools.js';
 import type { RankingRow, UniverseRankings } from '../market/rankings.js';
 import type { PlatformHistoryRow } from './platformHistory.js';
 import type { EntryFillStats } from './entryStats.js';
-import { BAR_MINUTES, PENDING_TIMEOUT_MAX_MINUTES, pendingTimeoutMinutes } from '../trader/pendingTimeout.js';
+import {
+  BAR_MINUTES,
+  PENDING_TIMEOUT_MAX_MINUTES,
+  pendingTimeoutMinutes,
+  timeframeBarMinutes,
+} from '../trader/pendingTimeout.js';
 
 /* -------------------------------------------------------------------------- */
 /*  Prompt context                                                             */
@@ -4317,6 +4322,21 @@ function pendingDistanceRow(pending: PromptPendingEntry, ctx: PromptContext): st
    * 一个鼓励继续挂远的数字比不给更糟。
    */
   const atr = lastValue(snap?.primary?.atr?.['14']);
+  /*
+   * ⚠️ **ATR 的口径必须与 K 线周期一致**（外部 issue #165）。
+   *
+   * `snap.primary` 是**主周期**指标，而 `primaryTimeframe` **默认 `'5m'`**
+   *（`shared/strategy.ts:86`）且**可配置**。原来这里把 ATR 取出来之后，
+   * 下面的换算用了**写死的 15 分钟**（`BAR_MINUTES`）——
+   * 5m ATR 约为 15m ATR 的 `1/√3`，于是 `needMinutes` **系统性偏大**。
+   *
+   * 而同一个值也喂给 `pendingTimeoutMinutes` → `autoTrader.ts:4686` 的
+   * **真实撤单时限** —— 所以它改变了真实的挂单等待时长。
+   *
+   * `TimeframeIndicators` 自带 `timeframe`，所以直接推导，不猜。
+   */
+  const primaryTimeframe = snap?.primary?.timeframe;
+  const barMinutes = primaryTimeframe ? timeframeBarMinutes(primaryTimeframe) : BAR_MINUTES;
   if (atr !== null && Number.isFinite(atr) && atr > 0) {
     const atrPercent = (atr / mark) * 100;
     const distancePercent = Math.abs(pct);
@@ -4342,15 +4362,23 @@ function pendingDistanceRow(pending: PromptPendingEntry, ctx: PromptContext): st
       baseMinutes,
       distancePercent,
       atrPercent,
+      /* 与 ATR 同口径 —— 否则算出的时限系统性偏大（issue #165）。 */
+      barMinutes,
     });
-    /* 随机游走：走到 `x` 倍 ATR 的距离，预期需要 `x²` 根 15m K 线。 */
-    const needMinutes = atrPercent > 0 ? (distancePercent / atrPercent) ** 2 * BAR_MINUTES : null;
+    /* 随机游走：走到 `x` 倍 ATR 的距离，预期需要 `x²` 根 K 线（周期见 `barMinutes`）。 */
+    const needMinutes = atrPercent > 0 ? (distancePercent / atrPercent) ** 2 * barMinutes : null;
     const needText = needMinutes === null ? '未知' : `${Math.ceil(needMinutes)} 分钟`;
     if (limitMinutes > 0) {
       const capped = limitMinutes >= PENDING_TIMEOUT_MAX_MINUTES;
       const enough = needMinutes !== null && limitMinutes >= needMinutes;
+      /*
+       * ⚠️ 文案里的周期**必须跟着实际口径**（issue #165）：
+       * 原来写死 "15m ATR(14)"，而主周期默认是 5m ——
+       * 那会让模型按 15m 的量级去理解一个 5m 的读数。
+       */
+      const tfLabel = primaryTimeframe ?? `${BAR_MINUTES}m`;
       rows.push(
-        `   ⏱ 按当前 15m ATR(14) ≈ ${fmt(atr)}（占现价 ${atrPercent.toFixed(3)}%）估计：` +
+        `   ⏱ 按当前 ${tfLabel} ATR(14) ≈ ${fmt(atr)}（占现价 ${atrPercent.toFixed(3)}%）估计：` +
           `走到这个价位**预期需要约 ${needText}**（随机游走口径 x² 根 K 线）；` +
           `而系统会给这张单 **${limitMinutes} 分钟**上限` +
           `（取 max(基础 ${baseMinutes}, 预期×1.5)，封顶 ${PENDING_TIMEOUT_MAX_MINUTES}）` +

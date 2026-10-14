@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { pendingTimeoutMinutes } from './pendingTimeout.js';
+import { TIMEFRAMES } from '@aq/shared';
+import { pendingTimeoutMinutes, timeframeBarMinutes } from './pendingTimeout.js';
 
 /* -------------------------------------------------------------------------- */
 /*  挂单时限：按"走到挂价要多久"算，而不是固定 45 分钟                         */
@@ -92,4 +93,122 @@ test('基准时限为 0（模型关掉这条规则）时不做任何延长', () 
     pendingTimeoutMinutes({ baseMinutes: 0, distancePercent: 2, atrPercent: 0.2 }),
     0,
   );
+});
+
+/* -------------------------------------------------------------------------- */
+/*  ATR 的口径必须与 K 线周期一致（外部 issue #165）                            */
+/* -------------------------------------------------------------------------- */
+
+/*
+ * ## 缺陷形状
+ *
+ * `prompt.ts:4319` 取的 ATR 来自 **`snap.primary`** —— 而 `snap.primary` 是
+ * **主周期**指标（`market/service.ts` 按 `config.kline.primaryTimeframe` 选），
+ * 该字段默认是 **`'5m'`**（`shared/strategy.ts:86`）。
+ *
+ * 而 `pendingTimeoutMinutes()` 内部用的是**写死的 `BAR_MINUTES = 15`**：
+ *
+ * ```ts
+ * const needed = bars * BAR_MINUTES * SAFETY_FACTOR;   // ← 15，但 ATR 是 5m 的
+ * ```
+ *
+ * 5m ATR 显著小于 15m ATR（约为其 `1/√3`），于是：
+ *
+ * ```
+ * atrPercent 偏小 → inAtrs = distance/atr 偏大 → bars = inAtrs² 偏大 → needed 偏大
+ * ```
+ *
+ * **`needMinutes` 系统性偏大**（默认配置下）。同一个偏大的值也喂给了
+ * `autoTrader.ts:4686` 的**真实撤单时限** —— 所以这不只是"提示词里一句话不准"，
+ * 它改变了真实的挂单等待时长。
+ *
+ * ## 为什么修法不能是"把 BAR_MINUTES 改成 5"
+ *
+ * 因为主周期是**可配置的**（`primaryTimeframe` 支持 `1m`…`1d`）。
+ * 写死任何一个值都会在别的配置下重新错。正确做法是**从 timeframe 推导**。
+ *
+ * `TimeframeIndicators` **自带 `timeframe` 字段**（`indicators.ts:42`），
+ * 所以调用方拿得到它 —— 不需要改结构。
+ */
+test('★★★ 每根 K 线的分钟数必须从 timeframe 推导，不能写死', () => {
+  assert.equal(timeframeBarMinutes('1m'), 1);
+  assert.equal(timeframeBarMinutes('5m'), 5);
+  assert.equal(timeframeBarMinutes('15m'), 15);
+  assert.equal(timeframeBarMinutes('30m'), 30);
+  assert.equal(timeframeBarMinutes('1h'), 60);
+  assert.equal(timeframeBarMinutes('4h'), 240);
+  assert.equal(timeframeBarMinutes('1d'), 1440);
+  /* 覆盖 TIMEFRAMES 里的每一个，防止将来加周期时漏掉。 */
+  for (const tf of TIMEFRAMES) {
+    const m = timeframeBarMinutes(tf);
+    assert.ok(Number.isFinite(m) && m > 0, `★★ ${tf} 必须能算出正数的分钟数，实际 ${m}`);
+  }
+});
+
+test('★★★ 5m 的 ATR 必须按 5 分钟一根算 —— 而不是按 15 分钟', () => {
+  /*
+   * 同一个距离/ATR 比值下，5m 口径算出的"预期所需时间"应当**短于** 15m 口径
+   *（因为一根 5m K 线更短，同样的 K 线根数需要的时间更少）。
+   *
+   * 这是 issue #165 的核心：原来两个口径混用，导致 needMinutes 偏大。
+   */
+  const common = { baseMinutes: 45, distancePercent: 0.646, atrPercent: 0.212 };
+
+  const byFive = pendingTimeoutMinutes({ ...common, barMinutes: 5 });
+  const byFifteen = pendingTimeoutMinutes({ ...common, barMinutes: 15 });
+
+  assert.ok(
+    byFive < byFifteen,
+    `★★★ 5m 口径（${byFive}）必须短于 15m 口径（${byFifteen}）—— ` +
+      '原来两者都用写死的 15，于是 5m 的 ATR 被按 15 分钟一根换算，needMinutes 系统性偏大',
+  );
+
+  /* 5m 与 15m 的比例应当是 1:3（根数相同，每根 5 分钟 vs 15 分钟）。 */
+  assert.ok(
+    Math.abs(byFifteen / byFive - 3) < 0.05,
+    `★ 比例应当约等于 3，实际 ${(byFifteen / byFive).toFixed(3)}`,
+  );
+});
+
+test('★★ 不传 barMinutes 时保持既有行为（按 15 分钟）—— 反向守卫', () => {
+  /*
+   * 既有 5 条用例都没传 `barMinutes`，它们必须继续通过。
+   * 这里显式钉住"缺省 = 15"，因为那是这些用例当初写下的口径
+   *（`BAR_MINUTES` 的注释也写明"本函数的距离/ATR 都按 15m 口径"）。
+   *
+   * ⚠️ 这个缺省值**不是**给生产调用点用的 —— 两个真实调用点都必须显式传
+   *（由 ATR 实际来自哪个 timeframe 决定）。它只是为了不让既有用例语义漂移。
+   */
+  const withDefault = pendingTimeoutMinutes({
+    baseMinutes: 45,
+    distancePercent: 0.646,
+    atrPercent: 0.212,
+  });
+  const explicit15 = pendingTimeoutMinutes({
+    baseMinutes: 45,
+    distancePercent: 0.646,
+    atrPercent: 0.212,
+    barMinutes: 15,
+  });
+  assert.equal(withDefault, explicit15, '★ 缺省必须等于显式 15');
+});
+
+test('★ 非法 barMinutes 退回 15 —— 不能产出 NaN 时限', () => {
+  /*
+   * `barMinutes` 是 NaN/0/负数时，`bars * barMinutes` 会变成 NaN，
+   * 而 NaN 传给定时器是"永不过期"或"立刻过期"（取决于实现）—— 两者都危险。
+   * 退回 15（既有口径）是保守选择。
+   */
+  for (const barMinutes of [Number.NaN, 0, -5, Number.POSITIVE_INFINITY]) {
+    const got = pendingTimeoutMinutes({
+      baseMinutes: 45,
+      distancePercent: 0.646,
+      atrPercent: 0.212,
+      barMinutes,
+    });
+    assert.ok(
+      Number.isFinite(got) && got >= 45 && got <= 480,
+      `★ barMinutes=${barMinutes} 时必须退回一个合法时限，实际 ${got}`,
+    );
+  }
 });

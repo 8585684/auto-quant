@@ -85,7 +85,11 @@ import { rankPlatformHistory } from '../strategy/platformHistory.js';
 import { applyAgentPatch } from './agent/patch.js';
 import { rankConsensus } from '../strategy/consensus.js';
 import { clampNextCheckMinutes, nextCycleDelayMs } from './cycleSchedule.js';
-import { pendingTimeoutMinutes } from './pendingTimeout.js';
+import {
+  BAR_MINUTES,
+  pendingTimeoutMinutes,
+  timeframeBarMinutes,
+} from './pendingTimeout.js';
 import { averageRoundTripCostPercent } from '../strategy/costs.js';
 import { entryFillStats } from '../strategy/entryStats.js';
 import {
@@ -4681,12 +4685,26 @@ export class AutoTrader {
        *（那等于绕开这条兜底规则）。
        */
       const rowBaseMinutes = Math.max(configBaseMinutes, row.wait_minutes ?? 0);
+      /*
+       * ⚠️ **ATR 的口径必须与 K 线周期一致**（外部 issue #165）。
+       *
+       * `snap.primary` 是**主周期**指标，而 `primaryTimeframe` **默认 `'5m'`**
+       *（`shared/strategy.ts:86`）且可配置。原来这里把 ATR 取出来之后，
+       * `pendingTimeoutMinutes` 内部用**写死的 15 分钟**换算 ——
+       * 5m ATR 约为 15m ATR 的 `1/√3`，于是算出的时限**系统性偏大**。
+       *
+       * 这是**真实撤单时限**（不是提示词里的一句话），所以偏差直接改变
+       * 挂单等待多久才被撤。同口径的修正在 `strategy/prompt.ts` 那处。
+       */
+      const primaryTimeframe = snap?.primary?.timeframe;
+      const barMinutes = primaryTimeframe ? timeframeBarMinutes(primaryTimeframe) : BAR_MINUTES;
       const limitMinutes =
         mark !== null && atr !== null
           ? pendingTimeoutMinutes({
               baseMinutes: rowBaseMinutes,
               distancePercent: (Math.abs(row.entry_price - mark) / mark) * 100,
               atrPercent: (atr / mark) * 100,
+              barMinutes,
             })
           : rowBaseMinutes;
 

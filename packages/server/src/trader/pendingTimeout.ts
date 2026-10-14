@@ -23,8 +23,53 @@
  * 数字比不给更糟**，因为它看起来还算过。
  */
 
-/** 每根 K 线的分钟数（本函数的距离/ATR 都按 15m 口径）。 */
+/**
+ * 每根 K 线的分钟数（`pendingTimeoutMinutes` 的**缺省**口径）。
+ *
+ * ⚠️ **生产调用点不要用这个常量** —— 用 `timeframeBarMinutes(snap.primary.timeframe)`。
+ * 保留它只为"缺省 = 15"这个既有语义（本文件的距离/ATR 最初都按 15m 口径写，
+ * 而 `pendingTimeout.test.ts` 里那 5 条既有用例没传 `barMinutes`）。
+ */
 export const BAR_MINUTES = 15;
+
+/**
+ * 某个周期下**一根 K 线是多少分钟**。
+ *
+ * ## 为什么需要它（外部 issue #165）
+ *
+ * `prompt.ts:4319` 取的 ATR 来自 **`snap.primary`** —— 主周期指标，
+ * 而 `primaryTimeframe` **默认是 `'5m'`**（`shared/strategy.ts:86`）且**可配置**。
+ * 而本文件原来把 `BAR_MINUTES = 15` **写死**在算式里：
+ *
+ * ```ts
+ * const needed = bars * BAR_MINUTES * SAFETY_FACTOR;   // ← 15，但 ATR 可能是 5m 的
+ * ```
+ *
+ * 5m ATR 约为 15m ATR 的 `1/√3`，于是 `atrPercent` 偏小 → `inAtrs` 偏大 →
+ * `bars = inAtrs²` 偏大 → **`needMinutes` 系统性偏大**。
+ * 而同一个值也喂给 `autoTrader.ts:4686` 的**真实撤单时限** ——
+ * 所以它改变了真实的挂单等待时长，不只是提示词里的一句话。
+ *
+ * ## 为什么不是"把 15 改成 5"
+ *
+ * 因为主周期**可配置**（`1m`…`1d`）。写死任何一个值都会在别的配置下重新错。
+ * 正确做法是从 `TimeframeIndicators.timeframe`（`indicators.ts:42` 自带该字段）
+ * 推导 —— 调用方拿得到它，不需要改结构。
+ *
+ * ⚠️ 未来若 `TIMEFRAMES` 加了新周期，本函数**必须**同步 ——
+ * `pendingTimeout.test.ts` 有一条用例遍历 `TIMEFRAMES` 逐个断言，
+ * 漏掉时它会当场变红。
+ */
+export function timeframeBarMinutes(timeframe: string): number {
+  const m = /^(\d+)([mhd])$/.exec(timeframe);
+  if (!m) return BAR_MINUTES;
+  const value = Number(m[1]);
+  if (!Number.isFinite(value) || value <= 0) return BAR_MINUTES;
+  const unit = m[2];
+  if (unit === 'm') return value;
+  if (unit === 'h') return value * 60;
+  return value * 24 * 60; // 'd'
+}
 
 /**
  * 时限的硬上限（8 小时）。
@@ -57,6 +102,16 @@ export function pendingTimeoutMinutes(input: {
   baseMinutes: number;
   distancePercent: number;
   atrPercent: number;
+  /**
+   * ATR 来自哪个周期的 K 线 —— **一根多少分钟**。
+   *
+   * ⚠️ **生产调用点必须显式传**（外部 issue #165）：`atrPercent` 与
+   * "一根 K 线多久"必须同口径，否则算出的 `needed` 会系统性偏大或偏小。
+   * 用 `timeframeBarMinutes(snap.primary.timeframe)` 推导。
+   *
+   * 缺省 15 只为保持既有语义（见 `BAR_MINUTES` 的说明）。
+   */
+  barMinutes?: number;
 }): number {
   const base = Number.isFinite(input.baseMinutes) ? input.baseMinutes : 0;
   /* `0` = 关闭这条规则（本项目同类字段的既有约定），关闭就该是关闭。 */
@@ -72,9 +127,18 @@ export function pendingTimeoutMinutes(input: {
     return base;
   }
 
+  /*
+   * ⚠️ `barMinutes` 非法时退回 `BAR_MINUTES` —— 不能让它把时限变成 NaN。
+   * NaN 传给定时器是"永不过期"或"立刻过期"，两者都危险。
+   */
+  const barMinutes =
+    input.barMinutes !== undefined && Number.isFinite(input.barMinutes) && input.barMinutes > 0
+      ? input.barMinutes
+      : BAR_MINUTES;
+
   const inAtrs = distance / atr;
   const bars = inAtrs * inAtrs; // 随机游走：x 倍 ATR 需要 x² 根
-  const needed = bars * BAR_MINUTES * SAFETY_FACTOR;
+  const needed = bars * barMinutes * SAFETY_FACTOR;
 
   return Math.min(PENDING_TIMEOUT_MAX_MINUTES, Math.max(base, Math.ceil(needed)));
 }
