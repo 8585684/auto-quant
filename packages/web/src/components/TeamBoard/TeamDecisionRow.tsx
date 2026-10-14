@@ -481,9 +481,40 @@ function TeamDecisionDetails({
   );
 }
 
-/** 一个角色的产出。 */
+/**
+ * **一个角色的产出**（2026-10-14 加「展开全文」）。
+ *
+ * ## 为什么需要折叠
+ *
+ * 用户第三次反馈（同一处）：
+ * > 「展开后只有 300 字，看不清它在想什么」
+ *
+ * 而**前端拿不到更长的版本** —— `teamTrace.ts` 解析的是后端 `deskOutput`
+ * 写进 `rawResponse` 的内容。所以修法分两步：
+ * ```
+ *   后端：截断上限 300 → 2,000（数据里真的有全文）
+ *   前端：默认只显示前 300 字 + 「展开全文」（版面不被长文挤爆）
+ * ```
+ *
+ * ⚠️ **后端截断时会留痕**（`…（已截断，完整 N 字）`）—— 所以这里不需要
+ * 自己判断"有没有更多"，直接看文本里有没有那个标记即可。
+ * 若数据本身就只有 300 字（没留痕），就**不渲染按钮** ——
+ * 一个点开没有变化的按钮比没有按钮更让人困惑（本项目已有先例）。
+ */
 function MemberLine({ member }: { member: TeamMemberOutput }): React.ReactElement {
   const label = roleLabel(member.role);
+  const [open, setOpen] = useState(false);
+
+  /*
+   * 后端留痕的形态：`…（已截断，完整 1234 字）`
+   * ⚠️ 用 `includes` 而不是正则：那个标记是固定文案，正则只会更难读。
+   */
+  const TRUNCATED = '…（已截断，完整 ';
+  const truncated = member.text.includes(TRUNCATED);
+  /* 折叠时显示到留痕处之前（去掉那半句），展开时显示全文。 */
+  const preview = truncated ? `${member.text.slice(0, member.text.indexOf(TRUNCATED))}…` : member.text;
+  const body = open || !truncated ? member.text : preview;
+
   return (
     <li className="min-w-0">
       <div className="flex flex-wrap items-baseline gap-x-2">
@@ -496,8 +527,18 @@ function MemberLine({ member }: { member: TeamMemberOutput }): React.ReactElemen
             {member.modelId}
           </span>
         )}
+        {truncated && (
+          <button
+            type="button"
+            onClick={() => setOpen((v) => !v)}
+            aria-expanded={open}
+            className="shrink-0 rounded px-1 text-[11px] text-ink-lo transition hover:bg-base-800 hover:text-ink-hi"
+          >
+            {open ? '收起' : '展开全文'}
+          </button>
+        )}
       </div>
-      <p className="min-w-0 whitespace-pre-wrap break-words text-xs leading-relaxed text-ink-mid">{member.text}</p>
+      <p className="min-w-0 whitespace-pre-wrap break-words text-xs leading-relaxed text-ink-mid">{body}</p>
     </li>
   );
 }

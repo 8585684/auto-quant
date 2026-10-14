@@ -361,12 +361,33 @@ export function renderDeskOutcome(
    * 所以这里剥掉它们**不会丢信息**（那些块有各自的渲染）。
    *
    * ⚠️ 实现已上移到函数顶部（它被汇报段与这里两处用到）。
+   *
+   * ## ⚠️ 2026-10-14 第三次修：截断上限从 300 提到 2,000（配合前端的「展开全文」）
+   *
+   * 用户第三次反馈（同一处，观感问题）：
+   * > 「展开后只有 300 字，看不清它在想什么」
+   *
+   * 而**前端无法自己拿到更长的版本** —— `teamTrace.ts` 解析的是这里的输出，
+   * 所以"展开全文"必须**数据里真的有全文**。
+   *
+   * ```
+   *   300 字   → 只够看到开头（且常常只有一个 `<reasoning>` 标签的开头）
+   *   2,000 字 → 装得下一次完整的推理（实测角色产出多在 1,000–3,000 字）
+   * ```
+   * ⚠️ 截断时要**留下痕迹**（`…（已截断，完整 N 字）`）——
+   * 否则前端分不清"这就是全部"和"还有更多"，而"展开全文"按钮会在无事可展时出现
+   *（那正是本项目反复说的"看不出异常的失败"）。
    */
+  const clip = (s: string, limit: number): string => {
+    const one = oneLine(s, limit + 1); /* 多取 1 字用于判断"是否被截断" */
+    return one.length > limit ? `${one.slice(0, limit)}…（已截断，完整 ${s.length} 字）` : one;
+  };
+
   for (const a of outcome.analyses) {
-    lines.push(`- ${a.role}（${a.modelId}）：${a.ok ? oneLine(a.raw, 300) : `失败 —— ${a.error ?? '未知'}`}`);
+    lines.push(`- ${a.role}（${a.modelId}）：${a.ok ? clip(a.raw, 2_000) : `失败 —— ${a.error ?? '未知'}`}`);
   }
-  if (outcome.bull) lines.push(`- bull（${outcome.bull.modelId}）：${outcome.bull.ok ? oneLine(outcome.bull.raw, 400) : '失败'}`);
-  if (outcome.bear) lines.push(`- bear（${outcome.bear.modelId}）：${outcome.bear.ok ? oneLine(outcome.bear.raw, 400) : '失败'}`);
+  if (outcome.bull) lines.push(`- bull（${outcome.bull.modelId}）：${outcome.bull.ok ? clip(outcome.bull.raw, 2_000) : '失败'}`);
+  if (outcome.bear) lines.push(`- bear（${outcome.bear.modelId}）：${outcome.bear.ok ? clip(outcome.bear.raw, 2_000) : '失败'}`);
   /*
    * ⚠️ **裁决官要留完整**（2026-10-13 修）。
    *
@@ -390,10 +411,12 @@ export function renderDeskOutcome(
    * 分析师的 300 字**保持不变**：他们是并行产出、量大，
    * 而且他们的结论已经在辩论材料里被完整引用过。
    *
-   * ⚠️ 2026-10-14：**同样要压成单行**（见上面 `oneLine` 的说明）——
+   * ⚠️ 2026-10-14：**同样要压成单行 + 截断留痕**（见上面 `clip` 的说明）——
    * 裁决官的输出是多行 markdown，它的列表项会被解析器当成"角色"。
+   * ⚠️ 第一版我漏改了这里（还是 `oneLine`），测试当场抓到 —— 留痕与压单行
+   * 两者必须**一起**用在每一行上，漏一处就等于没做。
    */
-  if (verdict) lines.push(`- judge（${verdict.modelId}）：${verdict.ok ? oneLine(verdict.raw, 4_000) : `失败 —— ${verdict.error ?? '未知'}`}`);
+  if (verdict) lines.push(`- judge（${verdict.modelId}）：${verdict.ok ? clip(verdict.raw, 4_000) : `失败 —— ${verdict.error ?? '未知'}`}`);
   lines.push('</team>');
 
   return lines.join('\n');

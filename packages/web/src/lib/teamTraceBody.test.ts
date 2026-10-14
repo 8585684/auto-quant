@@ -107,13 +107,18 @@ test('★ 单行产出仍能正常解析（不能把正常的也挡掉）', () =
 /* -------------------------------------------------------------------------- */
 
 test('★★★ 渲染层必须把产出压成单行（换行会破坏解析）', () => {
+  /*
+   * ⚠️ 2026-10-14：渲染入口从 `oneLine(a.raw, N)` 改成了 `clip(a.raw, N)` ——
+   * `clip` 内部仍走 `oneLine`（压单行），只是多加了"截断留痕"。
+   * 所以判据看 `clip`（它是当前的渲染入口）。
+   */
   assert.ok(
-    /oneLine\(a\.raw/.test(DESK),
-    '★ 分析师的产出必须走 oneLine（压成单行）—— 否则它的列表项会变成"角色"',
+    /clip\(a\.raw/.test(DESK),
+    '★ 分析师的产出必须走 clip（内部压成单行）—— 否则它的列表项会变成"角色"',
   );
-  assert.ok(/oneLine\(outcome\.bull\.raw/.test(DESK), '★ bull 也要压成单行');
-  assert.ok(/oneLine\(outcome\.bear\.raw/.test(DESK), '★ bear 也要压成单行');
-  assert.ok(/oneLine\(verdict\.raw/.test(DESK), '★ judge 也要压成单行');
+  assert.ok(/clip\(outcome\.bull\.raw/.test(DESK), '★ bull 也要压成单行');
+  assert.ok(/clip\(outcome\.bear\.raw/.test(DESK), '★ bear 也要压成单行');
+  assert.ok(/clip\(verdict\.raw/.test(DESK), '★ judge 也要压成单行');
   assert.ok(
     /replace\(\/\\s\*\\n\+\\s\*\/g, ' '\)/.test(DESK),
     '★ oneLine 必须真的把换行替换掉（不是只截断 —— 截断仍保留换行，问题照旧）',
