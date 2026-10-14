@@ -1,8 +1,10 @@
 import { Navigate, Route, Routes, useLocation } from 'react-router-dom';
 import { lazy, Suspense, useEffect, type ReactNode } from 'react';
 import { Layout } from './components/Layout';
+import { FeedErrorBoundary } from './components/FeedErrorBoundary';
 import { Spinner, Spinner3 } from './components/ui';
 import { useApp } from './lib/store';
+import { boundaryKeyFor } from './lib/routeBoundary';
 
 /*
  * 路由级代码分割。
@@ -204,14 +206,73 @@ export function App() {
 }
 
 /**
- * 一个路由元素 + 它自己的 Suspense 边界。
+ * 一个路由元素 + 它自己的 Suspense 边界 + 它自己的**错误边界**。
  *
  * 边界放在元素这一层而不是整个 `<Routes>` 外面：这样加载下一页时外壳
  * （顶栏、导航、推送状态）保持挂载，只有内容区换成 fallback；
  * 放在外面会让整棵树连同 socket 状态一起卸载重建。
+ *
+ * ## ⚠️ 错误边界必须在这里（外部 issue #169）
+ *
+ * `Suspense` **只捕挂起，不捕抛错**。而在渲染期抛错且没有错误边界时，
+ * React 会**卸载整棵树** —— 表现是**整个控制台白屏**，
+ * 连"去别的地方看看"都做不到。
+ *
+ * 本仓库自己记录过这次事故：
+ * `docs/archive/REPORT-TRIAGE-20260926.md:98` 把「前端缺 ErrorBoundary
+ * （渲染期抛错会白屏）」列在"已确认但仍未修"；`FeedErrorBoundary.tsx` 的头部
+ * 注释也记了一次真实白屏（一条字段不全的决策记录 → 读 `undefined.length`）。
+ *
+ * 而**风险面不止决策看板**：`OverviewPage` / `TradersPage` / `MarketPage` /
+ * `TraderTables`（持仓、订单、成交、权益曲线）消费的**同样是"模型输出解析而来"
+ * 的不可信数据**（按 `docs/AGENTS.md` §2.4，模型的输出是不可信输入）。
+ * 之前只有决策卡片那一条路径有兜底。
+ *
+ * ## 为什么 key 必须随路由变化
+ *
+ * React 的错误边界**进入 error 状态后不会自己恢复**。没有 `key` 的话，
+ * 一次崩溃会粘住整个会话 —— 用户切到别的（好的）页面看到的仍是"这一块渲染失败"。
+ * 所以用当前路径当 `key`：**换页即重置**。
+ *
+ * 用 `pathname` 而不是 `location.key`：后者每次导航都换新值（含同页查询串变化），
+ * 会让"在崩溃页点一个筛选"重置边界、于是又崩一次。见 `lib/routeBoundary.ts`。
  */
 function Lazy({ children }: { children: ReactNode }) {
-  return <Suspense fallback={<RouteFallback />}>{children}</Suspense>;
+  const { pathname } = useLocation();
+  return (
+    <FeedErrorBoundary key={boundaryKeyFor(pathname)} fallback={<RouteCrashFallback />}>
+      <Suspense fallback={<RouteFallback />}>{children}</Suspense>
+    </FeedErrorBoundary>
+  );
+}
+
+/**
+ * 页面渲染崩溃时显示什么。
+ *
+ * ⚠️ **必须保住"还能去别处"这条路**：外壳（顶栏/导航/侧栏）在边界之外仍然挂载，
+ * 所以用户可以直接点导航切走。fallback 里也要说清这一点 ——
+ * 白屏时用户最需要知道的是"这是数据问题还是系统挂了、我还能做什么"。
+ */
+function RouteCrashFallback() {
+  return (
+    <div
+      role="alert"
+      className="flex min-h-[60vh] flex-col items-center justify-center gap-3 px-6 text-center"
+    >
+      <div className="text-base font-medium text-warn">这个页面渲染失败了</div>
+      <div className="max-w-md text-xs leading-relaxed text-ink-lo">
+        最可能的原因是某条数据不完整（页面内容一部分来自模型输出解析，字段缺失是常态）。
+        <br />
+        <strong className="font-semibold text-ink-mid">
+          顶栏与侧栏仍然可用 —— 点别的页面即可继续操作
+        </strong>
+        ，不需要重启服务。
+      </div>
+      <div className="text-xs text-ink-faint">
+        切走再切回来会重新渲染这个页面；若每次都崩，请把浏览器控制台的报错发出来。
+      </div>
+    </div>
+  );
 }
 
 /** 撑满内容区的加载态 —— 高度接近一屏，所以出现/消失都不会造成跳版。 */
