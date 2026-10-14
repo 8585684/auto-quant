@@ -2083,6 +2083,34 @@ export class AutoTrader {
   }
 
   /**
+   * **结清"交易所已不再挂着"的本地委托行** —— 供外部节奏调用。
+   *
+   * ## 为什么需要这个公开入口（2026-10-14 线上实测抓到的 BUG）
+   *
+   * `settleStaleOrders()` 原来只挂在**决策周期的对账**里。而线上 `#11`
+   * （团队模式）实测：**36 条本地 `NEW` 委托，而交易所侧 0 条**
+   *（`/fapi/v1/openOrders` 与 `/fapi/v1/openAlgoOrders` 都查过）。
+   *
+   * 逐条复刻它的判据，**它本来能结清全部 36 条**：
+   * ```
+   *   ① candidates（够老 + 非终态）      : 36 条
+   *   ② activeProtectionIds（open 持仓）:  0 个
+   *   ③ 交易所挂着                       :  0 条 → 可结清 36
+   * ```
+   * 也就是说**逻辑是对的，只是从未被执行** —— 因为团队模式的决策周期
+   * 又慢又长，而结清挂在周期的对账那一步里。
+   *
+   * 所以给它一个**独立于决策周期**的入口，由 `manager` 的**自检循环**
+   *（每 30 分钟，那条路径即使决策卡住也一定会跑）调用。
+   *
+   * ⚠️ 它只改账：既不撤单、也不重挂保护单，唯一依据是交易所自己说那张单还在不在
+   *（见 `settleStaleOrders()` 的完整说明）。
+   */
+  async settleStaleOrderRecords(): Promise<number> {
+    return this.settleStaleOrders();
+  }
+
+  /**
    * Run the ledger reconciliation pass, serialised against any running cycle.
    *
    * The `/reconcile` endpoint used to build a **second** `AutoTrader` over the
