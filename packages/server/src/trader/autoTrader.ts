@@ -84,6 +84,7 @@ import {
 import { rankPlatformHistory } from '../strategy/platformHistory.js';
 import { applyAgentPatch } from './agent/patch.js';
 import { rankConsensus } from '../strategy/consensus.js';
+import { pickAtrSeries } from '../strategy/atrPeriod.js';
 import { clampNextCheckMinutes, nextCycleDelayMs } from './cycleSchedule.js';
 import {
   BAR_MINUTES,
@@ -4751,7 +4752,18 @@ export class AutoTrader {
 
       const snap = caps?.find((s) => s.symbol === row.symbol) ?? null;
       const mark = snap && Number.isFinite(snap.price) && snap.price > 0 ? snap.price : null;
-      const atrSeries = snap?.primary?.atr?.['14'];
+      /*
+       * ⚠️ **不能写死 `'14'`**（外部 issue #179）：`atrPeriods` 默认 `[14]`
+       * 但**界面可改、AI 可调**。写死的话配置不含 14 时这里取不到值 →
+       * `atr` 为 `null` → 下面的 `limitMinutes` 退回 `rowBaseMinutes` →
+       * **"自适应时限"静默退化成固定值**（那是能力降级，不只是少显示一行字）。
+       *
+       * 改成从配置里挑第一个实际存在的周期。
+       */
+      const atrSeries = pickAtrSeries(
+        snap?.primary?.atr,
+        this.activeConfig.indicators.atrPeriods,
+      ).values;
       const atr =
         atrSeries && atrSeries.length > 0
           ? [...atrSeries].reverse().find((v): v is number => typeof v === 'number' && Number.isFinite(v)) ??

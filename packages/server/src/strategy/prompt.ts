@@ -14,6 +14,7 @@ import { DECISION_TOOL_CATALOGUE } from '../trader/decisionTools.js';
 import type { RankingRow, UniverseRankings } from '../market/rankings.js';
 import type { PlatformHistoryRow } from './platformHistory.js';
 import type { EntryFillStats } from './entryStats.js';
+import { pickAtrSeries } from './atrPeriod.js';
 import {
   BAR_MINUTES,
   PENDING_TIMEOUT_MAX_MINUTES,
@@ -2811,9 +2812,14 @@ function renderUserPrompt(
      * 逐个排除让它看得见每个标的的毛病，却看不见**合格面有多宽**。
      * 系统只给这个统计，不给结论。
      */
+    /*
+     * ⚠️ **不能写死 `'14'`**（外部 issue #179）：`atrPeriods` 可配置
+     *（界面可改、AI 可调），写死的话配置不含 14 时这一整块统计会**无声消失**。
+     * 改成从配置里挑第一个实际存在的周期。
+     */
     const atrPcts = ctx.candidates
       .map((c) => {
-        const atr = lastValue(c.primary?.atr?.['14']);
+        const atr = lastValue(pickAtrSeries(c.primary?.atr, ctx.config.indicators.atrPeriods).values ?? undefined);
         return atr !== null && Number.isFinite(c.price) && c.price > 0
           ? (atr / c.price) * 100
           : null;
@@ -4321,7 +4327,19 @@ function pendingDistanceRow(pending: PromptPendingEntry, ctx: PromptContext): st
    * 后者在 45 分钟（3 根）上会把预期行程夸大 1.7 倍，而那正是"让我以为挂得到"的方向 ——
    * 一个鼓励继续挂远的数字比不给更糟。
    */
-  const atr = lastValue(snap?.primary?.atr?.['14']);
+  /*
+   * ⚠️ **不能写死 `'14'`**（外部 issue #179）。
+   *
+   * `atrPeriods` 默认 `[14]`，但它**界面上可改、AI 也可调**。
+   * 写死 `'14'` 的话，配置一旦不含 14（例如 `[7]`），`lastValue(undefined)`
+   * 返回 `null` → 下面整块 `if` 不进 → **这条时限估算无声消失**
+   *（没有 else、没有 fallback、没有告警）。
+   *
+   * 改成从配置里挑第一个**实际存在**的周期；一个都没有时
+   * `atrSeries` 为 `null`，下面会走 `else` **显式说明原因**，而不是静默跳过。
+   */
+  const pickedAtr = pickAtrSeries(snap?.primary?.atr, ctx.config.indicators.atrPeriods);
+  const atr = lastValue(pickedAtr.values ?? undefined);
   /*
    * ⚠️ **ATR 的口径必须与 K 线周期一致**（外部 issue #165）。
    *
@@ -4368,17 +4386,21 @@ function pendingDistanceRow(pending: PromptPendingEntry, ctx: PromptContext): st
     /* 随机游走：走到 `x` 倍 ATR 的距离，预期需要 `x²` 根 K 线（周期见 `barMinutes`）。 */
     const needMinutes = atrPercent > 0 ? (distancePercent / atrPercent) ** 2 * barMinutes : null;
     const needText = needMinutes === null ? '未知' : `${Math.ceil(needMinutes)} 分钟`;
+    /*
+     * ⚠️ 文案里的周期**必须跟着实际口径**（issue #165 / #179）：
+     * 原来写死 "15m ATR(14)"，而主周期默认是 5m、ATR 周期也可配置 ——
+     * 那会让模型按错误的量级去理解一个读数。
+     *
+     * ⚠️ 定义在 `if (limitMinutes > 0)` **之外**：两个分支（有/无自动撤单时限）
+     * 都要用它。
+     */
+    const tfLabel = primaryTimeframe ?? `${BAR_MINUTES}m`;
+    const atrLabel = pickedAtr.period !== null ? `${tfLabel} ATR(${pickedAtr.period})` : `${tfLabel} ATR`;
     if (limitMinutes > 0) {
       const capped = limitMinutes >= PENDING_TIMEOUT_MAX_MINUTES;
       const enough = needMinutes !== null && limitMinutes >= needMinutes;
-      /*
-       * ⚠️ 文案里的周期**必须跟着实际口径**（issue #165）：
-       * 原来写死 "15m ATR(14)"，而主周期默认是 5m ——
-       * 那会让模型按 15m 的量级去理解一个 5m 的读数。
-       */
-      const tfLabel = primaryTimeframe ?? `${BAR_MINUTES}m`;
       rows.push(
-        `   ⏱ 按当前 ${tfLabel} ATR(14) ≈ ${fmt(atr)}（占现价 ${atrPercent.toFixed(3)}%）估计：` +
+        `   ⏱ 按当前 ${atrLabel} ≈ ${fmt(atr)}（占现价 ${atrPercent.toFixed(3)}%）估计：` +
           `走到这个价位**预期需要约 ${needText}**（随机游走口径 x² 根 K 线）；` +
           `而系统会给这张单 **${limitMinutes} 分钟**上限` +
           `（取 max(基础 ${baseMinutes}, 预期×1.5)，封顶 ${PENDING_TIMEOUT_MAX_MINUTES}）` +
@@ -4391,9 +4413,32 @@ function pendingDistanceRow(pending: PromptPendingEntry, ctx: PromptContext): st
       );
     } else {
       rows.push(
-        `   ⏱ 按当前 15m ATR(14) ≈ ${fmt(atr)}（占现价 ${atrPercent.toFixed(3)}%）估计，` +
+        `   ⏱ 按当前 ${atrLabel} ≈ ${fmt(atr)}（占现价 ${atrPercent.toFixed(3)}%）估计，` +
           `走到这个价位**预期需要约 ${needText}**（随机游走口径 x² 根 K 线）。` +
           '系统当前**没有设自动撤单时限**，所以这张单会一直等着。',
+      );
+    }
+  } else {
+    /*
+     * ⚠️ **取不到 ATR 时要显式说明，而不是让整块消失**（外部 issue #179）。
+     *
+     * 原来没有这个 `else`：配置的 `atrPeriods` 不含 14（或指标还没算出来）时，
+     * 这一整块提示**无声消失** —— 模型不会知道自己少看了一条约束，
+     * 操作员也无从判断"是没数据还是系统没算"。
+     *
+     * ⚠️ **两种情况要分开说**：配置要的周期**一个都没算出来**（配置问题，
+     * 人可以改）vs 算出来了但**值是空的**（预热期，等一轮就好）。
+     * 混成一句话会让操作员去查错方向。
+     */
+    if (pickedAtr.values === null) {
+      rows.push(
+        `   ⏱ 无法估算"走到这个价位要多久"：当前指标里没有配置要求的 ATR 周期` +
+          `（配置要的是 ${pickedAtr.requested.length > 0 ? pickedAtr.requested.join('、') : '（空列表）'}）。` +
+          '这不影响下单，但系统给不出时间账 —— 要恢复请在「策略工作室」的指标周期里加上它。',
+      );
+    } else {
+      rows.push(
+        '   ⏱ 无法估算"走到这个价位要多久"：ATR 还没算出来（指标预热期）。下一轮会好。',
       );
     }
   }
