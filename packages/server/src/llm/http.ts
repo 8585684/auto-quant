@@ -170,7 +170,23 @@ export async function executeJsonRequest(
     failFastOnMinimaxBaseResp?: boolean;
   } = {},
 ): Promise<JsonResponse> {
+  /*
+   * ⚠️ **响应体的读取要有自己的错误分类，两条路径语义一致。**
+   *
+   * 原来 `response.text()` 裸抛，落在所有 try 之外，于是"头部已回、body 读到一半
+   * 被重置"抛的是原生 `TypeError: fetch failed` —— `isRetryable()` 只认 `LlmError`，
+   * 一次本可重试的抖动被判成永久失败。#135 的外部实测坐实它比表面更重：同一故障
+   * 注入下，**流式路径保住 `status=429` 与 `Retry-After`（30s 退避），非流式连这两
+   * 个一起丢**，只剩一条裸 `TypeError` 给操作员。
+   *
+   * 分类规则（与流式路径同构，"错误分类只有一份逻辑"）：
+   *   · 调用方按下的取消 → `abortError`，**不重试**（重试等于把取消复活）；
+   *   · 非 2xx → 状态码已经在手，body 没读到也**照样按 status 分类**
+   *     （429 → 可重试、`retryAfterMs` 仍取自响应头）—— 这正是流式的行为；
+   *   · 2xx 却没读到 body → 真·传输断裂，`connectionError`（可重试）。
+   */
   let response: Response;
+  let rawText: string;
   try {
     response = await fetchGuarded(request.url, {
       method: 'POST',
@@ -190,7 +206,19 @@ export async function executeJsonRequest(
     throw connectionError(String(provider), error);
   }
 
-  const rawText = await response.text();
+  try {
+    rawText = await response.text();
+  } catch (error) {
+    const retryAfterMs = parseRetryAfter(response.headers.get('retry-after'));
+    if (options.signal?.aborted) throw abortError(String(provider), error);
+    if (!response.ok) {
+      const classified = classifyHttpError(String(provider), response.status, null, '');
+      classified.retryAfterMs = retryAfterMs;
+      throw classified;
+    }
+    throw connectionError(String(provider), error);
+  }
+
   const body = safeJsonParse(rawText);
   const retryAfterMs = parseRetryAfter(response.headers.get('retry-after'));
 
@@ -311,8 +339,25 @@ export async function executeStreamRequest(
     /* 每收到一块数据就重置"卡住"计时器 —— 慢模型因此不会被总时长误杀。 */
     lines = await readOpenAiStreamLines(response, bumpIdle);
   } catch (error) {
+    /*
+     * ⚠️ **2xx 流式在读取过程中失败，要与非流式共用同一套分类。**
+     *
+     * 原来这里只认"卡住"（`stall.signal.aborted`），其余一律 `throw error` 裸抛 ——
+     * 于是"头部已 200、SSE 读到一半连接被重置"抛的是原生 `TypeError`，
+     * `isRetryable()` 认不出，一次可重试的抖动被判成永久失败
+     * （外部实测确认：流式 200 + body 读失败 → `isRetryable=false`）。
+     *
+     * 补法与上面 fetch 的 catch **完全同构**：卡住→可重试超时；调用方取消→不重试；
+     * 其余（连接重置）→可重试连接错误。三条路径的错误分类只有一份逻辑。
+     */
     if (stall.signal.aborted) throw timeoutError(String(provider), idleMs);
-    throw error;
+    if (error instanceof Error && error.name === 'TimeoutError') {
+      throw timeoutError(String(provider), options.timeoutMs ?? 0);
+    }
+    if (error instanceof Error && error.name === 'AbortError') {
+      throw abortError(String(provider), error);
+    }
+    throw connectionError(String(provider), error);
   } finally {
     if (idleTimer) clearTimeout(idleTimer);
   }
