@@ -962,6 +962,15 @@ export const api = {
       firstAt: string | null;
       lastAt: string | null;
       detectedAt: string | null;
+      /**
+       * **平台账本与交易所流水的差额**（`undefined` = 没读到，不代表 0）。
+       *
+       * ⚠️ 它是"列表页盈亏与详情页账户余额对不上"的量化答案 ——
+       * 两个数字口径不同（本地记账 vs 交易所真实值），而这个差是它们的距离。
+       */
+      ledgerGap?: number;
+      /** 对账检查的时刻（`undefined` = 从没跑过对账）。 */
+      ledgerCheckedAt?: string;
     }>(`/traders/${id}/foreign-activity`, { signal }),
   /**
    * 一页订单记录（服务端按 `id` 倒序，即最新的一单在前）。

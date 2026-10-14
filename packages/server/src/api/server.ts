@@ -2765,11 +2765,40 @@ export function bootstrapOwnerAccount(): {
 }
 
 /**
- * 读最近一次对账检测到的外部交易活动。
+ * 读最近一次对账检测到的外部交易活动**与账本差额**。
  *
  * 返回 `rounds: 0` 而不是 `null`：**「检测过，没有外部活动」和
  * 「从来没检测过」对操作员的含义不同** —— 前者是"账户干净"，
  * 后者是"我们还不知道"。用 `detectedAt` 区分。
+ *
+ * ## ⚠️ 2026-10-14：补上 `ledgerGap`（用户报"列表页和详情页数据对不上"）
+ *
+ * ### 现象
+ *
+ * 列表页「盈亏」显示 **+4.84**（本地记账），详情页「账户余额」显示 **92.34**
+ * （交易所真实值），两者差 **12.55** —— 而界面上**没有任何地方解释这个差**。
+ *
+ * ### 根因：两个数字口径不同，而界面没说
+ *
+ * ```
+ *   本地记账（trades 净额合计）   = 起始 + 已实现净额 = 104.89  ← 列表页
+ *   交易所真实权益               = 92.34                        ← 详情页
+ *   差额（ledger_check.gap）     = 12.55                        ← 只在后端台账里
+ * ```
+ *
+ * 差额的来源是**对账重建的已知缺陷**（窗口起点落在持仓中间 → 开/平判反，
+ * 见 `reconstructRoundTrips()` 的说明）—— 系统**每轮都在检测它**，
+ * 但那个数字**只进了 `ledger_check:` 台账与给模型看的提示词**，
+ * 没有进任何界面。于是操作员看到两个数字对不上，而**无处可知为什么**。
+ *
+ * ### 为什么在这里补，而不是新开端点
+ *
+ * 这个端点本来就是为"账户余额不对"建的（见上面那段注释），
+ * 而 `gap` 正是那个问题的**量化答案**。分成两个端点会让
+ * 「外部活动」与「账本差额」这两件相关的事在界面上被拆到两处。
+ *
+ * ⚠️ 读不到时**不带这个字段**（不是 `0`）—— 「我们不知道」和「账没问题」
+ * 对操作员的含义完全不同（同 `readForeignActivity` 的说明）。
  */
 function readForeignActivityFor(traderId: number): {
   rounds: number;
@@ -2778,6 +2807,10 @@ function readForeignActivityFor(traderId: number): {
   firstAt: string | null;
   lastAt: string | null;
   detectedAt: string | null;
+  /** 平台账本与交易所流水的差额（`undefined` = 没读到，不代表 0）。 */
+  ledgerGap?: number;
+  /** 对账检查的时刻（`undefined` = 从没跑过对账）。 */
+  ledgerCheckedAt?: string;
 } {
   const empty = {
     rounds: 0,
@@ -2787,9 +2820,31 @@ function readForeignActivityFor(traderId: number): {
     lastAt: null,
     detectedAt: null,
   };
+  /*
+   * ⚠️ 账本差额**独立读**（同 `readForeignActivity` 的做法）：
+   * 两个台账是分别写的，任一个缺失不该让另一个也丢。
+   */
+  const gap = (() => {
+    try {
+      const raw = settings.get(`ledger_check:${traderId}`);
+      if (!raw) return {};
+      const parsed = JSON.parse(raw) as { gap?: number; incomeReadFailed?: boolean; checkedAt?: string };
+      /*
+       * ⚠️ 读流水失败那一轮的 `gap` 是**假差额**（等于整个 platformNet）——
+       * 与 `readForeignActivity` 里同一条判据，不能只修一处。
+       */
+      if (parsed.incomeReadFailed) return {};
+      return {
+        ...(typeof parsed.gap === 'number' ? { ledgerGap: parsed.gap } : {}),
+        ...(typeof parsed.checkedAt === 'string' ? { ledgerCheckedAt: parsed.checkedAt } : {}),
+      };
+    } catch {
+      return {};
+    }
+  })();
   try {
     const raw = settings.get(`foreign_activity:${traderId}`);
-    if (!raw) return empty;
+    if (!raw) return { ...empty, ...gap };
     const parsed = JSON.parse(raw) as Partial<ReturnType<typeof readForeignActivityFor>>;
     return {
       rounds: typeof parsed.rounds === "number" ? parsed.rounds : 0,
@@ -2798,8 +2853,9 @@ function readForeignActivityFor(traderId: number): {
       firstAt: typeof parsed.firstAt === "string" ? parsed.firstAt : null,
       lastAt: typeof parsed.lastAt === "string" ? parsed.lastAt : null,
       detectedAt: typeof parsed.detectedAt === "string" ? parsed.detectedAt : null,
+      ...gap,
     };
   } catch {
-    return empty;
+    return { ...empty, ...gap };
   }
 }

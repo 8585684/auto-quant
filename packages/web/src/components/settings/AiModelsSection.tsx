@@ -339,6 +339,38 @@ export function AiModelsSection() {
   const [error, setError] = useState<string | null>(null);
   const [testResult, setTestResult] = useState<Record<number, ModelTestResult & { at: number }>>({});
   const [testingId, setTestingId] = useState<number | null>(null);
+  /*
+   * ══════════════════════════════════════════════════════════════════════════
+   *  ⭐ **一键测试全部**（2026-10-14 用户要求）
+   * ══════════════════════════════════════════════════════════════════════════
+   *
+   * ## 为什么需要它
+   *
+   * 单个模型的「测试」按钮早就有（见 `test`），但**配置了十几个模型时**，
+   * 逐个点等于十几次点击 + 十几次等待，而用户真正想回答的问题是
+   * "**我这一批模型里哪些是通的**"。
+   *
+   * ## 设计取舍
+   *
+   * ```
+   *   ① 并发数限制 4 —— 不是无限并发
+   *      每个测试都是真实的上游请求（可能跨洋），同时发十几个会让
+   *      网关侧限流或本机连接打满；而**串行**在十几个模型时太慢。
+   *   ② 进度必须可见 —— `测试中 3/8`
+   *      十几个请求可能要十几秒；没有进度条的等待会被当成"卡住了"，
+   *      用户会重复点击（而那会**再发一轮请求**）。
+   *   ③ 结果复用 `testResult` —— 与单个测试同一个 state
+   *      于是表格里每个模型那一格会自动显示结果，不需要第二套渲染。
+   *   ④ 结束时给一行汇总 —— `8 个通过 · 2 个失败`
+   *      用户要的是结论，不是自己数格子。
+   * ```
+   *
+   * ⚠️ **不覆盖已有结果时的问题**：批量测试会覆盖之前单个测试的结果 ——
+   * 那是**对的**（新结果比旧结果有价值），而且 `at` 时间戳会更新，
+   * 界面上的"多久之前"跟着走。
+   */
+  const [batch, setBatch] = useState<{ done: number; total: number } | null>(null);
+  const [batchSummary, setBatchSummary] = useState<string | null>(null);
   const [discovery, setDiscovery] = useState<DiscoverModelsResult | null>(null);
   const [discovering, setDiscovering] = useState(false);
   const [draftTest, setDraftTest] = useState<ModelTestResult | null>(null);
@@ -600,30 +632,95 @@ export function AiModelsSection() {
     [reload],
   );
 
+  /**
+   * **把一次测试的结果写进 state**（单个测试与批量测试共用）。
+   *
+   * ⚠️ 抽出来是刻意的：批量测试如果自己再写一遍错误解析，
+   * 两条路径就会漂移（本项目反复踩过"同一个算术写在两个地方"）。
+   *
+   * ⚠️ 必须定义在 `test` **之前** —— `test` 依赖它（TS2448：块级作用域
+   * 变量不能用在使用之后）。
+   */
+  const recordTestResult = useCallback((id: number, result: ModelTestResult) => {
+    setTestResult((current) => ({ ...current, [id]: { ...result, at: Date.now() } }));
+  }, []);
+
   const test = useCallback(async (row: AiModelRow) => {
     setTestingId(row.id);
     setError(null);
     try {
       const result = await api.testAiModel(row.id);
-      setTestResult((current) => ({ ...current, [row.id]: { ...result, at: Date.now() } }));
+      recordTestResult(row.id, result);
     } catch (err) {
       const payload = (err as Error & { payload?: ModelTestResult }).payload;
-      setTestResult((current) => ({
-        ...current,
-        [row.id]: {
-          ok: false,
-          message: payload?.message ?? (err as Error).message,
-          latencyMs: payload?.latencyMs ?? 0,
-          at: Date.now(),
-        },
-      }));
+      recordTestResult(row.id, {
+        ok: false,
+        message: payload?.message ?? (err as Error).message,
+        latencyMs: payload?.latencyMs ?? 0,
+      });
     } finally {
       setTestingId(null);
     }
-  }, []);
+  }, [recordTestResult]);
 
   const onTest = useCallback((row: AiModelRow) => void test(row), [test]);
   const onRemove = useCallback((row: AiModelRow) => void remove(row), [remove]);
+
+  /**
+   * **一键测试全部模型**（并发 4，带进度与汇总）。
+   *
+   * 见上面 `batch` 的设计说明。⚠️ 失败**不中断整批** —— 一个模型不通
+   * 不该让其余模型测不了（那正是用户最需要看到的情况）。
+   */
+  const testAll = useCallback(async () => {
+    const targets = models.map((m) => m.id);
+    if (targets.length === 0) return;
+    setBatchSummary(null);
+    setBatch({ done: 0, total: targets.length });
+
+    let ok = 0;
+    let failed = 0;
+    let cursor = 0;
+
+    /* 工人函数：从共享游标取下一个任务，直到取完。 */
+    const worker = async (): Promise<void> => {
+      for (;;) {
+        const index = cursor;
+        cursor += 1;
+        if (index >= targets.length) return;
+        const id = targets[index]!;
+        try {
+          const result = await api.testAiModel(id);
+          recordTestResult(id, result);
+          if (result.ok) ok += 1;
+          else failed += 1;
+        } catch (err) {
+          /*
+           * ⚠️ 必须**也记一条失败结果**：那个模型那一格留空的话，
+           * 用户看到的是"没测过"，而不是"测了、不通"。
+           */
+          const payload = (err as Error & { payload?: ModelTestResult }).payload;
+          recordTestResult(id, {
+            ok: false,
+            message: payload?.message ?? (err as Error).message,
+            latencyMs: payload?.latencyMs ?? 0,
+          });
+          failed += 1;
+        }
+        setBatch((current) => (current === null ? null : { ...current, done: current.done + 1 }));
+      }
+    };
+
+    /* 并发 4：够快，又不会把网关与本机连接打满（见设计说明）。 */
+    await Promise.all(Array.from({ length: Math.min(4, targets.length) }, worker));
+
+    setBatch(null);
+    setBatchSummary(
+      failed === 0
+        ? `${fmtInt(targets.length)} 个模型全部通过`
+        : `${fmtInt(ok)} 个通过 · ${fmtInt(failed)} 个失败（失败的格子标红，鼠标悬停看原因）`,
+    );
+  }, [models, recordTestResult]);
 
   /* --- render ------------------------------------------------------------ */
 
@@ -645,13 +742,45 @@ export function AiModelsSection() {
           /* 页面级动作 → 统一接口。禁用态跟着 providers 走，不在这里重复判断。 */
           <PageActions
             start={
-              <Button variant="primary" size="sm" onClick={openCreate} disabled={providers.length === 0}>
-                + 添加模型
-              </Button>
+              <>
+                {/*
+                  ⭐ **一键测试全部**（2026-10-14）。
+                  ⚠️ 与「+ 添加模型」并列而不是塞进某个菜单：它是这一页第二常用的动作
+                  （配完一批模型后第一件事就是问"哪些是通的"）。
+                  ⚠️ 测试期间 disabled —— 重复点击会**再发一轮请求**，
+                  而那在十几个模型时是明显的浪费（也可能触发网关限流）。
+                */}
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  busy={batch !== null}
+                  disabled={batch !== null || models.length === 0}
+                  onClick={() => void testAll()}
+                  title={
+                    batch !== null
+                      ? `正在测试（${batch.done}/${batch.total}）`
+                      : '对每个已配置模型各发一次最小补全请求，结果直接标在下面每一行上'
+                  }
+                >
+                  {batch !== null ? `测试中 ${batch.done}/${batch.total}` : '一键测试全部'}
+                </Button>
+                <Button variant="primary" size="sm" onClick={openCreate} disabled={providers.length === 0}>
+                  + 添加模型
+                </Button>
+              </>
             }
           />
         }
       />
+
+      {/*
+        批量测试的汇总 —— 只在跑完一轮之后显示。
+        ⚠️ 用户要的是**结论**（"哪些不通"），而不是自己数格子；
+        所以给一行"X 个通过 · Y 个失败"，失败的格子另有标记。
+      */}
+      {batchSummary !== null && (
+        <div className="px-0.5 text-xs text-ink-mid">{batchSummary}</div>
+      )}
 
       <Panel padded={false}>
         {/* 轮询失败必须说出来：否则空列表会被读成"还没配过模型" */}
