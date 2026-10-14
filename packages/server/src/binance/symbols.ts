@@ -11,8 +11,48 @@ export { normalizeSymbol, baseAssetOf } from '@aq/shared';
  * Number of decimal places implied by a step/tick string.
  *
  *   "0.001" → 3      "0.10" → 1      "1" → 0      "10" → 0
+ *
+ * ## ⚠️ 必须同时认得科学计数法（外部 issue #136）
+ *
+ * `SymbolInfo` 里的 tick/step 是 **`Number`**（`:97` 的 `Number(tickSize)`），
+ * 而调用点又把它转回字符串再解析精度（`:220` 的 `stepDecimals(String(info.tickSize))`）。
+ *
+ * `Number` → `String` 这一步**不是无损的**：JS 对 `< 1e-6` 的量使用科学计数法，
+ *
+ * ```
+ * "0.0000001" → Number → 1e-7 → String → "1e-7"      ← 没有小数点！
+ * ```
+ *
+ * 而原实现只认小数点（`trimmed.indexOf('.')`），于是 `"1e-7"` 被读成 **0 位小数** ——
+ * `roundPrice` / `roundTriggerPrice` 对任何价格都返回 **0**。
+ *
+ * 后果是**真实的**（实测）：`1000PEPEUSDT`（`tickSize=1e-7`）的保护单因为
+ * "触发价 0 会立即触发"被拒 → 止损挂不上 → 按 `docs/AGENTS.md` §2.6
+ * 立即市价平掉该仓位 → 每次尝试白付一次开+平的手续费与滑点。
+ *
+ * ## 为什么修这里而不是改调用点
+ *
+ * 也可以让调用点保留原始字符串（issue #136 的"方案二"）—— 那更治本，
+ * 但 `SymbolInfo` 是 `binance/` 与 `risk/` 共用的类型，改它要动结构。
+ * 而**本函数的契约就是"从 step 字符串读精度"**：一个形如 `"1e-7"` 的 step
+ * 字符串是合法输入，读不出精度是**这个函数的缺陷**，不是调用方的错。
+ *
+ * 所以修在这里，并把 `Number` 往返的两种形态都钉进 `stepDecimals.test.ts`。
  */
 export function stepDecimals(step: string): number {
+  /*
+   * 科学计数法：`"1e-7"` / `"1.5e-8"` / `"2E-6"`。
+   *
+   * 小数位数 = 指数绝对值 + 尾数本身的小数位。例：
+   *   "1e-7"   → 尾数 "1"   无小数 → 7 + 0 = 7
+   *   "1.5e-8" → 尾数 "1.5" 有 1 位 → 8 + 1 = 9
+   */
+  const scientific = /^(\d+)(?:\.(\d+))?[eE]-(\d+)$/.exec(step.trim());
+  if (scientific) {
+    const mantissaDecimals = scientific[2]?.length ?? 0;
+    return Number(scientific[3]) + mantissaDecimals;
+  }
+
   const trimmed = step.includes('.') ? step.replace(/0+$/, '') : step;
   const dot = trimmed.indexOf('.');
   return dot === -1 ? 0 : trimmed.length - dot - 1;
