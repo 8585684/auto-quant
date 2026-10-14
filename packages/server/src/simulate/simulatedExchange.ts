@@ -190,12 +190,45 @@ export class SimulatedExchange {
 
     if (stop) {
       const breached = isLong ? low <= stop.price : high >= stop.price;
-      // A gap through the stop fills at the open, not at the stop price — the
-      // slippage is real and worth modelling.
+      /*
+       * 跳空穿过止损时按**开盘价**成交，而不是触发价 —— 滑点是真实的、值得建模。
+       *
+       * ## 🔴 原来那两个三元表达式恒等于 `stop.price`（外部 issue #150 / #153）
+       *
+       * ```ts
+       * // 改前：
+       * isLong
+       *   ? Math.min(stop.price, step.open > stop.price ? step.open : stop.price)
+       *   : Math.max(stop.price, step.open < stop.price ? step.open : stop.price)
+       * ```
+       *
+       * 多头：`open > stop` 时 `min(stop, open) = stop`；否则 `min(stop, stop) = stop`
+       * —— **两种情况都是 `stop.price`**（空头对称）。也就是说：
+       * **注释承诺了跳空滑点，实现一步都没走。**
+       *
+       * 后果不是精度问题，而是**回测的结论方向错了**：止损跳空亏损被系统性低估，
+       * 于是模拟盘上的策略看起来比真实情况好。这个项目的 `npm run sim`
+       * 与 `sim:live` 是"上线前唯一能证明接缝"的一档（见 docs/AGENTS.md §6.1），
+       * 它的结论偏乐观等于把那一档验证的价值抹掉。
+       *
+       * ## 为什么默认 `npm run sim` 抓不到它
+       *
+       * 确定性夹具 `syntheticCandles.ts:150-152` 刻意让 `open = 上一根 close`（**无跳空**），
+       * 所以默认 sim 根本走不到这条分支 —— 只有 `--real-market` / `sim:live` 才会踩到。
+       * "默认夹具无跳空"是**有意的**（为了让输出可复现），所以这条缺陷
+       * 不能被 sim 兜住，必须由 `slippage.test.ts` 单独钉住。
+       *
+       * ## 正确的形态
+       *
+       * 跳空时成交价 = 开盘价（比触发价更不利的那一侧）；未跳空时 = 触发价。
+       * `Math.min/Math.max` 本身就表达了"取更不利的一侧"，不需要再套条件：
+       *   · 多头（卖平）在下跌中成交 → 取更低者 `min(open, stop)`
+       *   · 空头（买平）在上涨中成交 → 取更高者 `max(open, stop)`
+       */
       if (breached) {
         const fillPrice = isLong
-          ? Math.min(stop.price, step.open > stop.price ? step.open : stop.price)
-          : Math.max(stop.price, step.open < stop.price ? step.open : stop.price);
+          ? Math.min(stop.price, step.open)
+          : Math.max(stop.price, step.open);
         return { price: fillPrice, reason: 'stop_loss', orderId: stop.id };
       }
     }
