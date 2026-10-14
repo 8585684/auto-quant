@@ -2221,3 +2221,92 @@ Docker 镜像 (v0.1.10)→ success
 - **PR #180** —— `CHANGES_REQUESTED`（注释与实现相反 + `'EUR'` 误杀）
 - **PR #170** —— `CHANGES_REQUESTED`（NAT64 分支误伤）
 - **16 个 issue** —— 累计关闭 23 个
+
+---
+
+## 24. 第 18 轮：v0.1.11 发版 + #179（写死的 ATR 周期）
+
+### 一、#179 —— 兑现我上一轮拆出来的那一半（`f23fd13`）
+
+三处硬编码 `'14'` 全部改为**从配置挑第一个实际存在的周期**：
+
+```
+prompt.ts:2816       连续观望提醒的 ATR 统计
+prompt.ts:4324       挂单时限估算
+autoTrader.ts:4754   真实撤单时限
+```
+
+**实测修复效果**：
+
+```
+配置 [14]    → period=null  （测试的 atr 里只有 7/21）
+配置 [7]     → period=7     ← 修复前会落空
+配置 [3,21]  → period=21    ← 正确跳过不存在的 3
+配置 []      → period=null
+```
+
+**两处按 issue 里给的方向补的东西**：
+
+1. **显式说明**（方向 B）—— 原来没有 `else`。现在**分开说两种情况**：
+   "配置要的周期一个都没算出来"（配置问题，人能改）vs "算出来了但值是空的"
+   （预热期，等一轮就好）。**混成一句会让操作员去查错方向。**
+2. **文案里的周期号跟着实际值** —— 与 #165 的 `tfLabel` 同一处理。
+
+**不 fallback 到 14**：`atrPeriods` 为空说明"没有要求任何 ATR"，
+猜一个 14 会让调用方以为有数据、而那不是配置要的。
+
+⚠️ **一处我主动删掉的重复**：最初在 `atrPeriod.ts` 里也写了 `lastFiniteValue`，
+但发现 `prompt.ts:4450` 的 `lastValue` **语义完全相同** —— 保留两个就是
+"同一概念两套实现"。删掉，只留"挑周期"这一份。
+
+### 二、发版前的红线检查（三条交易路径提交）
+
+`v0.1.10..HEAD` 里有另一个智能体的**三条** `fix(trader)`：
+
+- `11668e9` 自检循环也结清陈旧委托
+- `326eff4` 自检循环启动时立即跑一次
+- `b5a2cdf` 交易所说不存在的条件单可以结清
+
+**核实结论：三条都未触及 `risk/engine.ts`，且 `b5a2cdf` 明确保留了安全边界**：
+
+```
+-2013（Order does not exist）→ 'not-found'（可判定）
+其它错误（网络/鉴权/限流）   → null（仍然"不下结论"）
+```
+
+它修的是真实死锁：**42 条**本地 `NEW` 条件单，逐个查都回 `-2013`，
+而界面一直显示"已挂单"。**"读不到"与"不存在"是两件事，把它们混成一件正是这个 bug 的成因** ——
+这个论证与我在别的 issue 上反复引用的"一个信号承载两种语义"是同一个模式。
+
+### 三、发版 v0.1.11
+
+```
+① main 全绿      typecheck / test(47+1506+220) / build / lint /
+                check:links / check:routes / sim 18/18 → 全 0
+② notices 一致   183 依赖全宽松许可，git diff 空
+③ tag v0.1.11    Docker 镜像构建 success
+④ 发布 release   isDraft=false
+```
+
+⚠️ 本次**触及下单路径**（`broker.ts` 的 `getAlgoOrder`、`autoTrader.ts` 的时限与结清），
+§4 实盘冒烟**本项适用** —— 已写明"未执行、留部署方"，并在说明里
+**明确标注"已核实三个提交均未触及 `risk/engine.ts`"**（红线检查的结论要留痕）。
+
+### 四、本轮验证
+
+```
+npm run typecheck   → 0
+npm test            → 47 + 1506 + 220，0 fail
+npm run build       → 0
+npm run lint        → 0
+npm run check:links → 0
+npm run check:routes→ 0
+npm run sim         → 18/18
+Docker 镜像 (v0.1.11)→ success
+```
+
+### 五、剩余
+
+- **PR #180** —— `CHANGES_REQUESTED`（注释与实现相反 + `'EUR'` 误杀）
+- **PR #170** —— `CHANGES_REQUESTED`（NAT64 分支误伤）
+- **15 个 issue** —— 累计关闭 24 个
