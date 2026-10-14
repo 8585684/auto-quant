@@ -23,13 +23,7 @@ import { Badge, Button, Empty, ErrorNote, Panel, Spinner3, cn } from '../compone
 import { TraderStatusBadge } from '../components/Badges';
 import { PageShell, Metric } from '../components/shell';
 import { DecisionFeed } from '../components/DecisionFeed';
-/*
- * ⚠️ **`AgentAuditPanel` 暂时不用**（2026-10-14 用户要求把它那一块让给决策区）。
- *
- * 保留 import 语句（注释形式）而不是删掉：用户说的是"**暂时**去掉"，
- * 数据仍在落库，要恢复时取消注释这一行与下面那处使用即可。
- */
-// import { AgentAuditPanel } from '../components/AgentAuditPanel';
+import { AgentAuditPanel } from '../components/AgentAuditPanel';
 import { isOpenOrder, TraderTables, type TraderTabId } from '../components/TraderTables';
 import { NET_PNL_FORMULA, PnlBreakdown, pnlFormulaText, statsCosts } from '../components/PnlBreakdown';
 import { DashboardEquityChart, WinLossBar } from '../components/DashboardCharts';
@@ -1638,6 +1632,35 @@ export function TraderPage() {
          * （`space-y-*` 本身不影响 flex 布局）。
          */
         mainClassName="flex flex-col space-y-2"
+        aside={
+          <DecisionFeed
+            traderId={traderId}
+            running={running}
+            /*
+             * ⚠️ **把模式传下去** —— 团队模式的看板与另两种根本不同
+             *（用户 2026-10-12 要求"3 种模式进去以后看板 UI 显示内容也应该是要分开的"）。
+             *
+             * 默认值是 `'strategy'`，所以这里即使不传也不改变既有行为；
+             * 传下去是为了让团队模式显示**编制表**而不是线性步骤列表。
+             */
+            mode={trader?.mode ?? 'strategy'}
+            /* 下一轮决策的预定时刻 —— 由服务端给出，界面只显示倒计时（见 CycleCountdown）。 */
+            nextCycleAt={trader?.nextCycleAt ?? null}
+            /*
+             * ⚠️ **必须传它**（2026-10-13 实测踩到）：`DecisionFeed` 只在
+             * `onToggleFocus !== undefined` 时渲染「全屏」按钮 ——
+             * 我第一版只在聚焦分支传了它，于是**常规视图里根本没有那个按钮**，
+             * 用户**无法进入全屏**（而"进不去全屏"正是他抱怨的那件事）。
+             */
+            onToggleFocus={() => setFeedFocusOverride(true)}
+            actions={
+              <>
+                {runNowAction}
+                {reviewAction}
+              </>
+            }
+          />
+        }
       >
         {/* A. 页头：我是谁 + 什么状态 + 能做什么，常驻一行 --------------- */}
         {/*
@@ -2039,86 +2062,7 @@ export function TraderPage() {
 
           所以现在**只对 `ai_team` 显示** —— 与本次大更新的边界一致。
         */}
-        {/*
-          ══════════════════════════════════════════════════════════════════════
-          ⭐ **决策区从右栏移到这里**（2026-10-14 用户要求）
-          ══════════════════════════════════════════════════════════════════════
-          
-          ## 用户的原话
-          
-          > 「这么一小块根本没用，不如直接把这块直接移动到左边，智能体审计原有的位置，
-          >   然后把智能体审计功能暂时去掉」
-          
-          ## 为什么右栏那一块"没用"
-          
-          右栏宽度是**视口的 40% 以下**（`PageShell` 的两栏比例），而决策区里装的是
-          团队看板（编制表 + 每个角色的产出）、周期结论、以及决策详情 ——
-          那些内容是**横向要空间、纵向要空间**的：
-          ```
-            团队看板：编制表一行 5 列（角色/阶段/摘要/耗时/状态）
-            角色产出：一段 300–2000 字的文本，窄栏里每行只放得下几个字
-          ```
-          挤在 40% 宽里，它只能显示成一个**很窄的条**（用户截图里那一块），
-          信息密度低于可读阈值 —— 那不是"信息少"，是**排版没跟上内容的形状**。
-          
-          ## 为什么放在主栏的这里（图表之后、表格之前）
-          
-          ```
-            指标卡 → 账户条 → 权益曲线 → 【决策区】 → 表格
-          ```
-          · 前三个是"账户现在什么状态"（盯盘时看）
-          · 决策区是"它在想什么、做了什么"（**这一页存在的理由**）
-          · 表格是"历史明细"（参考材料，在最下面）
-          
-          即：**从"现在"到"为什么"到"历史"**。决策区排在图表之后、明细之前，
-          正好承接这个顺序。
-          
-          ## ⚠️ 高度不再由 `aside` 的 `h-full` 决定
-          
-          原来它在右栏里靠 `flex-none max-h-[10%]`（团队模式）压高度 ——
-          那个约束是**为了适配右栏**而写的。搬到主栏之后它按内容自然高，
-          不再需要那个上限（见 `DecisionFeed` 里 `mode === 'ai_team'` 那段的条件）。
-        */}
-        <DecisionFeed
-          traderId={traderId}
-          running={running}
-          /*
-           * ⚠️ **把模式传下去** —— 团队模式的看板与另两种根本不同
-           *（用户 2026-10-12 要求"3 种模式进去以后看板 UI 显示内容也应该是要分开的"）。
-           *
-           * 默认值是 `'strategy'`，所以这里即使不传也不改变既有行为；
-           * 传下去是为了让团队模式显示**编制表**而不是线性步骤列表。
-           */
-          mode={trader?.mode ?? 'strategy'}
-          /* 下一轮决策的预定时刻 —— 由服务端给出，界面只显示倒计时（见 CycleCountdown）。 */
-          nextCycleAt={trader?.nextCycleAt ?? null}
-          /*
-           * ⚠️ **必须传它**（2026-10-13 实测踩到）：`DecisionFeed` 只在
-           * `onToggleFocus !== undefined` 时渲染「全屏」按钮 ——
-           * 我第一版只在聚焦分支传了它，于是**常规视图里根本没有那个按钮**，
-           * 用户**无法进入全屏**（而"进不去全屏"正是他抱怨的那件事）。
-           */
-          onToggleFocus={() => setFeedFocusOverride(true)}
-          actions={
-            <>
-              {runNowAction}
-              {reviewAction}
-            </>
-          }
-        />
-
-        {/*
-          ⚠️ **`AgentAuditPanel` 暂时撤掉**（2026-10-14 用户要求）。
-          
-          它原来的位置就是上面决策区现在占的地方。用户的原话是「暂时去掉」——
-          所以是**注释掉而不是删掉**：那三张表（运行轨迹 / 参数实验 / 教训记忆）
-          的数据仍在落库（`agent_runs` / `agent_experiments` / `agent_memory`），
-          只是不在这一页渲染。要恢复时把下面这行取消注释即可。
-          
-          ⚠️ 注意 `import { AgentAuditPanel }` 也要跟着处理 —— 留着未使用的 import
-          会被 lint 拦下（本项目 lint 是 0 warning 门禁）。
-        */}
-        {/* {trader.mode === 'ai_team' && <AgentAuditPanel traderId={traderId} />} */}
+        {trader.mode === 'ai_team' && <AgentAuditPanel traderId={traderId} />}
 
       </PageShell>
       </div>
