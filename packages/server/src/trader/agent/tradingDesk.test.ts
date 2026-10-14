@@ -9,6 +9,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { DESK_LIMITS, ROLE_TIMEOUT_MS, assertBudgetConsistent, roleTimeoutMs, runTradingDesk, type AskRole, type DeskRoleOutput } from './tradingDesk.js';
+import { planDispatch } from './dispatch.js';
 
 /** 造一个"总是成功"的 ask 桩，并记录调用顺序。 */
 function okAsk(log: string[], delayMs = 0): AskRole {
@@ -222,6 +223,194 @@ test('★ 默认配置下裁决一定会发生（不被预算饿死）', async (
   const out = await runTradingDesk({ ask: okAsk([]), ...CTX });
   assert.equal(out.verdict?.ok, true, '★ 默认配置必须跑得到裁决');
   assert.equal(out.truncatedByBudget, false, '默认配置下不该因为预算而截断');
+});
+
+/* -------------------------------------------------------------------------- */
+/*  总管主动少派 ≠ 预算截断（外部 issue #156）                                   */
+/* -------------------------------------------------------------------------- */
+
+/*
+ * ## 缺陷形状
+ *
+ * `tradingDesk.ts:1405` 原来是：
+ *
+ * ```ts
+ * if (affordable.length < analysisRoles.length) truncatedByBudget = true;
+ * ```
+ *
+ * 它把「**派得比满编少**」直接等同于「**预算截断**」—— 而 `dispatch.ts:66`
+ * 早就有现成的三态 `decidedBy: 'supervisor' | 'fallback_all' | 'budget'`。
+ *
+ * 而"派得少"至少有**三个互不相同**的原因：
+ *
+ *   1. **总管按行情主动少派**（`supervisor`）—— 那是**判断**，不是受限；
+ *   2. **没有新闻材料**（`dispatch.ts:96` 的硬边界）—— 那是**防编造**的刻意行为；
+ *   3. **调用预算不够**（`budget`）—— 这才是真正的"受限"。
+ *
+ * 三者被压进同一个标记，而它对操作员说的话是
+ *「本轮因预算提前收尾 —— 结论是在受限条件下得出的」——
+ * **只在第 3 种情况下成立**。
+ *
+ * ## 为什么这不只是措辞问题
+ *
+ * `deskOutput.ts:2177` 自己算过这笔账：**「一个总在响的告警等于没有告警。」**
+ * 而这条判据的触发条件是"总管按行情少派" —— 那**每轮都可能发生**。
+ * 于是"因预算收尾"会长期亮着，而真正因预算受限的那一次就淹没在噪音里。
+ * **假告警的真实代价是掩盖真告警。**
+ */
+test('★★★ 总管主动少派不该被记成"预算截断" —— 那会让真告警淹没在噪音里', async () => {
+  /*
+   * 造一个"总管只派 2 个"的 ask 桩：`supervisor` 角色返回一份派活决定，
+   * 其余角色正常产出。
+   *
+   * 派活决定的格式见 `parseDispatch`（`dispatch.ts`）——它认 JSON 里的
+   * 角色名列表。这里给出两个真实的分析角色名，并**故意不给全**。
+   */
+  const log: string[] = [];
+  const ask: AskRole = async ({ role }) => {
+    log.push(role);
+    if (role === 'supervisor') {
+      /*
+       * ⚠️ **必须用 `DISPATCH: a, b` 这个格式** —— `parseDispatch`
+       *（`dispatch.ts:221`）只认 `DISPATCH[:：]` 前缀。第一版我返回了 JSON，
+       * 于是它解析成 `null` → 退回全派 → 这个用例**测不到任何东西**
+       *（我实测过：`analyses` 仍是 4 个，旧实现下这条断言照样通过）。
+       *
+       * 这个坑值得记：**"总管桩没生效"与"总管没少派"在断言上看起来一样**。
+       */
+      return {
+        role,
+        modelId: 'stub/supervisor',
+        data: {},
+        raw: 'DISPATCH: market_analyst, technical',
+        latencyMs: 1,
+        ok: true,
+      } satisfies DeskRoleOutput;
+    }
+    return {
+      role,
+      modelId: `stub/${role}`,
+      data: { role },
+      raw: `${role} 的产出`,
+      latencyMs: 1,
+      ok: true,
+    } satisfies DeskRoleOutput;
+  };
+
+  const out = await runTradingDesk({
+    ask,
+    ...CTX,
+    /*
+     * ⚠️ 必须给**有余量**的预算 —— 默认 `DESK_LIMITS.maxCalls = 9` 是"刚好够"
+     *（1 总管 + 4 分析师 + 2 辩论 + 1 裁决 + 1 汇报），用它测不出"主动少派"：
+     * 那时 `planDispatch` 的 `budget` 参数会把少派归因成预算。
+     *
+     * 给 14 次之后，"少派"只可能来自总管的选择。
+     */
+    limits: { maxCalls: 14, maxDebateRounds: 1 },
+  });
+
+  /*
+   * ⚠️ **先确认总管真的少派了** —— 否则这条用例会"看起来通过"而什么都没测。
+   *
+   * 我第一版就踩了这个坑：桩返回了 JSON，而 `parseDispatch` 只认 `DISPATCH:`
+   * 前缀 → 解析成 null → 退回全派（4 个分析师）→ 旧实现下断言照样通过。
+   * **"桩没生效"与"总管没少派"在断言上长得一样**，所以必须显式钉住这个前提。
+   */
+  assert.equal(
+    out.analyses.length,
+    2,
+    `★ 这个场景的前提是"总管只派 2 个"（实际 ${out.analyses.length} 个：` +
+      `${out.analyses.map((a) => a.role).join('、')}）—— ` +
+      '若不是 2，说明总管桩没生效，这条用例测不到任何东西',
+  );
+
+  /*
+   * 关键断言：预算**绰绰有余**时，总管少派不该被记成"因预算收尾"。
+   */
+  assert.ok(
+    out.callsUsed < 14,
+    `★ 这个场景的预算必须有余量（实际用了 ${out.callsUsed}/14）—— ` +
+      '否则这条用例测的就不是"主动少派"了',
+  );
+  assert.equal(
+    out.truncatedByBudget,
+    false,
+    '★★★ 总管按行情主动少派**不是**预算截断 —— 记成截断会让「本轮因预算提前收尾」' +
+      '这句告警每轮都亮，而真正因预算受限的那一次就淹没了（issue #156）。\n' +
+      '    判据应当看 `plan.decidedBy === \'budget\'`，而不是"派得比满编少"。',
+  );
+});
+
+test('★★ 真正的预算不足仍然要标记 —— 修 #156 不能把真告警一起关掉', async () => {
+  /*
+   * 反向守卫：把判据收窄时，最容易犯的错是**顺手把真正因预算截断的情形也漏掉**。
+   *
+   * ## ⚠️ 我在写这条时核实出的一个事实（很重要）
+   *
+   * `dispatch.ts:66` 的类型声明是
+   * `decidedBy: 'supervisor' | 'fallback_all' | 'budget'` ——
+   * 但**代码从不返回 `'budget'`**（实测四种输入，只出现 `fallback_all` 与 `supervisor`）。
+   *
+   * 也就是说 `'budget'` 是**死值**。所以 #156 的修复**不能**用
+   * `plan.decidedBy === 'budget'` 当判据 —— 那会让 `truncatedByBudget`
+   * **永远不被这条路径置位**（把真告警一起关掉，正是这条反向守卫要防的）。
+   *
+   * 预算不足的真实信号在 `plan.skipped` 里：`reason === '调用预算不足'`
+   *（`dispatch.ts:83`）。所以判据取它。
+   */
+  const tight = planDispatch({
+    candidates: [{ role: 'a' }, { role: 'b' }, { role: 'c' }, { role: 'd' }] as never,
+    budget: 2, // ← 只有 2 个位置，4 个候选 → 2 个因预算被砍
+    hasNews: true,
+    requested: null,
+  });
+
+  assert.ok(
+    tight.skipped.some((s) => s.reason === '调用预算不足'),
+    '★★ 预算不足时 `skipped` 必须带"调用预算不足"这条理由 —— ' +
+      '这是 `truncatedByBudget` 修复后的判据，它必须真的会出现',
+  );
+  assert.equal(tight.roles.length, 2, '★ 只派得起 2 个');
+
+  /*
+   * 对照①：预算够 + 总管少派 → **不该**有"调用预算不足"。
+   * 这正是 #156 报的那个场景（总管按行情少派被误记成预算截断）。
+   */
+  const supervisorCut = planDispatch({
+    candidates: [{ role: 'a' }, { role: 'b' }, { role: 'c' }, { role: 'd' }] as never,
+    budget: 10, // ← 预算绰绰有余
+    hasNews: true,
+    requested: ['a', 'b'], // ← 总管主动只要这两个
+  });
+  assert.equal(
+    supervisorCut.skipped.some((s) => s.reason === '调用预算不足'),
+    false,
+    '★★ 预算充足时总管少派**不能**出现"调用预算不足" —— 否则判据又把两种原因混在一起了',
+  );
+  assert.ok(
+    supervisorCut.skipped.some((s) => s.reason === '总管认为本轮不需要'),
+    '★ 总管少派应当带它自己的理由',
+  );
+
+  /*
+   * 对照②：没有新闻材料被砍 → 理由是"防编造"，**不是**预算。
+   */
+  const noNews = planDispatch({
+    candidates: [{ role: 'a' }, { role: 'news', needsNews: true }] as never,
+    budget: 10,
+    hasNews: false,
+    requested: null,
+  });
+  assert.equal(
+    noNews.skipped.some((s) => s.reason === '调用预算不足'),
+    false,
+    '★★ "没有新闻材料"是防编造的刻意行为，**不是**预算受限 —— 两者不能混',
+  );
+  assert.ok(
+    noNews.skipped.some((s) => s.reason.includes('新闻')),
+    '★ 它应当带自己的理由',
+  );
 });
 
 test('★★★ 角色超过档位超时 → 标记失败而不是拖死整轮', () => {

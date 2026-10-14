@@ -73,6 +73,24 @@ export interface DispatchResult {
  * 理由：角色的先后会影响提示词里的呈现顺序，而"总管换了个顺序"
  * 会让我**分不清"是派活变了还是措辞变了"**。它决定的是**派谁**，不是排序。
  */
+/**
+ * 「这个角色被砍是因为**调用预算不足**」—— `skipped` 里的理由字面量。
+ *
+ * ## 为什么导出成常量（外部 issue #156）
+ *
+ * 这个字符串是**判断"本轮是否真的因预算受限"的唯一可靠信号** ——
+ * 见 `tradingDesk.ts` 里 `truncatedByBudget` 的判据说明：
+ *
+ * ⚠️ `decidedBy` 那个字段的类型里有 `'budget'`，但**代码从不返回它**
+ *（实测四种输入只出现 `fallback_all` 与 `supervisor`）—— 那是个死值，
+ * 拿它当判据会让 `truncatedByBudget` 永远不置位。
+ *
+ * 所以判据只能落在 `skipped` 的 `reason` 上。导出成常量是为了让
+ * "产生它的地方"与"消费它的地方"共用一份字面量 —— 否则改一处、漏一处
+ * 就会静默失效（本仓库反复吃过这个亏）。
+ */
+export const BUDGET_SKIP_REASON = '调用预算不足';
+
 export function planDispatch(input: DispatchInput): DispatchResult {
   const skipped: Array<{ role: string; reason: string }> = [];
 
@@ -80,7 +98,7 @@ export function planDispatch(input: DispatchInput): DispatchResult {
   const budget = Math.max(0, input.budget);
   const affordable = input.candidates.slice(0, budget);
   for (const c of input.candidates.slice(budget)) {
-    skipped.push({ role: c.role, reason: '调用预算不足' });
+    skipped.push({ role: c.role, reason: BUDGET_SKIP_REASON });
   }
 
   /*

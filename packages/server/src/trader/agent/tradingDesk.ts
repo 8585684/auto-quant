@@ -46,6 +46,7 @@ import { enterCritical, leaveCritical } from './resourceGate.js';
 import { compactMarketContext } from './symbolSlices.js';
 import { pickForAnalysis } from './analystSampling.js';
 import {
+  BUDGET_SKIP_REASON,
   buildSupervisorPrompt,
   parseDispatch,
   planDispatch,
@@ -1402,7 +1403,36 @@ async function runTradingDeskInner(input: {
 
   /* 总管已经决定了派谁（见上面的 `plan`）—— 这里只做"按计划过滤"。 */
   const affordable = analysisRoles.filter((r) => plan.roles.includes(r.role));
-  if (affordable.length < analysisRoles.length) truncatedByBudget = true;
+  /*
+   * ⚠️ **只有"预算不足"才是 `truncatedByBudget`**（外部 issue #156）。
+   *
+   * 原来这一行是 `if (affordable.length < analysisRoles.length) truncatedByBudget = true;`
+   * —— 把「**派得比满编少**」直接等同于「**预算截断**」。而"派得少"至少有
+   * **三个互不相同**的原因：
+   *
+   *   1. **总管按行情主动少派**（`dispatch.ts:115` 的 `'总管认为本轮不需要'`）
+   *      —— 那是**判断**，不是受限；
+   *   2. **没有新闻材料**（`dispatch.ts:96` 的硬边界）—— 那是**防编造**的刻意行为；
+   *   3. **调用预算不够**（`BUDGET_SKIP_REASON`）—— 这才是真正的"受限"。
+   *
+   * 三者被压进同一个标记，而它对操作员说的话是
+   *「本轮因预算/轮次上限提前收尾 —— 结论是在受限条件下得出的」——
+   * **只在第 3 种情况下成立**。
+   *
+   * 而 `deskOutput.ts:2177` 自己算过这笔账：**「一个总在响的告警等于没有告警。」**
+   * 触发条件是"总管按行情少派" —— 那**每轮都可能发生**。于是这条告警会长期亮着，
+   * 而真正因预算受限的那一次就淹没在噪音里。**假告警的真实代价是掩盖真告警。**
+   *
+   * ## ⚠️ 判据为什么不能是 `plan.decidedBy === 'budget'`
+   *
+   * 因为那是**死值**：`dispatch.ts:66` 的类型里有 `'budget'`，但代码从不返回它
+   *（实测四种输入只出现 `fallback_all` 与 `supervisor`）。
+   * 拿它当判据会让 `truncatedByBudget` **永远不置位** —— 等于把真告警一起关掉。
+   *
+   * 可靠信号只有 `plan.skipped` 里的理由，所以用导出的 `BUDGET_SKIP_REASON`
+   *（两处共用一份字面量，避免改一处漏一处）。
+   */
+  if (plan.skipped.some((s) => s.reason === BUDGET_SKIP_REASON)) truncatedByBudget = true;
 
   callsUsed += affordable.length;
   /*
