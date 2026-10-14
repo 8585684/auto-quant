@@ -1906,3 +1906,83 @@ npm run check:routes→ 0
 npm run sim         → 18/18
 Docker 镜像 (v0.1.6)→ success
 ```
+
+---
+
+## 20. 第 14 轮：v0.1.7 发版 + #157（zustand 原地改）
+
+### 一、#157 —— `cycle_step` 原地改 `liveCycle`（`01f13e2`）
+
+```ts
+store.ts:513   const next = { ...current };                      // 浅拷贝
+store.ts:548   next.liveCycle.steps = [...next.liveCycle.steps, …];   // 原地改
+store.ts:650   useEvents((s) => s.byTrader[traderId]?.liveCycle)      // 选择器返回它
+```
+
+引用不变 → `Object.is` 相等 → **不通知订阅者**。
+
+**对照**：同一个 `applyEvent` 里的 `case 'cycle_start'`（`:534`）用的是
+`next.liveCycle = { … }` —— **替换引用**。两种写法并存，是它容易被漏掉的原因。
+
+### 二、issue 作者自己指出"影响被高估"，我复核成立
+
+`TraderPage` 订阅的是整个 `byTrader[traderId]`（每次都被替换），所以步骤**照样刷新** ——
+**当前看不到故障**。所以按**潜伏缺陷**处理，但仍修：
+
+1. 一旦给 `DecisionFeed` 加 `memo`、或改成只订阅 `useLiveCycle`（都是正常重构）→ 立刻爆发；
+2. **而且它已经在破坏不变量**（见下）。
+
+### 三、把"更本质的代价"做成独立用例
+
+作者提到「它已破坏"历史快照不可变"这条不变量」—— 我认为这比"选择器失明"更本质，
+所以单独写了一条：
+
+```ts
+const snapshot = useStore.getState().byTrader[id].liveCycle;
+step(id, 200, '后来的一步');
+assert.equal(snapshot.steps.length, stepsAtSnapshot, '改动前的快照不能被追溯改写');
+```
+
+**原地改会让改动前拿到的引用也看到新数据** —— 任何依赖"我拿到的是那一刻的状态"
+的代码（`useMemo` 依赖比较、将来的 diff/undo）都会拿到错的东西。
+
+### 四、两处我自己在写测试时的修正（值得记）
+
+**① zustand 的 `subscribe(listener)` 不替你做选择器过滤。**
+第一版断言精确序列 `[1, 2]`，实际收到 `[0, 1, 1, 2]` ——
+因为它在**每次 `set`** 时都调用 listener。那**不是缺陷**，是我的断言过严。
+改成"每个新步骤数都要在序列里出现过"。
+
+**② 一条在旧实现下也不会失败的用例要说明清楚。**
+第 3 条（订阅通知）同样因为 `subscribe` 不过滤，在旧实现下**也通过** ——
+真正的防护来自第 1、2 条。我在测试注释里写明了这一点，
+**免得将来有人以为第 3 条能抓住这个缺陷**。
+
+这与第 12 轮那条"一个修复前也通过的测试必须先证明它在错误实现下会红"是同一条纪律的
+两个方向：**要么让它会红，要么明确说明它不会红、防护在哪**。
+
+### 五、发版 v0.1.7
+
+```
+① main 全绿      typecheck / test(47+1476+196) / build / lint /
+                check:links / check:routes / sim 18/18 → 全 0
+② notices 一致   183 依赖全宽松许可，git diff 空
+③ tag v0.1.7     Docker 镜像构建 success
+④ 发布 release   isDraft=false
+```
+
+**未触及下单路径**（只改 `web/src/lib/store.ts`）—— 所以 §4 的实盘冒烟本项不适用，
+已在发布说明里按判据写明。
+
+### 六、本轮验证
+
+```
+npm run typecheck   → 0
+npm test            → 47 + 1476 + 196，0 fail
+npm run build       → 0
+npm run lint        → 0
+npm run check:links → 0
+npm run check:routes→ 0
+npm run sim         → 18/18
+Docker 镜像 (v0.1.7)→ success
+```
