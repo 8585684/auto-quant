@@ -78,3 +78,81 @@ test('★ 空输入 → 空输出（不起工人）', async () => {
   const out = await mapConcurrent([], 4, async () => 1);
   assert.deepEqual(out, []);
 });
+
+/* -------------------------------------------------------------------------- */
+/*  NaN 的 limit 不能被静默吞掉（外部 issue #154）                              */
+/* -------------------------------------------------------------------------- */
+
+/*
+ * ## 缺陷链
+ *
+ * `tradingDesk.ts:1431` 读环境变量时**没有 NaN 兜底**（同文件 `:1219` 与
+ * `manager.ts:842/864` 都有）：
+ *
+ * ```ts
+ * const concurrency = Number(process.env.AQ_ANALYST_CONCURRENCY ?? 4);
+ * ```
+ *
+ * `AQ_ANALYST_CONCURRENCY=abc` → `NaN` → 传进这里：
+ *
+ * ```
+ * Math.max(1, Math.floor(NaN)) = NaN        ← NaN 传染，钳制失效
+ * Array.from({length: Math.min(NaN, n)}) → 0 个工人
+ * new Array(items.length) → 稀疏数组（洞，不是 null）
+ * ```
+ *
+ * 于是下游 `for (const a of outcome.analyses)` 对稀疏数组产出 `undefined`，
+ * `deskOutput.ts:275` 解引用 `.role` 抛 `TypeError` —— 而那个异常冒到
+ * `runCycle` 的 catch，**每一轮都失败**，最终进 `safe_mode`。
+ *
+ * ## 为什么这条用例放在 `pool.test.ts` 而不是只修调用方
+ *
+ * `mapConcurrent` 是**公用件**。"NaN 静默产出空数组"对**任何**调用方都是陷阱，
+ * 所以公用件自己不该被 NaN 击穿 —— 按 `docs/AGENTS.md` §4.5
+ * 「不要把校验加在错误的层」的正面应用：**两层都修**。
+ *
+ * ⚠️ 既有用例 `limit < 1 抬到 1` 覆盖了 `0`，但**没有覆盖 NaN** ——
+ * 而 `Math.max(1, NaN)` 是 `NaN`（不是 1），所以那个"抬到 1"的保证
+ * 在 NaN 上**失效**。这正是它长期潜伏的原因。
+ */
+test('★★★ limit 是 NaN 时不能产出空数组 —— 必须兜底成一个能跑的值', async () => {
+  const results = await mapConcurrent([1, 2, 3, 4], Number.NaN, async (n) => n * 2);
+
+  assert.equal(results.length, 4, '★ 结果长度必须等于输入长度');
+  assert.ok(
+    results.every((r) => r.ok),
+    '★★★ NaN 的 limit 不能导致"一个任务都没跑" —— 那会让下游拿到 undefined 并崩溃（issue #154）',
+  );
+  /* 真的跑了，而不只是"长度对、内容空"。稀疏数组在这里会暴露成 undefined。 */
+  assert.deepEqual(
+    results.map((r) => (r.ok ? r.value : null)),
+    [2, 4, 6, 8],
+    '★ 每个元素都要真的被处理过 —— 稀疏数组会在这里显示成 [null,null,null,null]',
+  );
+});
+
+test('★★ Infinity 的 limit 是"不限并发"，不是 NaN —— 要能正常跑完', async () => {
+  const results = await mapConcurrent([1, 2, 3], Number.POSITIVE_INFINITY, async (n) => n);
+  assert.equal(results.length, 3);
+  assert.ok(results.every((r) => r.ok), '★ Infinity 应当正常跑完（它是合法的"不限"）');
+});
+
+test('★★ NaN 兜底之后并发上限仍然生效 —— 修 NaN 不能把限流一起放宽', async () => {
+  /*
+   * 反向守卫：兜底值不能是 Infinity（那会让"不限并发"变成默认行为）。
+   * 这里只验证"兜底成一个有限值" —— 具体是几不重要，重要的是**有限**。
+   */
+  let running = 0;
+  let peak = 0;
+  await mapConcurrent(Array.from({ length: 20 }, (_, i) => i), Number.NaN, async () => {
+    running += 1;
+    peak = Math.max(peak, running);
+    await sleep(5);
+    running -= 1;
+    return 0;
+  });
+  assert.ok(
+    Number.isFinite(peak) && peak < 20,
+    `★★ NaN 兜底后仍必须限流（实测峰值 ${peak}）—— 兜底成 Infinity 等于关掉并发上限`,
+  );
+});

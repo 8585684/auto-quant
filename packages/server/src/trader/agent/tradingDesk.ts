@@ -1428,7 +1428,27 @@ async function runTradingDeskInner(input: {
    * `mapConcurrent` 保证"结果与输入同序"（否则 `analyses[i]` 会对错角色），
    * 且单个失败只标记它自己（`safeAsk` 本来就不抛）。
    */
-  const concurrency = Number(process.env.AQ_ANALYST_CONCURRENCY ?? 4);
+  /*
+   * ⚠️ **必须挡住非数字**（外部 issue #154）。
+   *
+   * 原来是 `Number(process.env.AQ_ANALYST_CONCURRENCY ?? 4)` —— `??` 只挡
+   * `undefined`，挡不住"填了一个非数字"：`AQ_ANALYST_CONCURRENCY=abc` → `NaN`。
+   *
+   * 而 NaN 会一路传到 `mapConcurrent`，在那里让"钳制"失效
+   *（`Math.max(1, NaN)` 仍是 NaN）→ **0 个工人** → 稀疏数组 →
+   * `deskOutput.ts:275` 的 `for (const a of outcome.analyses)` 解引用 `undefined.role`
+   * 抛 `TypeError` → 冒到 `runCycle` 的 catch → **每一轮都失败** → 进 `safe_mode`。
+   *
+   * 对比同文件 `:1219` 的 `Number(... ?? '') || 6` 与 `manager.ts:842/864` 的
+   * `Number.isFinite` 守卫 —— 这里原来是**唯一的例外**。
+   *
+   * 两层都修：`mapConcurrent` 自己也挡住了 NaN（它是公用件），
+   * 而这里给出**语义正确的默认值**（分析师并发 4），而不是让它降级成串行 1。
+   */
+  const requestedConcurrency = Number(process.env.AQ_ANALYST_CONCURRENCY);
+  const concurrency = Number.isFinite(requestedConcurrency) && requestedConcurrency >= 1
+    ? Math.floor(requestedConcurrency)
+    : 4;
   const analysisResults = await mapConcurrent(affordable, concurrency, async (a) => {
     /*
      * ⚠️ **必须走 `safeAsk`**（2026-10-12 实测踩到）。
