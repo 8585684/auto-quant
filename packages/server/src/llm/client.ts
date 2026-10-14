@@ -201,6 +201,24 @@ export class LlmClient {
   private reasoningEffort: 'low' | 'medium' | 'high' | undefined;
   /** Never logged in full; kept only so an operator can tell which key is live. */
   private readonly keyHint: string;
+  /**
+   * 上一次**回显**的具体模型名（provider 实际服务的那个）。
+   *
+   * ## 为什么需要记住它（外部 issue #178）
+   *
+   * 服务商回显的模型名与请求的不一致**是预期情况**（OpenRouter 别名、
+   * xAI `latest`）—— 见下面那条日志的注释。而它原来用 `info` 级别
+   * **每次成功调用都打一行**：线上实测最近 300 行日志里 **93 行（31%）是同一句**，
+   * 把「数据与日志」页里真正要看的决策/平仓/错误挤掉了 31% 的版面 ——
+   * 而那一页正是这个项目的排障入口。
+   *
+   * 降级成 `debug` 能止住刷屏，但会**连信号一起丢掉**：
+   * 真出现"服务商换了模型"时默认视图什么都看不到。
+   *
+   * 所以这里记住上一次的值，**只在它变化时打一行** ——
+   * 同一件事重复 93 遍没有信息量，而"从 A 变成 B"有。
+   */
+  private lastServedModel: string | undefined;
 
   constructor(options: LlmClientOptions) {
     this.descriptor = getProvider(options.provider);
@@ -699,14 +717,32 @@ export class LlmClient {
       });
     }
 
-    // The concrete model the provider actually served. This differs from the
-    // configured id on OpenRouter aliases and xAI `latest`, so it is logged.
-    if (parsed.model && parsed.model !== this.model) {
+    /*
+     * The concrete model the provider actually served. This differs from the
+     * configured id on OpenRouter aliases and xAI `latest`, so it is logged.
+     *
+     * ⚠️ **只在它变化时打一次**（外部 issue #178）。
+     *
+     * 这个条件在别名 / `latest` 场景下**每次成功调用都成立**，所以原来
+     * 用 `info` 级别打的话就是每次一行 —— 线上实测最近 300 行里 93 行（31%）
+     * 是同一句，把排障页真正要看的决策/平仓/错误挤掉了近三分之一版面。
+     *
+     * 而它**不是无用信息**（"服务商真的换了模型"值得知道），所以不能简单删掉
+     * 或降到 `debug`（那会让默认视图连信号一起丢）。正确的形态是**去重**：
+     * 记住上一次的值，只在**变化**时打 —— 重复 93 遍没有信息量，"A → B"有。
+     *
+     * 首次出现仍然打一行（`lastServedModel` 初值为 `undefined`），
+     * 这样"这台机器一直在用哪个具体模型"这件事在日志里始终有据可查。
+     */
+    if (parsed.model && parsed.model !== this.model && parsed.model !== this.lastServedModel) {
       log.info(`${this.provider} 回显的模型名与请求的不一致`, {
         requested: this.model,
         served: parsed.model,
+        previous: this.lastServedModel ?? null,
       });
     }
+    /* 无论是否打日志都要记住 —— 否则"变化"永远检测不出来。 */
+    if (parsed.model) this.lastServedModel = parsed.model;
 
     return {
       text: parsed.text,
