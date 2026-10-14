@@ -3676,8 +3676,30 @@ export class TraderManager {
      *
      * `stopped` is still excluded: that status is an operator decision, and
      * starting it would be this code overriding a human.
+     *
+     * ## ⚠️ `starting` 也必须恢复（外部 issue #147）
+     *
+     * `starting` **会落库** —— `attemptStart()` 在真正起交易循环之前先
+     * `setTraderStatus(traderId, 'starting', null)`（`:3095`，同步写库），
+     * 而那之后还要建连接、校时、拉 exchangeInfo、探测模型（**几秒到几十秒**）。
+     *
+     * 进程若恰好死在那个窗口里（部署重启、OOM、断电）：
+     *
+     *   · `stopAll()` 只遍历 `this.running`，而这一台**还没进去** → DB 留成 `starting`；
+     *   · 看门狗是**内存定时器**，进程一死就没了；
+     *   · 本集合不认 `starting` → 不恢复；
+     *   · `api/server.ts` 把非 running 的状态覆写成 `'stopped'` → 界面显示**「已停止」**；
+     *   · `failedTraders()` 只收 `error` → 不告警。
+     *
+     * 于是它**既不恢复、也不告警**，而界面上那个"已停止"看起来
+     * **就像有人手动停的** —— 没人会去查它为什么停。
+     *
+     * 加它**不会覆盖任何人的决定**：`starting` 只可能因进程死亡而残留 ——
+     * 只要进程活着，看门狗必把它推到 `running` 或 `error`
+     *（`startTraderAsync` 的 `.then` / `.catch` 两条路径都写状态）。
+     * 这与 `stopped`（人的决定）有本质区别，所以不能一起放宽。
      */
-    const resumable = new Set(['running', 'safe_mode', 'error']);
+    const resumable = new Set(['running', 'safe_mode', 'error', 'starting']);
 
     /*
      * 全局熔断期间**不恢复任何机器人**，而且不要把它们标成 `error` ——

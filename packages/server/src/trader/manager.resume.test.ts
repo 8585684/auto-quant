@@ -219,3 +219,110 @@ test('★ 真正的启动失败（非取消）仍要落 error —— 修复不�
     '真正的失败必须落 error（否则状态停在 starting，操作员看不见也重试不了）',
   );
 });
+
+/* -------------------------------------------------------------------------- */
+/*  持久态停在 starting 的机器人必须被恢复                                        */
+/* -------------------------------------------------------------------------- */
+
+/*
+ * ## 缺陷形状（外部 issue #147）
+ *
+ * `resumePersisted()` 的可恢复集合原来是 `{running, safe_mode, error}` ——
+ * **漏了 `starting`**。
+ *
+ * 而 `starting` 是**会落库**的：`attemptStart()` 在真正启动交易循环之前
+ * 先 `setTraderStatus(traderId, 'starting', null)`（`manager.ts:3095`，同步写库），
+ * 而那之后还要建连接、校时、拉 exchangeInfo、探测模型 —— **几秒到几十秒**。
+ *
+ * 如果进程恰好死在那个窗口里（部署重启、OOM、断电）：
+ *
+ *   · `stopAll()` 只遍历 `this.running`，而这一台**还没进去** —— DB 状态原样留成 `starting`；
+ *   · 看门狗是**内存定时器**，进程一死就没了；
+ *   · `resumePersisted()` 不认 `starting` → 不恢复；
+ *   · `api/server.ts` 会把非 running 的状态覆写成 `'stopped'` → 界面显示**「已停止」**；
+ *   · `failedTraders()` 只收 `error` → 不告警。
+ *
+ * 于是这台机器人**既不恢复、也不告警**，而界面上那个"已停止"看起来
+ * **就像有人手动停的** —— 没有人会去查它为什么停。这正是仓库记过的那类事故
+ *（`autoTrader.ts:1503-1519`：一次部署静默停掉了正在跑的机器人）。
+ *
+ * ## 为什么可以安全地加进去
+ *
+ * `starting` **只可能因进程死亡而残留**：只要进程活着，看门狗一定会把它推到
+ * `running` 或 `error`（`startTraderAsync` 的 `.then` / `.catch` 两条路径都写状态）。
+ * 所以"恢复它"不会覆盖任何人的决定 —— 与 `stopped`（人停的）不同。
+ */
+test('★★★ 持久态停在 starting 的机器人必须被开机恢复 —— 否则它永久隐身', async () => {
+  const id = seedTrader('stuck-starting');
+  /*
+   * 模拟"进程死在 starting 窗口"留下的持久态。
+   * 注意：这不是构造出来的假象 —— `attemptStart()` 真的会写这个状态（`:3095`）。
+   */
+  traders.setStatus(id, 'starting', null);
+
+  const manager = new TraderManager(new Vault(Buffer.alloc(32, 7)));
+  const attempted: number[] = [];
+  manager.startTrader = (async (traderId: number) => {
+    attempted.push(traderId);
+    return { ok: true, preflight: [] };
+  }) as unknown as TraderManager['startTrader'];
+
+  await manager.resumePersisted(false);
+
+  assert.deepEqual(
+    attempted,
+    [id],
+    '★★★ `starting` 必须被恢复 —— 它只可能因进程死亡残留（看门狗在进程活着时必把它推到 running/error），' +
+      '所以恢复它不会覆盖任何人的决定。漏了它 = 这台机器人既不恢复也不告警，' +
+      '而界面显示「已停止」，看起来像有人手动停的（issue #147）',
+  );
+});
+
+test('★★ 恢复集合必须仍然排除 stopped —— 那是人的决定，加 starting 不能顺带把它放进来', async () => {
+  /*
+   * 反向守卫：修 issue #147 时最容易犯的错是"干脆把集合放宽"。
+   * `stopped` 是人做的决定，开机不得越过 —— 这条把它钉住。
+   */
+  const id = seedTrader('operator-stopped');
+  traders.setStatus(id, 'stopped', null);
+
+  const manager = new TraderManager(new Vault(Buffer.alloc(32, 7)));
+  const attempted: number[] = [];
+  manager.startTrader = (async (traderId: number) => {
+    attempted.push(traderId);
+    return { ok: true, preflight: [] };
+  }) as unknown as TraderManager['startTrader'];
+
+  await manager.resumePersisted(false);
+
+  assert.deepEqual(attempted, [], '★★ `stopped` 是人做的决定，开机不该把它翻过来');
+});
+
+test('★★ 四类该恢复的持久态都要被恢复 —— 逐一钉住，防下次再漏一个', async () => {
+  /*
+   * `running` / `safe_mode` / `error` / `starting` 四个都要恢复。
+   * 分成四个独立 trader 一次断言，这样将来漏掉任何一个都会精确报出是哪个。
+   */
+  const ids = {
+    running: seedTrader('resume-running'),
+    safe_mode: seedTrader('resume-safe-mode'),
+    error: seedTrader('resume-error'),
+    starting: seedTrader('resume-starting'),
+  };
+  for (const [status, id] of Object.entries(ids)) {
+    traders.setStatus(id, status as 'running' | 'safe_mode' | 'error' | 'starting', null);
+  }
+
+  const manager = new TraderManager(new Vault(Buffer.alloc(32, 7)));
+  const attempted = new Set<number>();
+  manager.startTrader = (async (traderId: number) => {
+    attempted.add(traderId);
+    return { ok: true, preflight: [] };
+  }) as unknown as TraderManager['startTrader'];
+
+  await manager.resumePersisted(false);
+
+  for (const [status, id] of Object.entries(ids)) {
+    assert.ok(attempted.has(id), `★★ 持久态 ${status} 的机器人必须被恢复`);
+  }
+});
