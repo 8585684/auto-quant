@@ -1646,3 +1646,94 @@ npm run check:routes→ 0
 npm run sim         → 18/18
 Docker 镜像 (v0.1.3)→ success
 ```
+
+---
+
+## 17. 第 11 轮：v0.1.4 发版 + 3 个 issue（全部"判据被两种语义共用"族）
+
+本轮修的三个 issue **根因同源** —— 都是"**一个信号被两种含义共用，
+消费方只能选一种解释**"。这个模式在本仓库反复出现，值得单独记一笔。
+
+### 一、#148 —— 401 被"会话失效"与"口令填错"共用（`8a66592`）
+
+```
+auth.ts:169/174/178   需要登录 / 令牌过期 / 凭据变更 → 401   ← "会话结束了"
+server.ts:872         改密码时"当前密码不正确"       → 401   ← "这次口令填错了"
+```
+
+前端 `api.ts:229` 只按状态码判断 → **在设置页输错一次当前密码就被登出**。
+
+**修法采纳 issue 作者的方案②**（服务端加机器可读码 `invalid_current_password`），
+理由：方案①（前端 `skipUnauthorized` 选项）需要**每个**调用点记得带上 ——
+将来新增的会漏；方案②把判据放服务端，新增调用点自动正确。
+
+**判据抽成导出函数 `shouldSignOut(status, payload, anonymous)`** ——
+缺陷所在的那一行第一次可单测（web 侧无 jsdom/RTL，`request()` 依赖 fetch 测不了）。
+与 #168 抽 `shouldBackfill()`、#169 抽 `boundaryKeyFor()` 是同一个做法。
+
+### 二、#168 —— "缓冲区为空"被"首次加载"与"用户清空"共用（`5508c9e`）
+
+`DataPage.tsx:193` 用 `liveLogs.length === 0` 当**首次**回填的判据，
+而清空之后那个条件成立 → 同一批历史立刻灌回（轮询 8–30 秒一次，是**持续**灌回）。
+
+**修法需要两个标志而不是一个**：
+- `hydratedOnce` —— 否则每次轮询（`restLines` 是新数组引用）都会重灌；
+- `clearedByUser` —— 否则"用户想看空白"这个明确意图会被下一次轮询撤销。
+
+用 `useRef` 而非 `useState`（只需记住事实、不该触发重渲染）。
+
+### 三、#169 —— "有边界"只覆盖了决策卡片一条路径（`6035efd`）
+
+全仓只有一个错误边界且只用在 `DecisionFeed` 两处；
+`OverviewPage`/`TradersPage`/`MarketPage`/`TraderTables` 消费的**同样是模型输出
+解析而来的不可信数据**，却无兜底 → 一条坏记录白屏整页。
+
+**这是"记了账没还的债"**：`docs/archive/REPORT-TRIAGE-20260926.md:98` 已列在
+"已确认但仍未修"，`FeedErrorBoundary.tsx` 头部注释也记过一次真实白屏事故。
+
+**修法加在 `Lazy`（每个路由元素都经过的那一层）** —— 按页面逐个加，将来新增页面还会漏。
+两个设计点（这类修复最容易踩的坑）：
+1. **`key` 必须随路由变化** —— React 错误边界进入 error 后不会自己恢复，
+   没 key 会让一次崩溃**粘住整个会话**（切页看到的还是 fallback）；
+2. **用 `pathname` 而不是 `location.key`** —— 后者含同页查询串变化，
+   会让"在崩溃页点一个筛选"重置边界、于是又崩一次。
+
+### 四、发版 v0.1.4
+
+```
+① main 全绿      typecheck / test(47+1464+191) / build / lint /
+                check:links / check:routes / sim 18/18 → 全 0
+② notices 一致   183 依赖全宽松许可，git diff 空
+③ tag v0.1.4     Docker 镜像构建 success
+④ 发布 release   isDraft=false
+```
+
+⚠️ 本次改动**全部在控制台（`packages/web/`）与一个 API 响应字段**，
+未触及下单路径（`binance/` `risk/` `trader/` 均未改）—— 所以 §4 的实盘冒烟测试
+**按判据不适用**，已在发布说明里写明这一点（而不是笼统说"未执行"）。
+
+### 五、一个可复用的做法（本轮三次都用到了）
+
+**把缺陷所在的那一行抽成导出函数。** 本仓库 web 侧没有 jsdom/RTL
+（`test` 只跑 `.test.ts`，挂载不了组件），所以"渲染/请求层面的判据"测不了。
+抽出之后：
+- `shouldSignOut()` —— 该不该登出（#148）
+- `shouldBackfill()` —— 该不该回填（#168）
+- `boundaryKeyFor()` —— 边界的 key 怎么算（#169）
+
+三个都是**纯函数**，都能被单测钉住，且都带**反向守卫**
+（"会话失效仍要登出" / "首次加载仍要回填" / "不同路径 key 必须不同"）。
+这比"起一个半套桩去挂载组件"更接近被测对象，也更便宜。
+
+### 六、本轮验证
+
+```
+npm run typecheck   → 0
+npm test            → 47 + 1464 + 191，0 fail
+npm run build       → 0
+npm run lint        → 0
+npm run check:links → 0
+npm run check:routes→ 0
+npm run sim         → 18/18
+Docker 镜像 (v0.1.4)→ success
+```
