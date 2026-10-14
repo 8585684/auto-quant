@@ -18,6 +18,7 @@ import { useApp, useEvents, type LiveLogLine } from '../lib/store';
 import { useDocumentTitle, usePolled, useTicker } from '../lib/hooks';
 import { Badge, Button, CopyButton, ErrorNote, Panel, Spinner3, TextInput, cn } from '../components/ui';
 import { fmtClockOffsetMs, fmtInt, timeAgo, tradingEnvironmentLabel } from '../lib/format';
+import { shouldBackfill } from '../lib/logBackfill';
 
 type Level = 'all' | 'info' | 'warn' | 'error';
 
@@ -188,12 +189,39 @@ export function DataPage() {
     [restQuery.data],
   );
 
+  /*
+   * ⚠️ **回填必须是一次性的，且清空之后不得再回填**（外部 issue #168）。
+   *
+   * 原来的判据是 `liveLogs.length === 0` —— 而「清空」按钮把缓冲区清成 0 之后，
+   * 那个条件**成立**，于是 effect 立刻把同一批历史灌回（`restQuery` 每 8–30 秒
+   * 轮询一次，所以是**持续**灌回，不是闪一下）。
+   *
+   * 根因：用"缓冲区是否为空"当"是否需要**首次**回填"的判据 ——
+   * 而"用户主动清空"与"页面首次加载"在这个状态里长得一模一样。
+   *
+   * 修法：两个 `useRef` 标志（不触发重渲染），判据见 `lib/logBackfill.ts`：
+   *   · `hydratedOnce`  —— 回填过就不再重复（否则每次轮询都重灌）；
+   *   · `clearedByUser` —— 用户清空过就**闭嘴**（那是明确的意图，不是"重新加载"）。
+   *
+   * 要恢复请点「重新加载」按钮（下面工具栏里那个）或刷新页面。
+   */
+  const hydratedOnce = useRef(false);
+  const clearedByUser = useRef(false);
+
   // Backfill the pane from the persisted log table on first load.
   useEffect(() => {
-    if (source === 'socket' && restLines.length > 0 && liveLogs.length === 0) {
+    if (
+      shouldBackfill({
+        source,
+        restLineCount: restLines.length,
+        alreadyHydrated: hydratedOnce.current,
+        manuallyCleared: clearedByUser.current,
+      })
+    ) {
       hydrateLogs(restLines);
+      hydratedOnce.current = true;
     }
-  }, [restLines, liveLogs.length, hydrateLogs, source]);
+  }, [restLines, hydrateLogs, source]);
 
   const lines = source === 'socket' ? liveLogs : restLines;
 
@@ -413,7 +441,16 @@ export function DataPage() {
             </Button>
             <Button
               size="sm"
-              onClick={() => clearLogs()}
+              onClick={() => {
+                /*
+                 * ⚠️ **先立起"用户主动清空"的标志，再清缓冲区**（外部 issue #168）。
+                 *
+                 * 顺序无所谓（同一个事件循环内两件事都会发生），但**标志必须立** ——
+                 * 否则回填 effect 会立刻把同一批历史灌回，这个按钮等于没用。
+                 */
+                clearedByUser.current = true;
+                clearLogs();
+              }}
               disabled={source !== 'socket'}
               title={source === 'socket' ? '清空本页的推送缓冲' : '持久化日志来自服务端，不能在这里清空'}
             >
