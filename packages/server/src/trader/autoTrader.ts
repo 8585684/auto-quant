@@ -5210,12 +5210,32 @@ export class AutoTrader {
       const dead = (status: string | undefined): boolean =>
         status === 'CANCELED' || status === 'EXPIRED' || status === 'REJECTED';
 
-      if (fired(stopOrder?.algoStatus)) return 'stop_loss';
-      if (fired(tpOrder?.algoStatus)) return 'take_profit';
+      /*
+       * ⚠️ **`'not-found'` 不能当成任何一种终态**（2026-10-14）。
+       *
+       * `getAlgoOrder` 现在会返回 `'not-found'`（交易所明确说这张单不存在）。
+       * 在这里它意味着"那张单已经结束了，但**分不清是触发还是撤销**" ——
+       * 而 `fired` / `dead` 都会把它读成 `false`（因为它不是 `undefined` 里的任何一个
+       * 状态字符串），于是**自然落空**、继续走下面"用价位推断"的判据。
+       *
+       * 那正是这里想要的行为：**不拿一个分不清的答案去猜平仓原因**。
+       * 所以不需要额外的分支 —— 但必须**显式写下来**，否则下一个人会以为
+       * `'not-found'` 被漏处理了，然后给它加一个错误的映射。
+       */
+      /*
+       * ⚠️ **先把状态抽出来再判**（`getAlgoOrder` 现在可能返回 `'not-found'`）。
+       * 直接读 `stopOrder?.algoStatus` 会在类型层面失败 —— 那是好事：
+       * 它逼着我们把"读失败 / 不存在 / 有状态"三种情况分开处理。
+       */
+      const statusOf = (o: typeof stopOrder): string | undefined =>
+        o === null || o === 'not-found' ? undefined : o.algoStatus;
+
+      if (fired(statusOf(stopOrder))) return 'stop_loss';
+      if (fired(statusOf(tpOrder))) return 'take_profit';
 
       // Both cancelled: the position was closed some other way, so the levels
       // themselves are the tiebreaker.
-      if (dead(stopOrder?.algoStatus) && dead(tpOrder?.algoStatus)) {
+      if (dead(statusOf(stopOrder)) && dead(statusOf(tpOrder))) {
         const byPrice = this.reasonFromPrice(exitPrice, stopLoss, takeProfit);
         if (byPrice) return byPrice;
       }
@@ -7045,6 +7065,44 @@ etPnlOf —— 见它的注释（资金费的符号）。 */
 
     if (CONDITIONAL_ORDER_TYPES.has(row.type)) {
       const algo = await this.deps.broker.getAlgoOrder(Number(exchangeOrderId));
+      /*
+       * ══════════════════════════════════════════════════════════════════════
+       *  ⚠️ **交易所说"这张单不存在"是一个可判定的答案**（2026-10-14 修的死锁）
+       * ══════════════════════════════════════════════════════════════════════
+       *
+       * ## 死锁：查不到 → 不下结论 → 永远查不到
+       *
+       * 原来这里只有 `if (!algo) return null`，而 `null` 的含义是
+       * "这一轮不下结论"。那个取舍本身对（读不到时不该改账），但它有个死锁：
+       * ```
+       *   交易所真的查不到这张单（-2013 Order does not exist）
+       *   → getAlgoOrder 永远返回 null → 这里永远 return null
+       *   → 那些行【永远】停在 NEW
+       * ```
+       * 线上实测（`#11`）：**42 条**本地 `NEW` 条件单，逐个查都回
+       * `{"code":-2013,"msg":"Order does not exist."}` —— 而界面一直显示"已挂单"。
+       *
+       * ## 修法：把"不存在"翻译成一个明确的终态
+       *
+       * 交易所说它不存在，意思是**它已经结束了**（成交过、或被撤掉后过了保留期）。
+       * 而我们**无法**再分辨是哪一种 —— 所以写 `CANCELED`（币安语义里"带着剩余
+       * 数量离场"就是它），并且**不写成交数字**（`filledQty` / `avgPrice` 留空）。
+       *
+       * ⚠️ **安全边界不变**：
+       * ```
+       *   'not-found'（交易所明确说不存在）→ 写 CANCELED
+       *   null（网络 / 鉴权 / 限流）      → 仍然 return null，什么都不写
+       * ```
+       * 这两件事被混成一件正是这个 bug 的成因。
+       *
+       * ⚠️ 为什么敢写 `CANCELED` 而不是别的：这一行的仓位**早已平掉**
+       *（`settleStaleOrders` 只在"交易所挂单列表里没有它"时才走到这里），
+       * 所以它不可能还是"活着的保护单"。而写终态让界面不再骗人 ——
+       * 那正是 §2.2 的目的（"不删行，但状态不能停在 NEW"）。
+       */
+      if (algo === 'not-found') {
+        return { status: 'CANCELED' };
+      }
       if (!algo) return null;
       const status = ALGO_FINAL_ORDER_STATUS[algo.algoStatus];
       // `NEW` 会走到这里：它说"还挂着"，而挂单列表刚说"不在" —— 两次读之间的竞态，

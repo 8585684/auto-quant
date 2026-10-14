@@ -794,14 +794,48 @@ export class BinanceBroker {
    * their absence cannot distinguish them. The triggered order reports
    * `FINISHED` (or `TRIGGERED`); the other reports `CANCELED`/`EXPIRED`.
    */
-  async getAlgoOrder(algoId: string | number): Promise<BinanceAlgoOrderResponse | null> {
+  /**
+   * 查一张条件单（含**已经不在挂单列表里**的那些）。
+   *
+   * ## ⚠️ 2026-10-14：区分"读失败"与"交易所说它不存在"
+   *
+   * 原来这个方法的 `catch` 把**所有**错误都变成 `null` —— 而下游
+   *（`finalStatusOf`）把 `null` 读成"这一轮不下结论"，于是**静默跳过**。
+   *
+   * 那个取舍本身是对的（读不到时不该改账），但它有一个**死锁**：
+   * ```
+   *   交易所真的查不到这张单（-2013 Order does not exist）
+   *   → 永远返回 null → 永远跳过 → 那些行【永远】停在 NEW
+   * ```
+   * 线上实测（`#11`）：**42 条**本地 `NEW` 的条件单，逐个查都回
+   * `{"code":-2013,"msg":"Order does not exist."}` —— 而界面一直显示它们"已挂单"。
+   *
+   * ## 修法：把"交易所明确说它不存在"翻译成一个**可判定的答案**
+   *
+   * ```
+   *   -2013（Order does not exist）→ 返回 'not-found'
+   *   其它错误（网络 / 鉴权 / 限流）→ 返回 null（仍然"不下结论"）
+   * ```
+   * ⚠️ **安全边界不变**：只有交易所**自己说**这张单不存在时，我们才敢写终态。
+   * 网络抖动、鉴权失败仍然什么都不写 —— 那些"读不到"与"不存在"是两件事，
+   * 而把它们混成一件正是这个 bug 的成因。
+   */
+  async getAlgoOrder(algoId: string | number): Promise<BinanceAlgoOrderResponse | null | 'not-found'> {
     if (this.dryRun) return null;
     try {
       return await this.rest.signedRequest<BinanceAlgoOrderResponse>('GET', '/fapi/v1/algoOrder', {
         algoId,
       });
     } catch (error) {
-      log.debug(`getAlgoOrder(${algoId}) failed: ${(error as Error).message}`);
+      const message = (error as Error).message;
+      /*
+       * ⚠️ 判据用**错误码**（`-2013`），不用文案 —— 文案会随语言/版本变。
+       * 同时兼容 `Order does not exist` 这句（旧响应可能不带 code）。
+       */
+      if (/-2013\b/.test(message) || /Order does not exist/i.test(message)) {
+        return 'not-found';
+      }
+      log.debug(`getAlgoOrder(${algoId}) failed: ${message}`);
       return null;
     }
   }
