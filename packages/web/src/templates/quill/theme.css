@@ -633,7 +633,7 @@ html.aq-quill .btn-xs {
 /*
  * 纯图标的按钮 —— **保证一个方形的最小点击目标**。
  *
- * ## 判据踩过两次坑
+ * ## 判据踩过三次坑（前两次见下，第三次是外部 issue #183）
  *
  * **第一版** `:has(> svg:only-child)`：漏掉了"图标 + 文字"的按钮，却命中了
  * "图标 + 隐藏文字"的组合，于是把 40px 的内容压进 24px 的盒子 —— 真浏览器
@@ -643,26 +643,47 @@ html.aq-quill .btn-xs {
  * 但**纯文字按钮**同样满足（它没有元素子节点）—— 结果是所有按钮的左右
  * padding 被清零，`新建` 从 58px 缩到 30px。
  *
- * **现在**：必须**含**一个 svg，且**不含**任何非 svg 的元素子节点。
- * 文本节点不参与 `:has()`，所以三个分支都对。
+ * **第三版** `:has(> svg):not(:has(> :not(svg)))`：注释里写着
+ * 「文本节点不参与 `:has()`，所以三个分支都对」—— **那句话是错的，而且方向正好相反**：
+ * 正因为文本节点不参与 `:has()`，一个「`<svg/>` + 文字」的按钮**同时满足**两个条件：
+ *
+ * ```
+ *   :has(> svg)                ✅ 有 svg 元素子节点
+ *   :not(:has(> :not(svg)))    ✅ 没有"非 svg 的元素子节点"（文字不是元素）
+ * ```
+ *
+ * 于是「图标 + 文字」的按钮被当成纯图标：
+ *   · 所有带图标按钮的左右 padding 归零（启动 / 停止 / 立即分析 实测 `padding: 0px`）；
+ *   · **「停止」作为危险按钮变成透明描边**（最弱态）——
+ *     而 classic 模板下它是实心红。**最该醒目的危险动作反而最不醒目。**
+ *
+ * ## 现在：用**显式声明**，不再靠子节点形状反推
+ *
+ * `Button size="icon"` 是调用方对"这是一个纯图标按钮"的明确声明
+ *（9 处使用，都带 `aria-label`），它生成 `.btn-icon`。
+ * CSS 用它做判据 —— 与 `templates/registry.ts` 的 `supportedSkins`（issue #171）
+ * 是同一个思路：**需要判断的东西显式声明出来，而不是让消费方猜。**
+ *
+ * ⚠️ 不要再改回 `:has()` 形式：那条路已经走过三次，每次都因为
+ * "元素子节点"与"文本节点"的区别而漏掉一类按钮。
  */
-html.aq-quill .btn:has(> svg):not(:has(> :not(svg))) {
+html.aq-quill .btn-icon {
   padding-left: 0;
   padding-right: 0;
   justify-content: center;
   min-width: 30px;
 }
-html.aq-quill .btn-xs:has(> svg):not(:has(> :not(svg))) {
+html.aq-quill .btn-xs.btn-icon {
   min-width: 26px;
 }
 
 /* 纯图标的危险按钮 —— 静默态（判据同上）。 */
-html.aq-quill .btn-danger:has(> svg):not(:has(> :not(svg))) {
+html.aq-quill .btn-danger.btn-icon {
   background-color: transparent;
   color: var(--aq-down);
   border-color: var(--aq-base-700);
 }
-html.aq-quill .btn-danger:has(> svg):not(:has(> :not(svg))):hover {
+html.aq-quill .btn-danger.btn-icon:hover {
   background-color: var(--aq-down-soft);
   border-color: color-mix(in srgb, var(--aq-down) 45%, transparent);
   color: var(--aq-down);

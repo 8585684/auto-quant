@@ -165,7 +165,30 @@ const buttonVariants = cva('btn', {
     size: {
       md: '',
       sm: 'btn-xs',
-      icon: 'btn-xs px-2',
+      /*
+       * ⚠️ **`btn-icon` 是一个"显式声明"，不是装饰**（外部 issue #183）。
+       *
+       * quill 模板需要知道"哪些按钮是**纯图标**的"，以便给它们一个方形的最小点击目标。
+       * 它原来靠 CSS 反推：`:has(> svg):not(:has(> :not(svg)))` —— 而那个判据
+       * **必然误伤「图标 + 文字」的按钮**，因为**文本节点不参与 `:has()`**：
+       *
+       * ```
+       *   :has(> svg)                ✅ 有 svg 元素子节点
+       *   :not(:has(> :not(svg)))    ✅ 没有"非 svg 的元素子节点"（文字不是元素）
+       * ```
+       *
+       * 于是「停止」（`<Square/> + 停止`）被当成纯图标：padding 归零，
+       * 且作为危险按钮变成**透明描边**（最弱态）—— 而它本该是最醒目的那一个。
+       *
+       * `size="icon"` 本来就是调用方对"这是一个纯图标按钮"的**明确声明**
+       *（9 处使用，都带 `aria-label`），所以把它变成一个稳定的类名让 CSS 用。
+       * 与 `templates/registry.ts` 的 `supportedSkins`（issue #171）同一个思路：
+       * **需要判断的东西显式声明出来，而不是让消费方猜。**
+       *
+       * `px-2` 保留：非 quill 模板下它提供正常的左右内边距；
+       * quill 的 `.btn-icon` 规则会把左右 padding 清零以得到方形目标。
+       */
+      icon: 'btn-xs btn-icon px-2',
     },
   },
   defaultVariants: { variant: 'ghost', size: 'md' },
