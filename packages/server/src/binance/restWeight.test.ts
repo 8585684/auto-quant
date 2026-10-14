@@ -5,6 +5,7 @@ import {
   decayWeight,
   MAX_IN_FLIGHT_REQUESTS,
   preserveBigIds,
+  reanchorWindow,
   WEIGHT_LIMIT_DEFAULT,
   WEIGHT_WINDOW_MS,
 } from './rest.js';
@@ -391,4 +392,64 @@ test('★ 19 位订单号必须原样保留为字符串 —— 否则撤单会�
     '9007199254740993',
     '经保护后原文一字不差',
   );
+});
+/* -------------------------------------------------------------------------- */
+/*  换窗重锚：读数下降 + 本地窗口过期                                       */
+/* -------------------------------------------------------------------------- */
+
+/*
+ * ## 缺陷形状（2026-10-14 审查）
+ *
+ * `captureWeight()` 原来只认**读数下降**这一种换窗信号。但币安换窗后，新窗口的第一条
+ * 读数完全可能 ≥ 本地记忆值（别处其它流量在这个新窗口里已经累计得更高）。此时：
+ *
+ * ```
+ *   `reading < previous` = false  → 不重锚
+ *   `weightWindowStart` 仍停在旧窗口起点
+ * ```
+ *
+ * 而 `decayWeight()` 看到 `elapsed >= 60s` 直接返回 0 —— 它认为"这个窗口已经过去了"。
+ * 于是**新窗口的真实用量被整段忽略**：软限速对这个窗口彻底失明，只剩币安自己的 429
+ * 与 418 IP 封禁兜底。而 429/418 恰恰不带 `x-mbx-used-weight-1m` 头
+ * （本文件 `decayWeight` 的注释自己写着这一点）—— 封禁的时刻正是检测最弱的时刻。
+ *
+ * 修法：补上"本地窗口已过期"这个重锚条件。币安窗口最多 60 秒，
+ * 本地 60 秒没动静后，下一条读数必然属于新窗口。
+ *
+ * 判断抽成注入时间的纯函数 `reanchorWindow()`，与 `decayWeight()` 同理由。
+ */
+test('★★ 新窗口读数不降反升时也必须重锚 —— 否则软限速对整个新窗口失明', () => {
+  const t0 = 1_000_000;
+  /* 上一窗口：起点 t0，读数 1900（接近上限 2400）。 */
+  const prev = 1900;
+  const start = t0;
+  /* 换窗后 61 秒，第一条读数 500 —— 比 1900 小，下降条件成立（旧代码能处理）。 */
+  assert.equal(reanchorWindow(prev, start, t0 + 61_000, 500), t0 + 61_000, '读数下降 → 重锚（旧行为）');
+
+  /* 同一条时间线，但新窗口已被别处流量推高到 2100 —— 比 1900【大】，下降条件不成立。 */
+  const stuck = reanchorWindow(prev, start, t0 + 61_000, 2100);
+  assert.equal(
+    stuck,
+    t0 + 61_000,
+    '★★ 读数不降反升时，本地窗口过期必须触发重锚 —— 旧代码返回 0（不重锚），' +
+      '锚点停在旧窗口，decayWeight 直接返回 0，新窗口的真实用量被整段忽略',
+  );
+});
+
+test('★ 窗口未过期且读数没降：保持原锚点（不为每次响应抖动锚点）', () => {
+  const t0 = 1_000_000;
+  assert.equal(reanchorWindow(1900, t0, t0 + 30_000, 1950), 0, '窗口内读数微增：不重锚');
+  assert.equal(reanchorWindow(1900, t0, t0 + 30_000, 1900), 0, '读数持平：不重锚');
+});
+
+test('★ 从未收到过读数（锚点为 0）必须重锚 —— 否则 decayWeight 的 Unanchored 分支永远走不到', () => {
+  const t0 = 1_000_000;
+  assert.equal(reanchorWindow(0, 0, t0, 300), t0, '第一条读数要锚定');
+  assert.equal(reanchorWindow(0, 0, t0, 0), t0, '读数 0 也要锚定（后续 decay 才判得准）');
+});
+
+test('★ 过期边界：elapsed 恰好 60s 算过期，差一毫秒不算', () => {
+  const t0 = 1_000_000;
+  assert.equal(reanchorWindow(1900, t0, t0 + WEIGHT_WINDOW_MS - 1, 1950), 0, '差 1ms 未过期：不重锚');
+  assert.equal(reanchorWindow(1900, t0, t0 + WEIGHT_WINDOW_MS, 1950), t0 + WEIGHT_WINDOW_MS, '整 60s：过期');
 });
