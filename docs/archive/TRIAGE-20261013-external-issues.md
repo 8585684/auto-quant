@@ -2137,3 +2137,87 @@ Docker 镜像 (v0.1.9)→ success
 - **PR #180** —— `CHANGES_REQUESTED`（注释与实现相反 + `'EUR'` 误杀）
 - **PR #170** —— `CHANGES_REQUESTED`（NAT64 分支误伤）
 - **16 个 issue** —— 累计关闭 22 个；新增 #182 已在本轮修完，#183（quill `:has(> svg)`）待处理
+
+---
+
+## 23. 第 17 轮：v0.1.10 发版 + #183（CSS 判据误伤）
+
+### 一、#183 —— quill 的"纯图标"判据必然误伤（`d3325bd`）
+
+`quill/theme.css` 用 `:has(> svg):not(:has(> :not(svg)))` 判"纯图标按钮"，
+而注释里的前提是**错的**（"文本节点不参与 `:has()`，所以三个分支都对"）——
+**事实正好相反**：正因为文本节点不参与 `:has()`，「`<svg/>` + 文字」的按钮
+**同时满足**两个条件，于是被当成纯图标。
+
+我按 CSS 语义推演了各类按钮的命中矩阵：
+
+```
+按钮        size   修复前(:has)     修复后(.btn-icon)
+启动        sm     ❌ 误命中        不命中
+立即分析     sm     ❌ 误命中        不命中
+停止        sm     ❌ 误命中        不命中
+关闭(X)     icon   ❌ 误命中        命中 ✅
+新建        md     不命中          不命中
+```
+
+后果（issue 的真浏览器实测）：所有「图标+文字」按钮 padding 归零；
+**「停止」作为危险按钮变透明描边**（最弱态），而 classic 下它是实心红。
+
+**修法：用显式声明代替 CSS 猜测。** `Button size="icon"`（9 处使用、都带 `aria-label`）
+是调用方对"纯图标"的明确声明 → 生成 `btn-icon` 类，CSS 用它做判据。
+
+⚠️ **这条判据已经改过两版**（`:has(> svg:only-child)` → `:not(:has(> :not(svg)))`），
+每次都因"元素子节点 vs 文本节点"漏掉一类按钮 —— **第三次说明这条路本身不对**。
+我把三次经过写进了 CSS 注释，并写明"不要再改回 `:has()` 形式"。
+
+与 `templates/registry.ts` 的 `supportedSkins`（issue #171）是**同一个思路**：
+**需要判断的东西显式声明出来，而不是让消费方猜。**
+
+**测试 4 条**，其中第 3 条（`size="icon"` 必须真的生成 `btn-icon`）是
+**防"两处各写一份"断裂**：CSS 等 `btn-icon` 而组件没生成它，规则会**静默失效** ——
+那正是这类缺陷的形态。
+
+### 二、发版前的红线检查
+
+`v0.1.9..HEAD` 里有一条另一个智能体的 `ae1df8f fix(server): 对账被跳过时也结清陈旧委托`。
+按红线看一眼：
+
+- **未触及 `risk/engine.ts`**（只改 `autoTrader.ts`）；
+- 它只让 `settleStaleOrders()` 在 `!idle` 时也跑 —— 那个函数的契约是
+  "**只改账、唯一依据是交易所自己说这张单在不在**"，且委托行终态**幂等**，
+  不与交易周期并发写成交/持仓账；
+- 修的是真实事故：团队模式下本地 36 条 `NEW` 委托 vs 交易所 **0 条**。
+
+**结论：正确的修复，不是绕过。** 但我在发布说明里如实写明"它会改变 `orders` 表的写入频率"。
+
+### 三、发版 v0.1.10
+
+```
+① main 全绿      typecheck / test(47+1493+220) / build / lint /
+                check:links / check:routes / sim 18/18 → 全 0
+② notices 一致   183 依赖全宽松许可，git diff 空
+③ tag v0.1.10    Docker 镜像构建 success
+④ 发布 release   isDraft=false
+```
+
+⚠️ 本次**触及交易路径**（对账/结清时机），§4 实盘冒烟**本项适用** ——
+已写明"未执行、留部署方"。
+
+### 四、本轮验证
+
+```
+npm run typecheck   → 0
+npm test            → 47 + 1493 + 220，0 fail
+npm run build       → 0
+npm run lint        → 0
+npm run check:links → 0
+npm run check:routes→ 0
+npm run sim         → 18/18
+Docker 镜像 (v0.1.10)→ success
+```
+
+### 五、剩余
+
+- **PR #180** —— `CHANGES_REQUESTED`（注释与实现相反 + `'EUR'` 误杀）
+- **PR #170** —— `CHANGES_REQUESTED`（NAT64 分支误伤）
+- **16 个 issue** —— 累计关闭 23 个
