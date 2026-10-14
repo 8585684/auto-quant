@@ -17,6 +17,8 @@ import { createLogger } from '../logger.js';
 import { computeTimeframeIndicators } from './indicators.js';
 import { rankUniverse, type RankableTicker, type UniverseRankings } from './rankings.js';
 import {
+  filterByMinOpenInterest,
+  growthPercent,
   screenSymbols,
   type ScreenableSymbol,
   type ScreenCriteria,
@@ -440,11 +442,26 @@ export class MarketDataService {
     return rows;
   }
 
+  /**
+   * 按各维度给候选池排序取头部。
+   *
+   * ## ⚠️ 这里**没有** `minOpenInterestUsd` 参数（外部 issue #182）
+   *
+   * 它原来在这里被声明接收 —— 但**筛选体从不读它**，因为持仓量根本不在
+   * `BinanceTicker24h` 里（那是 24h 行情快照，持仓量要另外调 `openInterestHist`，
+   * **每个币一次请求**）。所以在这一层无法生效。
+   *
+   * "声明了却不读"比"没有这个参数"更糟：调用方以为传了就生效了
+   *（`coins.ts` 有四处这么传），而它真正该生效的地方是
+   * `screenOpenInterestGrowth` —— 那里**已经**在拉 OI 历史，数据就在手里。
+   *
+   * 所以参数被移除，而不是留在这里当摆设。门槛现在只在 OI 增长榜生效
+   *（见 `filterByMinOpenInterest` 的说明）。
+   */
   async screenUniverse(options: {
     rank: 'quote_volume' | 'gainers' | 'losers' | 'volatility' | 'funding_extreme';
     limit: number;
     minQuoteVolume24h: number;
-    minOpenInterestUsd: number;
     exclude?: ReadonlySet<string>;
   }): Promise<string[]> {
     const universe = await this.getUniverse(true);
@@ -627,7 +644,12 @@ export class MarketDataService {
       rank: 'quote_volume',
       limit: prefilterSize,
       minQuoteVolume24h: options.minQuoteVolume24h,
-      minOpenInterestUsd: options.minOpenInterestUsd,
+      /*
+       * ⚠️ **不再往这里传 `minOpenInterestUsd`**（外部 issue #182）：
+       * `screenUniverse` 拿不到持仓量（ticker 里没有），传了也读不到。
+       * 门槛在下面的 `filterByMinOpenInterest` 里**真正生效** ——
+       * 那时已经拉过 OI 历史，数据就在手里。
+       */
       ...(options.exclude ? { exclude: options.exclude } : {}),
     });
 
@@ -637,15 +659,34 @@ export class MarketDataService {
     const measured = await Promise.all(
       liquid.map(async (symbol) => {
         const hist = await this.market.openInterestHist(symbol, period, pointsNeeded + 2);
-        if (hist.length < 2) return { symbol, growth: 0 };
+        if (hist.length < 2) return { symbol, growth: 0, openInterestUsd: 0 };
         const first = Number(hist[0]?.sumOpenInterest ?? 0);
         const last = Number(hist[hist.length - 1]?.sumOpenInterest ?? 0);
-        if (first <= 0) return { symbol, growth: 0 };
-        return { symbol, growth: ((last - first) / first) * 100 };
+        return {
+          symbol,
+          /* 分母不可用时归 0，而不是把 Infinity 传给排序（见 `growthPercent`）。 */
+          growth: growthPercent(first, last),
+          /*
+           * ⚠️ **把持仓量带出来** —— 它正是 `minOpenInterestUsd` 要筛的东西
+           *（外部 issue #182）。原来这里只算 growth 就丢掉，于是那道护栏
+           * 即使想生效也无从下手。
+           */
+          openInterestUsd: last,
+        };
       }),
     );
 
-    return measured
+    /*
+     * ⚠️ **持仓量门槛在这里生效**（外部 issue #182）。
+     *
+     * `minOpenInterestUsd` 此前被 `screenUniverse` 接收、被本方法转发、
+     * 还被 `autoTrader.ts` 写进给操作员的门槛提示 —— 但**筛选体从不读它**。
+     *
+     * 而它最该生效的就是这里：`growth = (last-first)/first`，
+     * **分母极小时那个比值天然是噪声**（一点点资金进出就是 +300%），
+     * 这道护栏本就是为了把这类假信号挡住。
+     */
+    return filterByMinOpenInterest(measured, options.minOpenInterestUsd)
       .filter((m) => m.growth > 0)
       .sort((a, b) => b.growth - a.growth)
       .slice(0, options.limit)

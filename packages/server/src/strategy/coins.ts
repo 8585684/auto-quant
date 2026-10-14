@@ -142,7 +142,6 @@ export async function selectCandidates(
           rank: coinSource.coinPoolRank,
           limit: coinSource.coinPoolLimit,
           minQuoteVolume24h: coinSource.minQuoteVolume24h,
-          minOpenInterestUsd: coinSource.minOpenInterestUsd,
         });
         for (const symbol of symbols) add(symbol, 'coinpool');
         break;
@@ -200,7 +199,6 @@ export async function selectCandidates(
               rank: coinSource.coinPoolRank,
               limit: coinSource.coinPoolLimit,
               minQuoteVolume24h: coinSource.minQuoteVolume24h,
-              minOpenInterestUsd: coinSource.minOpenInterestUsd,
             })
             .catch((error) => {
               log.warn(`按成交额筛选候选池失败：${(error as Error).message}`);

@@ -80,3 +80,76 @@ export function screenSymbols(input: {
   const capped = Math.max(1, Math.min(wanted, input.maxLimit));
   return rows.slice(0, capped);
 }
+
+/* -------------------------------------------------------------------------- */
+/*  持仓量门槛（外部 issue #182）                                               */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * 一行带持仓量的候选 —— 由调用方从榜单或 OI 历史摊平而来。
+ */
+export interface MinOpenInterestRow {
+  symbol: string;
+  /** 当前持仓量（USDT 计价）。 */
+  openInterestUsd: number;
+}
+
+/**
+ * 把持仓量低于门槛的标的剔除。
+ *
+ * ## 为什么需要它（外部 issue #182）
+ *
+ * `minOpenInterestUsd`（界面「最小持仓量（USDT）」、schema 默认 5_000_000）此前
+ * **是一个不生效的护栏**：
+ *
+ * ```
+ * service.ts:447        screenUniverse 的 options 里声明收下
+ * service.ts:459        筛选循环只读 minQuoteVolume24h      ← 从不读它
+ * service.ts:630        screenOpenInterestGrowth 转发给它    ← 转发了也没人读
+ * autoTrader.ts:2969    写进给操作员的门槛提示              ← 拿它解释一个它没参与的结果
+ * ```
+ *
+ * 而它**最该生效的地方**是 OI 增长榜：那里的排序依据是
+ *
+ * ```
+ * growth = (last - first) / first * 100
+ * ```
+ *
+ * **分母（窗口起点持仓量）极小时这个比值天然是噪声** —— 一点点资金进出就是 +300%。
+ * "最小持仓量"这道护栏本就是为了把这类假信号挡住而存在的
+ *（见 `growthPercent` 的用例：同样 +1000 USDT 的绝对增长，
+ * 分母 100 时算出 +1000%，分母 5000 万时几乎不可见）。
+ *
+ * ## 保守方向：非有限值一律剔除
+ *
+ * `NaN < 门槛` 是 `false`，所以"直接比较"的写法会**放过 NaN**。
+ * 而一个**读不到持仓量**的标的恰恰是最不该进候选池的 —— 所以显式剔除非有限值。
+ *
+ * ⚠️ 门槛 `<= 0` 时**不做任何剔除**：那是"关掉这条规则"的既有约定
+ *（与 `pendingEntryTimeoutMinutes = 0` 等同族字段一致）。
+ */
+export function filterByMinOpenInterest<T extends MinOpenInterestRow>(
+  rows: readonly T[],
+  minOpenInterestUsd: number,
+): T[] {
+  /* `<= 0`（含 NaN）= 关闭这条规则。 */
+  if (!Number.isFinite(minOpenInterestUsd) || minOpenInterestUsd <= 0) return [...rows];
+  return rows.filter((r) => Number.isFinite(r.openInterestUsd) && r.openInterestUsd >= minOpenInterestUsd);
+}
+
+/**
+ * 持仓量增长率（百分数）。
+ *
+ * ## 为什么要走这个函数而不是到处写 `(last-first)/first*100`
+ *
+ * `first = 0` 时那个式子是 `Infinity`，而 `Infinity` 排序后**永远排第一** ——
+ * 一个读不到历史的标的不该登顶。这里把"分母不可用"统一归零。
+ *
+ * ⚠️ 归零是**保守方向**：0 增长会让它在"只看正增长"的榜单里落选
+ *（`screenOpenInterestGrowth` 用 `.filter((m) => m.growth > 0)`），
+ * 而不是靠一个假信号挤掉真实机会。
+ */
+export function growthPercent(first: number, last: number): number {
+  if (!Number.isFinite(first) || !Number.isFinite(last) || first <= 0) return 0;
+  return ((last - first) / first) * 100;
+}
