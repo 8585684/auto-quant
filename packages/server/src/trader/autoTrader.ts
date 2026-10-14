@@ -2102,6 +2102,59 @@ export class AutoTrader {
       // safe: the cycle reconciles at its own head, and this pass is a repair,
       // not a source of truth. Racing it would be the actual damage.
       this.emit('warn', '上一轮决策未在等待时限内结束，本次对账跳过，避免与交易周期并发写账。');
+      /*
+       * ══════════════════════════════════════════════════════════════════════
+       *  ⚠️⚠️ **但"结清陈旧委托"必须照跑**（2026-10-14 线上实测抓到的 BUG）
+       * ══════════════════════════════════════════════════════════════════════
+       *
+       * ## 事故：团队模式的委托列表在骗人（本地 36 条"已挂单"，交易所 0 条）
+       *
+       * 线上实测（`#11`）：
+       * ```
+       *   本地 orders 表 status='NEW'  : 36 条
+       *   交易所 /fapi/v1/openOrders   :  0 条
+       *   交易所 /fapi/v1/openAlgoOrders: 0 条（9 个标的逐个查）
+       * ```
+       * 用户看到的是「当前委托 28 · 已挂单（待对账）」，而**交易所一张都没有**。
+       *
+       * ## 为什么只有团队模式出问题
+       *
+       * ```
+       *   #10（ai_managed）: 本地 NEW 4 条 · 持仓 2   ← 正常
+       *   #11（团队）      : 本地 NEW 36 条 · 持仓 0  ← 全是孤儿
+       * ```
+       * 因为**团队模式的决策慢**（多智能体讨论 3–5 分钟）：
+       * ```
+       *   决策跑不完 → `cycleInFlight` 长期为真 → 这个 `!idle` 分支一直命中
+       *   → reconcileTradeHistory() 整个被跳过
+       *   → 挂在它里面的 settleStaleOrders() 永不执行
+       *   → 孤儿委托永远不被结清
+       * ```
+       * 实测日志：#11 的对账**只跑过 2 次、跳过 1 次**，而 `settleStaleOrders`
+       * 的结清日志**一条都没有**。
+       *
+       * ## 为什么结清可以安全地跑（而整个对账不能）
+       *
+       * `settleStaleOrders()` 的契约（见它的注释）：
+       * ```
+       *   · 只改账 —— 既不补撤单、也不重挂保护单
+       *   · 唯一依据是【交易所自己】说这张单还在不在
+       *   · 它读挂单列表、把交易所已不挂着的本地行写成终态
+       * ```
+       * 也就是说它**不写任何"交易所侧的事实"**，只写"本地记录的最终状态"。
+       * 而上面那个 `!idle` 守卫的目的是"**避免与交易周期并发写账**" ——
+       * 那指的是**成交与持仓的账**（`trades` / `positions`），
+       * 而委托行的终态是**幂等的**（`orders.update()` 只把它推向终态，
+       * 重复执行结果相同）。
+       *
+       * ⚠️ 保守起见仍然**只跑这一件事**，不跑 `reconcileTradeHistory()` 的其余部分 ——
+       * 那些确实会与周期竞争（它们改 `trades` / `positions`）。
+       */
+      await this.settleStaleOrders().catch((error) => {
+        log.warn(
+          `[${this.deps.trader.name}] 对账被跳过时结清陈旧委托失败（不影响本周期交易）：${(error as Error).message}`,
+        );
+      });
       return { recovered: 0, corrected: 0, funding: 0 };
     }
     return this.reconcileTradeHistory();
